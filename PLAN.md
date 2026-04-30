@@ -162,3 +162,106 @@ A single binary per platform that:
   restarts.
 - Is unsigned. macOS users right-click → Open the first time. Windows
   users dismiss SmartScreen. Linux users `chmod +x` the AppImage.
+
+## Dev environment setup (Arch / Omarchy)
+
+Pacman packages:
+
+```bash
+sudo pacman -S --needed \
+  rust \
+  base-devel \
+  pkgconf \
+  wayland \
+  wayland-protocols \
+  libxkbcommon \
+  pipewire \
+  xdg-desktop-portal \
+  xdg-desktop-portal-hyprland \
+  libx11 libxcb \
+  dbus
+```
+
+For cross-compiling to Windows later (optional, do this when needed):
+
+```bash
+sudo pacman -S --needed mingw-w64-gcc
+rustup target add x86_64-pc-windows-gnu
+```
+
+Cargo tooling:
+
+```bash
+cargo install cargo-watch cargo-bundle
+```
+
+Verify the portals are alive (sanity check before milestone 1):
+
+```bash
+busctl --user list | grep -E 'portal|Hyprland'
+```
+
+You should see `org.freedesktop.portal.Desktop` and the Hyprland-specific
+portal backend.
+
+## First task on Arch (Milestone 1: skeleton)
+
+Concrete pickup steps for the next session:
+
+1. `git clone git@github.com:jondkinney/vernier.git`
+2. `cd vernier && cat PLAN.md`
+3. Scaffold the Cargo workspace per the layout in this doc.
+4. Land a transparent fullscreen overlay window on Hyprland via
+   `smithay-client-toolkit` + `wlr-layer-shell` (NOT `winit` — it doesn't
+   expose layer-shell). Layer = `Overlay`, anchor all four edges,
+   exclusive zone = -1, keyboard interactivity = on-demand.
+5. Add a tray icon via `tray-icon` (StatusNotifierItem). Document the
+   `waybar` config snippet needed to render it in the README.
+6. Wire up the global hotkey via `ashpd::desktop::global_shortcuts` and
+   request a persistent token. Provide a CLI fallback subcommand
+   (`vernier toggle`) so users on systems without the portal can bind
+   the key in their compositor config.
+7. **Verify**: hotkey opens overlay → overlay covers the active monitor
+   with a faint tint → hotkey closes it → tray menu has Quit and an
+   Open Preferences placeholder.
+
+Once milestone 1 is solid on Hyprland, the same pattern repeats for X11
+(via `x11rb`), then we move to Milestone 2 (capture pipeline).
+
+## Editorial notes on the stack
+
+- **winit and layer-shell**: `winit` does not expose `wlr-layer-shell`.
+  The Wayland overlay is built directly on `smithay-client-toolkit` for
+  layer-shell-aware compositors (Hyprland ✅, Sway, KDE Plasma 6, river,
+  Cosmic). For GNOME we fall back to a regular fullscreen `xdg-toplevel`
+  via winit.
+- **Why not GTK4 + gtk4-layer-shell**: would solve the Wayland overlay
+  cleanly, but bundling GTK on macOS and Windows is heavy and the GTK
+  look there is poor. `smithay-client-toolkit` keeps Linux native and
+  lets us use `winit` + `egui` everywhere else.
+- **Why `egui` over `iced`**: better tray and embedded-window story
+  today, and easier to draw the measurement HUD on top of `wgpu`
+  without fighting a declarative reconciler.
+- **Why `tray-icon` over `tao`'s tray**: `tao` is heavier than we need,
+  and `tray-icon` is the same upstream code factored out.
+
+## Handoff notes (macOS → Arch)
+
+- Plan and repo seeded from a macOS Claude Code session on
+  `/Users/jon/Code/vernier` on 2026-04-30.
+- No Rust code yet — only this `PLAN.md` and a fresh `git init`.
+- The macOS Claude session has access to the running macOS measurement tools app at
+  `/Applications/Setapp/macOS.app` (version 2.6.2, bundle id
+  `pl.maketheweb.vernier2-setapp`) for further behavioral inspection
+  if questions come up. From Arch, behavior questions can be answered
+  by SSH-ing back here or by asking Jon.
+- User: Jon Kinney (`jondkinney` on GitHub, `jon@headway.io`). Primary
+  daily driver: Hyprland on Omarchy on Arch. The Mac is for occasional
+  macOS-specific verification work only.
+- Decisions already locked in: Rust + winit + wgpu + egui + tray-icon,
+  per-OS backends in `vernier-platform`, full macOS measurement tools feature
+  parity in v1 *except* the design-tool app integrations and CleanShot
+  integration, app-specific disable list IS in scope, unsigned binaries
+  are fine for now.
+- The next agent on Arch should NOT re-litigate any of the above —
+  Jon's already answered those questions. Skip straight to building.
