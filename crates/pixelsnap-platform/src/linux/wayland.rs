@@ -185,7 +185,13 @@ impl Platform for WaylandPlatform {
                 "no frame captured yet — try again in a moment"
             ))
         })?;
-        let pixels = to_rgba8(&captured.pixels, captured.format);
+        let pixels = to_rgba8(
+            &captured.pixels,
+            captured.stride,
+            captured.width,
+            captured.height,
+            captured.format,
+        );
         let monitor_info = self.monitors.lock().unwrap().iter().find(|m| m.id == monitor).cloned();
         let (bounds, scale_factor) = monitor_info
             .map(|m| (m.bounds, m.scale_factor))
@@ -771,49 +777,40 @@ delegate_registry!(WaylandState);
 // Pixel helpers
 // =========================================================================
 
-/// Convert a PipeWire-format buffer into RGBA8. Hyprland gives us BGRA;
-/// other compositors may pick RGBA / RGBx / xRGB. For unknown formats we
-/// pass bytes through unchanged.
+/// Convert a PipeWire-format buffer into tightly-packed RGBA8 (stride =
+/// width*4). Hyprland gives us BGRA; other compositors may pick BGRx /
+/// RGBA / RGBx / xRGB / xBGR. We honor the PipeWire stride to skip any
+/// per-row padding. Unknown formats fall through as-is.
 fn to_rgba8(
     src: &[u8],
+    stride: u32,
+    width: u32,
+    height: u32,
     format: pipewire::spa::param::video::VideoFormat,
 ) -> Vec<u8> {
     use pipewire::spa::param::video::VideoFormat as VF;
-    match format {
-        VF::BGRA | VF::BGRx => {
-            let mut dst = Vec::with_capacity(src.len());
-            for chunk in src.chunks_exact(4) {
-                dst.push(chunk[2]); // R
-                dst.push(chunk[1]); // G
-                dst.push(chunk[0]); // B
-                dst.push(if format == VF::BGRA { chunk[3] } else { 0xFF });
-            }
-            dst
+    let stride = stride as usize;
+    let row_bytes = (width as usize) * 4;
+    let mut dst = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height as usize {
+        let off = y * stride;
+        if off + row_bytes > src.len() {
+            break;
         }
-        VF::RGBA => src.to_vec(),
-        VF::RGBx => {
-            let mut dst = Vec::with_capacity(src.len());
-            for chunk in src.chunks_exact(4) {
-                dst.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+        let row = &src[off..off + row_bytes];
+        for chunk in row.chunks_exact(4) {
+            match format {
+                VF::BGRA => dst.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]),
+                VF::BGRx => dst.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 0xFF]),
+                VF::RGBA => dst.extend_from_slice(chunk),
+                VF::RGBx => dst.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]),
+                VF::xRGB => dst.extend_from_slice(&[chunk[1], chunk[2], chunk[3], 0xFF]),
+                VF::xBGR => dst.extend_from_slice(&[chunk[3], chunk[2], chunk[1], 0xFF]),
+                _ => dst.extend_from_slice(chunk),
             }
-            dst
         }
-        VF::xRGB => {
-            let mut dst = Vec::with_capacity(src.len());
-            for chunk in src.chunks_exact(4) {
-                dst.extend_from_slice(&[chunk[1], chunk[2], chunk[3], 0xFF]);
-            }
-            dst
-        }
-        VF::xBGR => {
-            let mut dst = Vec::with_capacity(src.len());
-            for chunk in src.chunks_exact(4) {
-                dst.extend_from_slice(&[chunk[3], chunk[2], chunk[1], 0xFF]);
-            }
-            dst
-        }
-        _ => src.to_vec(),
     }
+    dst
 }
 
 /// Pre-multiplied ARGB8888, stored in memory as B G R A.

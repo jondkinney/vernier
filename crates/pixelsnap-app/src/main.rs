@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use vernier_core::{detect_edges, FrameView, Px, Tolerance};
 use vernier_platform::{Accelerator, Frame, PlatformEvent, TrayMenu};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
@@ -24,6 +26,17 @@ enum Cmd {
         /// Output PNG path.
         path: PathBuf,
     },
+    /// Run the edge detector on the latest captured frame at the given pixel
+    /// coordinates and print the four cardinal candidates.
+    DetectEdges {
+        /// X coordinate in the frame's pixel space.
+        x: i32,
+        /// Y coordinate in the frame's pixel space.
+        y: i32,
+        /// Color tolerance (sum-of-channel difference, 0..=765). Default 30.
+        #[arg(long, default_value_t = 30)]
+        tolerance: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -41,6 +54,9 @@ fn main() -> Result<()> {
             "capture {}",
             path.canonicalize().unwrap_or(path).display()
         )),
+        Some(Cmd::DetectEdges { x, y, tolerance }) => {
+            run_client_command(&format!("detect-edges {x} {y} {tolerance}"))
+        }
         None => run_daemon(),
     }
 }
@@ -49,9 +65,16 @@ fn run_client_command(cmd: &str) -> Result<()> {
     let path = ipc_socket_path()?;
     let mut stream = std::os::unix::net::UnixStream::connect(&path)
         .with_context(|| format!("connect to {} (is the daemon running?)", path.display()))?;
-    use std::io::Write;
+    use std::io::{Read, Write};
     stream.write_all(cmd.as_bytes())?;
     stream.write_all(b"\n")?;
+    stream.shutdown(std::net::Shutdown::Write)
+        .with_context(|| "shutdown write half of ipc socket")?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok();
+    if !response.is_empty() {
+        print!("{}", String::from_utf8_lossy(&response));
+    }
     Ok(())
 }
 
@@ -177,6 +200,19 @@ fn run_daemon() -> Result<()> {
                     Err(e) => log::error!("capture_screen: {e}"),
                 }
             }
+            MainEvent::Ipc(IpcCmd::DetectEdges {
+                x,
+                y,
+                tolerance,
+                reply,
+            }) => {
+                log::info!("ipc: detect-edges ({x},{y}) tol={tolerance}");
+                let resp = match platform.capture_screen(primary.id) {
+                    Ok(frame) => format_edges(&frame, x, y, tolerance),
+                    Err(e) => format!("error: capture_screen: {e}\n"),
+                };
+                let _ = reply.send(resp);
+            }
         }
     }
 
@@ -195,15 +231,28 @@ enum IpcCmd {
     Toggle,
     Quit,
     Capture(PathBuf),
+    DetectEdges {
+        x: i32,
+        y: i32,
+        tolerance: u32,
+        reply: SyncSender<String>,
+    },
 }
 
 fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc::Sender<MainEvent>) {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("ipc accept: {e}");
+                continue;
+            }
+        };
+        let mut writer = match stream.try_clone() {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("ipc clone: {e}");
                 continue;
             }
         };
@@ -231,10 +280,77 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                         return;
                     }
                 }
+                "detect-edges" => {
+                    let parts: Vec<&str> = arg.split_whitespace().collect();
+                    let x = parts.first().and_then(|s| s.parse::<i32>().ok());
+                    let y = parts.get(1).and_then(|s| s.parse::<i32>().ok());
+                    let tol = parts.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(30);
+                    let (Some(x), Some(y)) = (x, y) else {
+                        let _ = writer.write_all(b"error: detect-edges X Y [tolerance]\n");
+                        continue;
+                    };
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+                    if sender
+                        .send(MainEvent::Ipc(IpcCmd::DetectEdges {
+                            x,
+                            y,
+                            tolerance: tol,
+                            reply: tx,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match rx.recv() {
+                        Ok(resp) => {
+                            let _ = writer.write_all(resp.as_bytes());
+                        }
+                        Err(_) => {
+                            let _ = writer.write_all(b"error: daemon dropped reply\n");
+                        }
+                    }
+                }
                 other => log::debug!("ipc unknown command: {other:?}"),
             }
         }
     }
+}
+
+fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {
+    let view = match FrameView::packed(&frame.pixels, frame.width, frame.height) {
+        Some(v) => v,
+        None => {
+            return format!(
+                "error: frame buffer {} bytes is shorter than {}x{}*4\n",
+                frame.pixels.len(),
+                frame.width,
+                frame.height
+            );
+        }
+    };
+    let edges = detect_edges(&view, Px::new(x, y), Tolerance(tolerance));
+    let mut out = String::new();
+    out.push_str(&format!(
+        "frame: {}x{} cursor: ({},{}) tolerance: {}\n",
+        frame.width, frame.height, x, y, tolerance
+    ));
+    let labels = ["Left  ", "Right ", "Up    ", "Down  "];
+    for (slot, label) in edges.iter().zip(labels.iter()) {
+        match slot {
+            Some(c) => out.push_str(&format!(
+                "  {label} dist={:4}px pos=({:5},{:5}) Δ={:3} edge=#{:02x}{:02x}{:02x}\n",
+                c.distance,
+                c.position.x,
+                c.position.y,
+                c.strength,
+                c.edge_color.r,
+                c.edge_color.g,
+                c.edge_color.b,
+            )),
+            None => out.push_str(&format!("  {label} no edge before frame boundary\n")),
+        }
+    }
+    out
 }
 
 fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
