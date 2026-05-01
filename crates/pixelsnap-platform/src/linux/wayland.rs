@@ -16,10 +16,15 @@ use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -32,7 +37,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::{
@@ -254,6 +259,7 @@ enum Cmd {
     OverlayShow(OverlayKey),
     OverlayHide(OverlayKey),
     OverlaySetTint(OverlayKey, Color),
+    OverlaySetInputCapturing(OverlayKey, bool),
     OverlayDestroy(OverlayKey),
 }
 
@@ -290,6 +296,11 @@ impl OverlayOps for WaylandOverlay {
     fn set_tint(&mut self, c: Color) {
         let _ = self.cmd_tx.send(Cmd::OverlaySetTint(self.key, c));
     }
+    fn set_input_capturing(&mut self, capturing: bool) {
+        let _ = self
+            .cmd_tx
+            .send(Cmd::OverlaySetInputCapturing(self.key, capturing));
+    }
 }
 
 impl Drop for WaylandOverlay {
@@ -313,6 +324,10 @@ struct WaylandState {
     /// Empty `wl_region` used as the surface input region while the overlay
     /// is passive — clicks fall through to underlying windows.
     empty_region: Region,
+    seat_state: SeatState,
+    /// Live pointers, one per seat with the Pointer capability. Held to
+    /// keep them alive; we don't otherwise read this list.
+    pointers: Vec<wl_pointer::WlPointer>,
 
     overlays: HashMap<OverlayKey, OverlayInst>,
     next_overlay_id: u64,
@@ -334,6 +349,10 @@ struct OverlayInst {
     visible_intent: bool,
     tint: Color,
     visible_atomic: Arc<AtomicBool>,
+    /// Whether the surface currently accepts pointer / keyboard input.
+    /// Default `false` (click-through). Toggled to `true` while a
+    /// measurement session is active.
+    input_capturing: bool,
 }
 
 fn run_event_loop(
@@ -364,6 +383,7 @@ fn run_event_loop(
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("create shm pool: {e}")))?;
     let empty_region = Region::new(&compositor)
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("create empty region: {e}")))?;
+    let seat_state = SeatState::new(&globals, &qh);
 
     let mut state = WaylandState {
         registry,
@@ -374,6 +394,8 @@ fn run_event_loop(
         pool,
         qh: qh.clone(),
         empty_region,
+        seat_state,
+        pointers: Vec::new(),
         overlays: HashMap::new(),
         next_overlay_id: 1,
         monitors_pub,
@@ -435,6 +457,9 @@ impl WaylandState {
                     }
                 }
             }
+            Cmd::OverlaySetInputCapturing(key, capturing) => {
+                self.set_input_capturing(key, capturing);
+            }
             Cmd::OverlayDestroy(key) => {
                 if let Some(inst) = self.overlays.remove(&key) {
                     let _ = self
@@ -484,6 +509,7 @@ impl WaylandState {
                 visible_intent: false,
                 tint: Color::rgba(0x00, 0x88, 0xFF, 0x40),
                 visible_atomic: visible_atomic.clone(),
+                input_capturing: false,
             },
         );
 
@@ -515,6 +541,25 @@ impl WaylandState {
         // the next show is allowed, and any pre-configure buffer attach is a
         // protocol error.
         self.draw_overlay(key);
+    }
+
+    fn set_input_capturing(&mut self, key: OverlayKey, capturing: bool) {
+        let Some(inst) = self.overlays.get_mut(&key) else {
+            return;
+        };
+        if inst.input_capturing == capturing {
+            return;
+        }
+        inst.input_capturing = capturing;
+        let surface = inst.layer.wl_surface();
+        if capturing {
+            // None = "infinite" input region per Wayland spec — i.e. the
+            // entire surface accepts pointer/keyboard input.
+            surface.set_input_region(None);
+        } else {
+            surface.set_input_region(Some(self.empty_region.wl_region()));
+        }
+        surface.commit();
     }
 
     fn draw_overlay(&mut self, key: OverlayKey) {
@@ -632,7 +677,81 @@ impl ProvidesRegistryState for WaylandState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
+}
+
+impl SeatHandler for WaylandState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(p) => self.pointers.push(p),
+                Err(e) => log::warn!("get_pointer: {e}"),
+            }
+        }
+    }
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: Capability,
+    ) {
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for WaylandState {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for ev in events {
+            let surf_id = ev.surface.id();
+            let monitor = self
+                .overlays
+                .values()
+                .find(|inst| inst.layer.wl_surface().id() == surf_id)
+                .map(|inst| inst.monitor);
+            let Some(monitor) = monitor else {
+                continue;
+            };
+            let (x, y) = ev.position;
+            let plat_event = match &ev.kind {
+                PointerEventKind::Enter { .. } => PlatformEvent::PointerEnter { monitor, x, y },
+                PointerEventKind::Leave { .. } => PlatformEvent::PointerLeave { monitor },
+                PointerEventKind::Motion { .. } => PlatformEvent::PointerMove { monitor, x, y },
+                PointerEventKind::Press { button, .. } => PlatformEvent::PointerButton {
+                    monitor,
+                    button: *button,
+                    pressed: true,
+                    x,
+                    y,
+                },
+                PointerEventKind::Release { button, .. } => PlatformEvent::PointerButton {
+                    monitor,
+                    button: *button,
+                    pressed: false,
+                    x,
+                    y,
+                },
+                _ => continue,
+            };
+            let _ = self.events_tx.send(plat_event);
+        }
+    }
 }
 
 impl OutputHandler for WaylandState {
@@ -771,6 +890,8 @@ delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
 delegate_layer!(WaylandState);
 delegate_shm!(WaylandState);
+delegate_seat!(WaylandState);
+delegate_pointer!(WaylandState);
 delegate_registry!(WaylandState);
 
 // =========================================================================

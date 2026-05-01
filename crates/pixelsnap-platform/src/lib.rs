@@ -48,6 +48,11 @@ pub trait OverlayOps: Send {
     fn is_visible(&self) -> bool;
     fn monitor(&self) -> MonitorId;
     fn set_tint(&mut self, tint: Color);
+    /// Toggle whether the overlay surface captures pointer/keyboard
+    /// input. When `false` (the default), the surface is click-through
+    /// — pointer events go to underlying windows. When `true`, the
+    /// surface receives pointer enter/move/button + keyboard events.
+    fn set_input_capturing(&mut self, capturing: bool);
 }
 
 /// Owned handle to an overlay surface. Drop to destroy.
@@ -76,6 +81,9 @@ impl OverlayHandle {
     }
     pub fn set_tint(&mut self, c: Color) {
         self.inner.set_tint(c)
+    }
+    pub fn set_input_capturing(&mut self, capturing: bool) {
+        self.inner.set_input_capturing(capturing)
     }
 }
 

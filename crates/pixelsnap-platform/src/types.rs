@@ -211,6 +211,32 @@ pub enum PlatformEvent {
     TrayIconLeftClicked,
     OverlayClosed(MonitorId),
     MonitorsChanged,
+    /// Pointer entered the overlay surface for `monitor`.
+    PointerEnter { monitor: MonitorId, x: f64, y: f64 },
+    /// Pointer left the overlay surface for `monitor`.
+    PointerLeave { monitor: MonitorId },
+    /// Pointer moved over the overlay. Coordinates are surface-local
+    /// pixels (not logical points; multiply your scale_factor when
+    /// rendering at HiDPI).
+    PointerMove { monitor: MonitorId, x: f64, y: f64 },
+    /// A mouse button was pressed (`pressed=true`) or released
+    /// (`pressed=false`). `button` is a Linux input event code
+    /// (BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112).
+    PointerButton {
+        monitor: MonitorId,
+        button: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    },
+    /// A keyboard key was pressed/released while the overlay had focus.
+    /// `keysym` is an XKB keysym; `pressed` distinguishes press from
+    /// release.
+    KeyboardKey {
+        monitor: MonitorId,
+        keysym: u32,
+        pressed: bool,
+    },
     Quit,
 }
 
