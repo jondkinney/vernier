@@ -1,0 +1,21 @@
+[package]
+name = "vernier-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vernier"
+path = "src/main.rs"
+
+[dependencies]
+vernier-core = { workspace = true }
+vernier-platform = { workspace = true }
+vernier-ui = { workspace = true }
+
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }

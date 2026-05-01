@@ -1,0 +1,24 @@
+[package]
+name = "vernier-platform"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vernier-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+tray-icon = { version = "0.23", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+gtk = "0.18"
+ashpd = { version = "0.13", features = ["global_shortcuts"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+futures-util = "0.3"

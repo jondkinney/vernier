@@ -1,0 +1,12 @@
+[package]
+name = "vernier-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vernier-core = { workspace = true }
+vernier-platform = { workspace = true }
+log = { workspace = true }
