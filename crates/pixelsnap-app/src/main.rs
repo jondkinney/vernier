@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use vernier_platform::{Accelerator, PlatformEvent, TrayMenu};
-use std::path::PathBuf;
+use vernier_platform::{Accelerator, Frame, PlatformEvent, TrayMenu};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
@@ -19,6 +19,11 @@ enum Cmd {
     Toggle,
     /// Tell the running vernier daemon to quit.
     Quit,
+    /// Ask the running daemon to capture the primary monitor and write a PNG.
+    Capture {
+        /// Output PNG path.
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -32,6 +37,10 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Cmd::Toggle) => run_client_command("toggle"),
         Some(Cmd::Quit) => run_client_command("quit"),
+        Some(Cmd::Capture { path }) => run_client_command(&format!(
+            "capture {}",
+            path.canonicalize().unwrap_or(path).display()
+        )),
         None => run_daemon(),
     }
 }
@@ -153,6 +162,21 @@ fn run_daemon() -> Result<()> {
                 log::info!("ipc: quit");
                 break;
             }
+            MainEvent::Ipc(IpcCmd::Capture(path)) => {
+                log::info!("ipc: capture → {}", path.display());
+                match platform.capture_screen(primary.id) {
+                    Ok(frame) => match save_frame_png(&path, &frame) {
+                        Ok(_) => log::info!(
+                            "capture saved: {} ({}x{})",
+                            path.display(),
+                            frame.width,
+                            frame.height
+                        ),
+                        Err(e) => log::error!("save_frame_png: {e:#}"),
+                    },
+                    Err(e) => log::error!("capture_screen: {e}"),
+                }
+            }
         }
     }
 
@@ -170,6 +194,7 @@ enum MainEvent {
 enum IpcCmd {
     Toggle,
     Quit,
+    Capture(PathBuf),
 }
 
 fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc::Sender<MainEvent>) {
@@ -185,7 +210,9 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            match line.trim() {
+            let trimmed = line.trim();
+            let (cmd, arg) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+            match cmd {
                 "toggle" => {
                     if sender.send(MainEvent::Ipc(IpcCmd::Toggle)).is_err() {
                         return;
@@ -196,10 +223,32 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                         return;
                     }
                 }
+                "capture" if !arg.is_empty() => {
+                    if sender
+                        .send(MainEvent::Ipc(IpcCmd::Capture(PathBuf::from(arg))))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 other => log::debug!("ipc unknown command: {other:?}"),
             }
         }
     }
+}
+
+fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
+    let img = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frame pixel buffer size {} doesn't match {}x{}*4",
+                frame.pixels.len(),
+                frame.width,
+                frame.height
+            )
+        })?;
+    img.save(path).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 fn ipc_socket_path() -> Result<PathBuf> {

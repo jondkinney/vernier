@@ -19,6 +19,8 @@ wayland-client = "0.31"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 gtk = "0.18"
-ashpd = { version = "0.13", features = ["global_shortcuts"] }
+ashpd = { version = "0.13", features = ["global_shortcuts", "screencast", "pipewire"] }
+pipewire = "0.9"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = "0.3"
+libc = "0.2"

@@ -87,12 +87,51 @@ pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
         }
     };
 
+    // Kick off the screencast portal handshake + PipeWire connect on a
+    // background thread so the user-consent dialog (only on first run)
+    // doesn't block daemon startup.
+    let screencast_session: Arc<Mutex<Option<super::screencast::CaptureService>>> =
+        Arc::new(Mutex::new(None));
+    let sc_clone = screencast_session.clone();
+    thread::Builder::new()
+        .name("vernier-screencast-init".into())
+        .spawn(move || {
+            let state = match super::screencast::open_session_blocking() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("screencast: portal handshake failed: {e}");
+                    return;
+                }
+            };
+            use std::os::fd::AsRawFd;
+            log::info!(
+                "screencast: portal session ready — {} stream(s); pipewire fd={}",
+                state.streams.len(),
+                state.pipewire_fd.as_raw_fd()
+            );
+            for s in &state.streams {
+                log::info!(
+                    "  stream node_id={} pos={:?} size={:?} id={:?}",
+                    s.node_id, s.position, s.size, s.stream_id
+                );
+            }
+            match super::screencast::start_capture(state) {
+                Ok(svc) => {
+                    log::info!("screencast: pipewire capture service running");
+                    *sc_clone.lock().unwrap() = Some(svc);
+                }
+                Err(e) => log::warn!("screencast: pipewire start failed: {e}"),
+            }
+        })
+        .map_err(|e| PlatformError::Other(anyhow::anyhow!("spawn screencast thread: {e}")))?;
+
     Ok((
         Box::new(WaylandPlatform {
             cmd_tx: Mutex::new(cmd_tx),
             monitors,
             events_tx,
             hotkey_service,
+            screencast_session,
         }),
         events_rx,
     ))
@@ -107,6 +146,8 @@ struct WaylandPlatform {
     monitors: Arc<Mutex<Vec<MonitorInfo>>>,
     events_tx: EventSender,
     hotkey_service: Option<super::hotkey::HotkeyService>,
+    #[allow(dead_code)] // capture_screen wires this up in milestone 2 task 10
+    screencast_session: Arc<Mutex<Option<super::screencast::CaptureService>>>,
 }
 
 impl WaylandPlatform {
@@ -128,9 +169,33 @@ impl Platform for WaylandPlatform {
         Ok(None)
     }
 
-    fn capture_screen(&self, _monitor: MonitorId) -> Result<Frame> {
-        Err(PlatformError::Unsupported {
-            what: "screen capture pending milestone 2",
+    fn capture_screen(&self, monitor: MonitorId) -> Result<Frame> {
+        let guard = self.screencast_session.lock().unwrap();
+        let svc = guard.as_ref().ok_or_else(|| PlatformError::Other(
+            anyhow::anyhow!("screencast not ready yet — portal handshake or PipeWire connect still in flight"),
+        ))?;
+        // First-stream mapping: portal-side stream order matches the monitor
+        // order the user picked in the consent dialog. Multi-monitor proper
+        // mapping is a milestone-3 refinement.
+        let stream_info = svc.streams().first().ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("screencast has no streams"))
+        })?;
+        let captured = svc.latest_frame(stream_info.node_id).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!(
+                "no frame captured yet — try again in a moment"
+            ))
+        })?;
+        let pixels = to_rgba8(&captured.pixels, captured.format);
+        let monitor_info = self.monitors.lock().unwrap().iter().find(|m| m.id == monitor).cloned();
+        let (bounds, scale_factor) = monitor_info
+            .map(|m| (m.bounds, m.scale_factor))
+            .unwrap_or((Rect::default(), 1.0));
+        Ok(Frame {
+            width: captured.width,
+            height: captured.height,
+            scale_factor,
+            bounds,
+            pixels,
         })
     }
 
@@ -705,6 +770,51 @@ delegate_registry!(WaylandState);
 // =========================================================================
 // Pixel helpers
 // =========================================================================
+
+/// Convert a PipeWire-format buffer into RGBA8. Hyprland gives us BGRA;
+/// other compositors may pick RGBA / RGBx / xRGB. For unknown formats we
+/// pass bytes through unchanged.
+fn to_rgba8(
+    src: &[u8],
+    format: pipewire::spa::param::video::VideoFormat,
+) -> Vec<u8> {
+    use pipewire::spa::param::video::VideoFormat as VF;
+    match format {
+        VF::BGRA | VF::BGRx => {
+            let mut dst = Vec::with_capacity(src.len());
+            for chunk in src.chunks_exact(4) {
+                dst.push(chunk[2]); // R
+                dst.push(chunk[1]); // G
+                dst.push(chunk[0]); // B
+                dst.push(if format == VF::BGRA { chunk[3] } else { 0xFF });
+            }
+            dst
+        }
+        VF::RGBA => src.to_vec(),
+        VF::RGBx => {
+            let mut dst = Vec::with_capacity(src.len());
+            for chunk in src.chunks_exact(4) {
+                dst.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+            }
+            dst
+        }
+        VF::xRGB => {
+            let mut dst = Vec::with_capacity(src.len());
+            for chunk in src.chunks_exact(4) {
+                dst.extend_from_slice(&[chunk[1], chunk[2], chunk[3], 0xFF]);
+            }
+            dst
+        }
+        VF::xBGR => {
+            let mut dst = Vec::with_capacity(src.len());
+            for chunk in src.chunks_exact(4) {
+                dst.extend_from_slice(&[chunk[3], chunk[2], chunk[1], 0xFF]);
+            }
+            dst
+        }
+        _ => src.to_vec(),
+    }
+}
 
 /// Pre-multiplied ARGB8888, stored in memory as B G R A.
 fn argb8888_premul(c: Color) -> [u8; 4] {
