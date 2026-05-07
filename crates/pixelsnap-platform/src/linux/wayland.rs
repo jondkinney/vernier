@@ -16,13 +16,14 @@ use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
@@ -37,13 +38,13 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::{
-    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, MonitorId,
-    MonitorInfo, OverlayHandle, OverlayOps, Platform, PlatformError, PlatformEvent, Rect, Result,
-    TrayHandle, TrayMenu,
+    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud, HudAxis,
+    HudKind, MonitorId, MonitorInfo, NativeFrame, OverlayHandle, OverlayOps, PixelFormat, Platform,
+    PlatformError, PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
 };
 
 pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
@@ -67,6 +68,9 @@ pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
                 ready_tx.clone(),
             );
             if let Err(e) = result {
+                log::error!(
+                    "wayland event loop terminated: {e:#}. Overlay is now dead — restart the daemon."
+                );
                 let _ = ready_tx.send(Err(e));
             }
         })
@@ -174,6 +178,35 @@ impl Platform for WaylandPlatform {
         Ok(None)
     }
 
+    fn capture_screen_native(&self, monitor: MonitorId) -> Result<NativeFrame> {
+        let guard = self.screencast_session.lock().unwrap();
+        let svc = guard.as_ref().ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("screencast not ready yet"))
+        })?;
+        let stream_info = svc.streams().first().ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("screencast has no streams"))
+        })?;
+        let captured = svc.latest_frame(stream_info.node_id).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!(
+                "no frame captured yet — try again in a moment"
+            ))
+        })?;
+        let monitor_info = self.monitors.lock().unwrap().iter().find(|m| m.id == monitor).cloned();
+        let (bounds, scale_factor) = monitor_info
+            .map(|m| (m.bounds, m.scale_factor))
+            .unwrap_or((Rect::default(), 1.0));
+        let format = video_format_to_pixel_format(captured.format)?;
+        Ok(NativeFrame {
+            width: captured.width,
+            height: captured.height,
+            stride: captured.stride,
+            format,
+            bounds,
+            scale_factor,
+            pixels: captured.pixels,
+        })
+    }
+
     fn capture_screen(&self, monitor: MonitorId) -> Result<Frame> {
         let guard = self.screencast_session.lock().unwrap();
         let svc = guard.as_ref().ok_or_else(|| PlatformError::Other(
@@ -260,6 +293,7 @@ enum Cmd {
     OverlayHide(OverlayKey),
     OverlaySetTint(OverlayKey, Color),
     OverlaySetInputCapturing(OverlayKey, bool),
+    OverlaySetHud(OverlayKey, Option<Hud>),
     OverlayDestroy(OverlayKey),
 }
 
@@ -301,6 +335,9 @@ impl OverlayOps for WaylandOverlay {
             .cmd_tx
             .send(Cmd::OverlaySetInputCapturing(self.key, capturing));
     }
+    fn set_hud(&mut self, hud: Option<Hud>) {
+        let _ = self.cmd_tx.send(Cmd::OverlaySetHud(self.key, hud));
+    }
 }
 
 impl Drop for WaylandOverlay {
@@ -328,6 +365,8 @@ struct WaylandState {
     /// Live pointers, one per seat with the Pointer capability. Held to
     /// keep them alive; we don't otherwise read this list.
     pointers: Vec<wl_pointer::WlPointer>,
+    /// Live keyboards, similarly held alive.
+    keyboards: Vec<wl_keyboard::WlKeyboard>,
 
     overlays: HashMap<OverlayKey, OverlayInst>,
     next_overlay_id: u64,
@@ -345,6 +384,10 @@ struct OverlayInst {
     monitor: MonitorId,
     width: u32,
     height: u32,
+    /// Buffer scale factor (HiDPI). Buffer dimensions = (width *
+    /// buffer_scale, height * buffer_scale). Set on the wl_surface so
+    /// the compositor doesn't upscale our pixels.
+    buffer_scale: i32,
     configured: bool,
     visible_intent: bool,
     tint: Color,
@@ -353,6 +396,8 @@ struct OverlayInst {
     /// Default `false` (click-through). Toggled to `true` while a
     /// measurement session is active.
     input_capturing: bool,
+    /// Optional HUD to draw on top of the background tint.
+    hud: Option<Hud>,
 }
 
 fn run_event_loop(
@@ -396,6 +441,7 @@ fn run_event_loop(
         empty_region,
         seat_state,
         pointers: Vec::new(),
+        keyboards: Vec::new(),
         overlays: HashMap::new(),
         next_overlay_id: 1,
         monitors_pub,
@@ -460,6 +506,14 @@ impl WaylandState {
             Cmd::OverlaySetInputCapturing(key, capturing) => {
                 self.set_input_capturing(key, capturing);
             }
+            Cmd::OverlaySetHud(key, hud) => {
+                if let Some(inst) = self.overlays.get_mut(&key) {
+                    inst.hud = hud;
+                    if inst.visible_intent {
+                        self.draw_overlay(key);
+                    }
+                }
+            }
             Cmd::OverlayDestroy(key) => {
                 if let Some(inst) = self.overlays.remove(&key) {
                     let _ = self
@@ -487,6 +541,18 @@ impl WaylandState {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         layer.set_size(0, 0);
+        // HiDPI: tell the compositor our buffers are at the monitor's
+        // scale factor, so it shows them 1:1 without upscale blur.
+        let buffer_scale = self
+            .monitors_pub
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == monitor)
+            .map(|m| m.scale_factor.round() as i32)
+            .unwrap_or(1)
+            .max(1);
+        layer.wl_surface().set_buffer_scale(buffer_scale);
         // Empty input region = click-through. Measurement mode will swap this
         // for a full-coverage region when we want to capture mouse later.
         layer
@@ -505,11 +571,13 @@ impl WaylandState {
                 monitor,
                 width: 0,
                 height: 0,
+                buffer_scale,
                 configured: false,
                 visible_intent: false,
                 tint: Color::rgba(0x00, 0x88, 0xFF, 0x40),
                 visible_atomic: visible_atomic.clone(),
                 input_capturing: false,
+                hud: None,
             },
         );
 
@@ -551,15 +619,29 @@ impl WaylandState {
             return;
         }
         inst.input_capturing = capturing;
-        let surface = inst.layer.wl_surface();
         if capturing {
             // None = "infinite" input region per Wayland spec — i.e. the
-            // entire surface accepts pointer/keyboard input.
-            surface.set_input_region(None);
+            // entire surface accepts pointer input. Exclusive keyboard
+            // ensures keypresses (Esc) reach us instead of the focused
+            // app underneath.
+            inst.layer.wl_surface().set_input_region(None);
+            inst.layer
+                .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         } else {
-            surface.set_input_region(Some(self.empty_region.wl_region()));
+            inst.layer
+                .wl_surface()
+                .set_input_region(Some(self.empty_region.wl_region()));
+            inst.layer
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
         }
-        surface.commit();
+        inst.layer.commit();
+    }
+
+    /// Lookup the monitor of the first known overlay. Used to attribute
+    /// keyboard events that the protocol doesn't carry a surface for in
+    /// our handler signatures.
+    fn first_overlay_monitor(&self) -> Option<MonitorId> {
+        self.overlays.values().next().map(|inst| inst.monitor)
     }
 
     fn draw_overlay(&mut self, key: OverlayKey) {
@@ -573,21 +655,19 @@ impl WaylandState {
         if !inst.configured || inst.width == 0 || inst.height == 0 {
             return;
         }
-        let w = inst.width as i32;
-        let h = inst.height as i32;
-        let stride = w * 4;
-        let color = if inst.visible_intent {
-            inst.tint
-        } else {
-            Color::TRANSPARENT
-        };
-        let pixel = argb8888_premul(color);
+        let scale = inst.buffer_scale.max(1);
+        // Buffer is at PHYSICAL resolution (surface dims × buffer_scale).
+        // Compositor displays it 1:1 without upscaling, so all our
+        // strokes and text render at native HiDPI clarity.
+        let buf_w = inst.width as i32 * scale;
+        let buf_h = inst.height as i32 * scale;
+        let stride = buf_w * 4;
 
         let (buffer, canvas) = match self.pool.create_buffer(
-            w,
-            h,
+            buf_w,
+            buf_h,
             stride,
-            wl_shm::Format::Argb8888,
+            wl_shm::Format::Abgr8888,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -595,8 +675,18 @@ impl WaylandState {
                 return;
             }
         };
-        for chunk in canvas.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&pixel);
+
+        if !inst.visible_intent {
+            // Hidden: clear to transparent.
+            canvas.fill(0);
+        } else if let Some(hud) = inst.hud.as_ref() {
+            render_hud_into(canvas, buf_w as u32, buf_h as u32, scale as u32, hud);
+        } else {
+            // Plain tint, no HUD.
+            let pixel = rgba8888_premul(inst.tint);
+            for chunk in canvas.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&pixel);
+            }
         }
 
         let surface = inst.layer.wl_surface();
@@ -604,7 +694,8 @@ impl WaylandState {
             log::warn!("buffer attach failed: {e}");
             return;
         }
-        surface.damage_buffer(0, 0, w, h);
+        // damage_buffer is in BUFFER coords — match the buffer dims.
+        surface.damage_buffer(0, 0, buf_w, buf_h);
         surface.commit();
     }
 
@@ -698,6 +789,12 @@ impl SeatHandler for WaylandState {
                 Err(e) => log::warn!("get_pointer: {e}"),
             }
         }
+        if capability == Capability::Keyboard {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(k) => self.keyboards.push(k),
+                Err(e) => log::warn!("get_keyboard: {e}"),
+            }
+        }
     }
     fn remove_capability(
         &mut self,
@@ -715,19 +812,29 @@ impl PointerHandler for WaylandState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for ev in events {
             let surf_id = ev.surface.id();
-            let monitor = self
+            let (monitor, capturing) = match self
                 .overlays
                 .values()
                 .find(|inst| inst.layer.wl_surface().id() == surf_id)
-                .map(|inst| inst.monitor);
-            let Some(monitor) = monitor else {
-                continue;
+            {
+                Some(inst) => (inst.monitor, inst.input_capturing),
+                None => continue,
             };
+            // On Enter, hide the system cursor while measuring so the
+            // user's actual mouse pointer doesn't obscure the snap
+            // lines. The cursor is already excluded from the captured
+            // PipeWire stream (CursorMode::Hidden), so this is purely a
+            // display-side hide.
+            if let PointerEventKind::Enter { serial } = ev.kind {
+                if capturing {
+                    pointer.set_cursor(serial, None, 0, 0);
+                }
+            }
             let (x, y) = ev.position;
             let plat_event = match &ev.kind {
                 PointerEventKind::Enter { .. } => PlatformEvent::PointerEnter { monitor, x, y },
@@ -886,12 +993,100 @@ impl ShmHandler for WaylandState {
     }
 }
 
+impl KeyboardHandler for WaylandState {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let monitor = self.first_overlay_monitor();
+        if let Some(monitor) = monitor {
+            let _ = self.events_tx.send(PlatformEvent::KeyboardKey {
+                monitor,
+                keysym: event.keysym.raw(),
+                pressed: true,
+            });
+        }
+    }
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let monitor = self.first_overlay_monitor();
+        if let Some(monitor) = monitor {
+            let _ = self.events_tx.send(PlatformEvent::KeyboardKey {
+                monitor,
+                keysym: event.keysym.raw(),
+                pressed: false,
+            });
+        }
+    }
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+        // Auto-repeat events: ignore. We only care about discrete press/release
+        // for ESC and friends.
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+    }
+    fn update_repeat_info(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: smithay_client_toolkit::seat::keyboard::RepeatInfo,
+    ) {
+    }
+}
+
 delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
 delegate_layer!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_pointer!(WaylandState);
+delegate_keyboard!(WaylandState);
 delegate_registry!(WaylandState);
 
 // =========================================================================
@@ -934,11 +1129,465 @@ fn to_rgba8(
     dst
 }
 
-/// Pre-multiplied ARGB8888, stored in memory as B G R A.
-fn argb8888_premul(c: Color) -> [u8; 4] {
+/// Layout for the dimension-readout pill. Computed alongside the line
+/// strokes so the pill background can be drawn via tiny-skia, and the
+/// glyph rasterization can run after pixmap drops its &mut canvas.
+struct PillLayout {
+    text: String,
+    /// Pen X position of the first glyph in BUFFER coords.
+    text_x: f32,
+    /// Baseline Y position in BUFFER coords (descenders go below).
+    baseline_y: f32,
+    /// fontdue rasterization size in BUFFER pixels.
+    px_size: f32,
+}
+
+/// Pixel size of the dimension-readout text in LOGICAL pixels. At
+/// HiDPI 2x this becomes 32 buffer pixels — small enough to read at a
+/// glance, smooth thanks to fontdue's grayscale rasterization.
+const TEXT_LOGICAL_PX: f32 = 16.0;
+
+/// Lazily-loaded TTF font for the dimension readout. We try a few
+/// well-known system paths; if none are available we fall back to no
+/// text (the pill stays empty).
+fn hud_font() -> Option<&'static fontdue::Font> {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<Option<fontdue::Font>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        ];
+        for path in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = fontdue::Font::from_bytes(
+                    bytes.as_slice(),
+                    fontdue::FontSettings::default(),
+                ) {
+                    log::info!("hud font: {path}");
+                    return Some(font);
+                }
+            }
+        }
+        log::warn!("hud font: no system TTF found; pill text will be blank");
+        None
+    })
+    .as_ref()
+}
+
+fn measure_text_width(font: &fontdue::Font, text: &str, px_size: f32) -> f32 {
+    text.chars()
+        .map(|c| font.metrics(c, px_size).advance_width)
+        .sum()
+}
+
+/// Render a [`Hud`] into a wl_shm Abgr8888 buffer at the given buffer
+/// dimensions and HiDPI scale factor. Cursor / edge coords are in
+/// surface (logical) pixels and get multiplied by `scale` internally.
+fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+    let bg = rgba8888_premul(hud.background);
+    if bg == [0, 0, 0, 0] {
+        canvas.fill(0);
+    } else {
+        for chunk in canvas.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&bg);
+        }
+    }
+
+    // tiny-skia phase scoped so its &mut borrow on canvas is released
+    // before we rasterize glyphs into it.
+    let pill = render_hud_strokes(canvas, buf_w, buf_h, scale, hud);
+
+    if let Some(layout) = pill {
+        if let Some(font) = hud_font() {
+            render_pill_text(canvas, buf_w, buf_h, font, &layout);
+        }
+    }
+}
+
+fn render_hud_strokes(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) -> Option<PillLayout> {
+    use tiny_skia::*;
+    let mut pixmap = PixmapMut::from_bytes(canvas, buf_w, buf_h)?;
+    let scale_f = scale as f32;
+
+    let fg = hud.foreground;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
+    // Anti-aliasing is the bulk of tiny-skia's per-frame cost. Crisp
+    // 1px lines are also closer to a clean minimal aesthetic.
+    paint.anti_alias = false;
+    // Axis lines: 1 LOGICAL pixel = `scale` buffer pixels.
+    let stroke = Stroke {
+        width: scale_f,
+        ..Default::default()
+    };
+    // Tick caps: ~2 LOGICAL pixels so they read as filled bars over the
+    // thinner axis lines.
+    let tick_stroke = Stroke {
+        width: 2.0 * scale_f,
+        ..Default::default()
+    };
+
+    let mut pill: Option<PillLayout> = None;
+    match &hud.kind {
+        HudKind::Hover { cursor, edges } => {
+            // Convert surface-logical coords to buffer-physical, snap
+            // to the pixel grid, offset by stroke half-width so non-AA
+            // strokes land cleanly on integer columns / rows. Without
+            // this, integer positions sit on the boundary between two
+            // pixels and the rasterizer's tie-break rule picks one or
+            // the other, giving uneven tick lengths and shimmer.
+            let half = stroke.width * 0.5;
+            let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
+            let cx = snap(cursor.0);
+            let cy = snap(cursor.1);
+            let surface_w = buf_w as f32;
+            let surface_h = buf_h as f32;
+
+            // Horizontal axis line: spans from left snap edge (or screen
+            // left) to right snap edge (or screen right), through cursor.
+            let left = edges
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|e| e.axis == HudAxis::Left);
+            let right = edges
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|e| e.axis == HudAxis::Right);
+            let left_x = left.map(|e| snap(e.position.0)).unwrap_or(half);
+            let right_x = right
+                .map(|e| snap(e.position.0))
+                .unwrap_or(surface_w - half);
+            let mut pb = PathBuilder::new();
+            pb.move_to(left_x, cy);
+            pb.line_to(right_x, cy);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+
+            // Vertical axis line.
+            let up = edges
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|e| e.axis == HudAxis::Up);
+            let down = edges
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .find(|e| e.axis == HudAxis::Down);
+            let up_y = up.map(|e| snap(e.position.1)).unwrap_or(half);
+            let down_y = down
+                .map(|e| snap(e.position.1))
+                .unwrap_or(surface_h - half);
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx, up_y);
+            pb.line_to(cx, down_y);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+
+            // Tick marks. Anchor the tick CENTER on the matching axis
+            // line (cy for left/right ticks, cx for up/down ticks) so
+            // they sit exactly on the main lines.
+            // Tick half-length = 5 LOGICAL pixels. Drawn with the
+            // thicker `tick_stroke` so caps look like filled bars.
+            let tick = 5.0 * scale_f;
+            for edge in edges.iter().flatten() {
+                let ex = snap(edge.position.0);
+                let ey = snap(edge.position.1);
+                let (px, py, tdx, tdy) = match edge.axis {
+                    HudAxis::Left | HudAxis::Right => (ex, cy, 0.0, tick),
+                    HudAxis::Up | HudAxis::Down => (cx, ey, tick, 0.0),
+                };
+                let mut pb = PathBuilder::new();
+                pb.move_to(px - tdx, py - tdy);
+                pb.line_to(px + tdx, py + tdy);
+                if let Some(path) = pb.finish() {
+                    pixmap.stroke_path(&path, &paint, &tick_stroke, Transform::identity(), None);
+                }
+            }
+
+            // Cursor `+` marker: white interior with a dark outline so
+            // it stays visible against any background. Drawn after the
+            // axis lines so it sits on top of their crossing point.
+            let arm = 6.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - arm, cy);
+            pb.line_to(cx + arm, cy);
+            pb.move_to(cx, cy - arm);
+            pb.line_to(cx, cy + arm);
+            if let Some(path) = pb.finish() {
+                let mut outline = Paint::default();
+                outline.set_color_rgba8(0, 0, 0, 200);
+                outline.anti_alias = true;
+                pixmap.stroke_path(
+                    &path,
+                    &outline,
+                    &Stroke {
+                        width: 4.0 * scale_f,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+                let mut fill = Paint::default();
+                fill.set_color_rgba8(255, 255, 255, 255);
+                fill.anti_alias = true;
+                pixmap.stroke_path(
+                    &path,
+                    &fill,
+                    &Stroke {
+                        width: 2.0 * scale_f,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+            }
+
+            // Width / height in LOGICAL pixels. Buffer span / scale.
+            let w_px = ((right_x - left_x) / scale_f).round() as u32;
+            let h_px = ((down_y - up_y) / scale_f).round() as u32;
+
+            // Match macOS format: "W × H" with the Unicode
+            // multiplication sign, no "px" suffix.
+            let text = format!("{} \u{00D7} {}", w_px, h_px);
+            let px_size = TEXT_LOGICAL_PX * scale_f;
+            // Measure text via fontdue. If the font is missing we still
+            // render the pill (just empty) at a sensible width using the
+            // average glyph metric.
+            let (text_w, ascent, descent) = if let Some(font) = hud_font() {
+                let w = measure_text_width(font, &text, px_size);
+                let lm = font.horizontal_line_metrics(px_size);
+                let (a, d) = lm
+                    .map(|m| (m.ascent, -m.descent))
+                    .unwrap_or((px_size * 0.8, px_size * 0.2));
+                (w, a, d)
+            } else {
+                (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+            };
+            let pad_x = 14.0 * scale_f;
+            let pad_y = 7.0 * scale_f;
+            let pill_w = text_w.ceil() + pad_x * 2.0;
+            let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+            // Lower-right of cursor by 14 LOGICAL px each axis.
+            let cursor_buf_x = (cursor.0 * scale as f64) as f32;
+            let cursor_buf_y = (cursor.1 * scale as f64) as f32;
+            let offset = 14.0 * scale_f;
+            let mut pill_x = (cursor_buf_x + offset).floor();
+            let mut pill_y = (cursor_buf_y + offset).floor();
+            pill_x = pill_x.min(surface_w - pill_w - 1.0).max(0.0);
+            pill_y = pill_y.min(surface_h - pill_h - 1.0).max(0.0);
+
+            // Slightly translucent dark gray (not pure black). The background still shows through a
+            // little, which keeps the pill from looking overweight.
+            let mut bg_paint = Paint::default();
+            bg_paint.set_color_rgba8(40, 40, 40, 230);
+            bg_paint.anti_alias = true;
+            if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+                pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+            }
+
+            pill = Some(PillLayout {
+                text,
+                text_x: pill_x + pad_x,
+                baseline_y: pill_y + pad_y + ascent,
+                px_size,
+            });
+        }
+        HudKind::Drawing { start, cursor } => {
+            let (sx, sy) = (start.0 as f32, start.1 as f32);
+            let (cx, cy) = (cursor.0 as f32, cursor.1 as f32);
+            let mut pb = PathBuilder::new();
+            pb.move_to(sx, sy);
+            pb.line_to(cx, cy);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+            // Endpoint markers.
+            stroke_circle(&mut pixmap, sx, sy, 4.0, &paint);
+            stroke_circle(&mut pixmap, cx, cy, 4.0, &paint);
+        }
+        HudKind::Held { start, end } => {
+            let (sx, sy) = (start.0 as f32, start.1 as f32);
+            let (ex, ey) = (end.0 as f32, end.1 as f32);
+            let mut pb = PathBuilder::new();
+            pb.move_to(sx, sy);
+            pb.line_to(ex, ey);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+            stroke_circle(&mut pixmap, sx, sy, 4.0, &paint);
+            stroke_circle(&mut pixmap, ex, ey, 4.0, &paint);
+        }
+    }
+    pill
+}
+
+/// Rasterize the dimension-readout text into the buffer using fontdue.
+/// Each glyph's grayscale alpha bitmap is alpha-blended onto the pill
+/// background that `render_hud_strokes` already drew. The buffer is
+/// premultiplied RGBA, and the source is fully-opaque white at the
+/// glyph's per-pixel alpha — so premul source = (a, a, a, a) and
+/// `out = src + dst * (1 - src.a)` reduces to the inner block here.
+fn render_pill_text(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    font: &fontdue::Font,
+    layout: &PillLayout,
+) {
+    let mut pen_x = layout.text_x;
+    let baseline = layout.baseline_y;
+    for ch in layout.text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, layout.px_size);
+        let glyph_origin_x = pen_x + metrics.xmin as f32;
+        let glyph_origin_y = baseline - metrics.ymin as f32 - metrics.height as f32;
+        composite_glyph(
+            canvas,
+            buf_w,
+            buf_h,
+            &bitmap,
+            metrics.width as u32,
+            metrics.height as u32,
+            glyph_origin_x,
+            glyph_origin_y,
+        );
+        pen_x += metrics.advance_width;
+    }
+}
+
+fn composite_glyph(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    bitmap: &[u8],
+    glyph_w: u32,
+    glyph_h: u32,
+    pos_x: f32,
+    pos_y: f32,
+) {
+    if glyph_w == 0 || glyph_h == 0 {
+        return;
+    }
+    let base_x = pos_x.round() as i32;
+    let base_y = pos_y.round() as i32;
+    for j in 0..glyph_h as i32 {
+        let y = base_y + j;
+        if y < 0 || y as u32 >= buf_h {
+            continue;
+        }
+        for i in 0..glyph_w as i32 {
+            let x = base_x + i;
+            if x < 0 || x as u32 >= buf_w {
+                continue;
+            }
+            let alpha = bitmap[(j as u32 * glyph_w + i as u32) as usize];
+            if alpha == 0 {
+                continue;
+            }
+            let idx = (y as u32 * buf_w + x as u32) as usize * 4;
+            let inv = 255u16 - alpha as u16;
+            // Source is opaque white at `alpha`; premultiplied = (a,a,a,a).
+            // out = src + dst * (1 - src.a)
+            //     = alpha + dst * inv / 255 (per channel, including alpha)
+            canvas[idx] = (alpha as u16 + (canvas[idx] as u16 * inv) / 255) as u8;
+            canvas[idx + 1] = (alpha as u16 + (canvas[idx + 1] as u16 * inv) / 255) as u8;
+            canvas[idx + 2] = (alpha as u16 + (canvas[idx + 2] as u16 * inv) / 255) as u8;
+            canvas[idx + 3] = (alpha as u16 + (canvas[idx + 3] as u16 * inv) / 255) as u8;
+        }
+    }
+}
+
+/// Build a horizontal pill path (rectangle with fully-rounded ends).
+/// `w` must be ≥ `h`; otherwise returns `None`.
+fn pill_path(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
+    use tiny_skia::PathBuilder;
+    if w < h {
+        return None;
+    }
+    let r = h * 0.5;
+    let cy = y + r;
+    // Cubic Bezier circle approximation: control offset = r * 0.5523.
+    let k = r * 0.5523;
+    let mut pb = PathBuilder::new();
+    // Top edge (left-corner end → right-corner start).
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    // Right cap as two cubic quarters.
+    pb.cubic_to(x + w - r + k, y, x + w, cy - k, x + w, cy);
+    pb.cubic_to(x + w, cy + k, x + w - r + k, y + h, x + w - r, y + h);
+    // Bottom edge.
+    pb.line_to(x + r, y + h);
+    // Left cap.
+    pb.cubic_to(x + r - k, y + h, x, cy + k, x, cy);
+    pb.cubic_to(x, cy - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+fn stroke_circle(
+    pixmap: &mut tiny_skia::PixmapMut,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    paint: &tiny_skia::Paint,
+) {
+    use tiny_skia::*;
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, radius);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(
+            &path,
+            paint,
+            &Stroke {
+                width: 1.5,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+fn video_format_to_pixel_format(
+    vf: pipewire::spa::param::video::VideoFormat,
+) -> Result<PixelFormat> {
+    use pipewire::spa::param::video::VideoFormat as VF;
+    match vf {
+        VF::BGRA => Ok(PixelFormat::Bgra8),
+        VF::BGRx => Ok(PixelFormat::Bgrx8),
+        VF::RGBA => Ok(PixelFormat::Rgba8),
+        VF::RGBx => Ok(PixelFormat::Rgbx8),
+        VF::xRGB => Ok(PixelFormat::Xrgb8),
+        VF::xBGR => Ok(PixelFormat::Xbgr8),
+        other => Err(PlatformError::Unsupported {
+            what: match other {
+                _ => "unrecognized PipeWire video format",
+            },
+        }),
+    }
+}
+
+/// Pre-multiplied RGBA, stored in memory as R G B A. Matches both
+/// tiny-skia's `PremultipliedColorU8` byte layout and wl_shm's
+/// `Abgr8888` format.
+fn rgba8888_premul(c: Color) -> [u8; 4] {
     let a = c.a as u16;
     let r = (c.r as u16 * a / 255) as u8;
     let g = (c.g as u16 * a / 255) as u8;
     let b = (c.b as u16 * a / 255) as u8;
-    [b, g, r, c.a]
+    [r, g, b, c.a]
 }

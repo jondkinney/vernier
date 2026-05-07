@@ -74,6 +74,93 @@ pub struct Frame {
     pub pixels: Vec<u8>,
 }
 
+/// Pixel layout used by [`NativeFrame`]. Edge detection treats all
+/// 4-byte formats as equivalent because its color delta is symmetric
+/// across R/G/B; consumers that care about the exact byte order (e.g.
+/// PNG export) need to inspect this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Bgra8,
+    Bgrx8,
+    Rgba8,
+    Rgbx8,
+    Xrgb8,
+    Xbgr8,
+}
+
+/// Capture in the source's native pixel format, with the original
+/// per-row `stride`. Used by the live measurement loop to skip the
+/// BGRA→RGBA conversion that [`Frame`] requires.
+#[derive(Debug, Clone)]
+pub struct NativeFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row. May exceed `width * 4` when the source pads rows.
+    pub stride: u32,
+    pub format: PixelFormat,
+    pub bounds: Rect,
+    pub scale_factor: f64,
+    pub pixels: Vec<u8>,
+}
+
+/// A heads-up display the overlay should render on top of its background
+/// tint. Coordinates are surface-local pixels (logical px on Wayland).
+#[derive(Debug, Clone)]
+pub struct Hud {
+    pub kind: HudKind,
+    /// Background tint. Pass `Color::TRANSPARENT` for an undecorated HUD
+    /// over the bare desktop.
+    pub background: Color,
+    /// Foreground stroke color for HUD primitives.
+    pub foreground: Color,
+}
+
+impl Hud {
+    pub fn hover(cursor: (f64, f64)) -> Self {
+        Self {
+            kind: HudKind::Hover {
+                cursor,
+                edges: [None; 4],
+            },
+            // Fully transparent so the user can read what's behind the
+            // overlay while measuring — only the HUD strokes draw.
+            background: Color::TRANSPARENT,
+            // Coral/red.
+            foreground: Color::rgba(0xFF, 0x5C, 0x5C, 0xF5),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum HudKind {
+    /// User is hovering — show a crosshair at the cursor and tick marks
+    /// at any detected edges.
+    Hover {
+        cursor: (f64, f64),
+        edges: [Option<HudEdge>; 4],
+    },
+    /// User is mid-drag from `start` to `cursor`.
+    Drawing { start: (f64, f64), cursor: (f64, f64) },
+    /// A measurement was committed; show the segment from `start` to
+    /// `end` until the user starts another one.
+    Held { start: (f64, f64), end: (f64, f64) },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HudEdge {
+    pub axis: HudAxis,
+    pub position: (f64, f64),
+    pub distance_px: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudAxis {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppIdentity {
     pub id: String,

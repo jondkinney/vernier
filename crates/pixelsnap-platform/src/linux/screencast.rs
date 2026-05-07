@@ -442,7 +442,10 @@ async fn open_session_async(prev_token: Option<String>) -> Result<SessionState> 
     let mut select_opts = SelectSourcesOptions::default()
         .set_sources(BitFlags::from_flag(SourceType::Monitor))
         .set_multiple(true)
-        .set_cursor_mode(CursorMode::Embedded)
+        // `Hidden` keeps the OS cursor out of the captured frame so edge
+        // detection doesn't see the cursor as an edge. The compositor
+        // still renders a cursor on top of our overlay surface.
+        .set_cursor_mode(CursorMode::Hidden)
         .set_persist_mode(PersistMode::ExplicitlyRevoked);
     if let Some(t) = prev_token.as_deref() {
         select_opts = select_opts.set_restore_token(t);

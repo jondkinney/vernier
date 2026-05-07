@@ -25,6 +25,17 @@ pub trait Platform: Send + Sync {
     /// Capture a still RGBA8 frame of `monitor`.
     fn capture_screen(&self, monitor: MonitorId) -> Result<Frame>;
 
+    /// Like [`capture_screen`] but returns the buffer in its source
+    /// pixel format with the original per-row stride. Designed for the
+    /// live measurement loop, where R/B order doesn't matter (the edge
+    /// detector's color delta is symmetric) and the conversion to
+    /// tightly-packed RGBA8 would dominate the per-frame cost.
+    fn capture_screen_native(&self, _monitor: MonitorId) -> Result<NativeFrame> {
+        Err(PlatformError::Unsupported {
+            what: "capture_screen_native is not implemented for this platform",
+        })
+    }
+
     /// Register a global hotkey. Activations arrive as
     /// [`PlatformEvent::HotkeyPressed`]. `label` is shown to the user by the
     /// host (e.g. portal dialog) and stored alongside the binding.
@@ -53,6 +64,9 @@ pub trait OverlayOps: Send {
     /// — pointer events go to underlying windows. When `true`, the
     /// surface receives pointer enter/move/button + keyboard events.
     fn set_input_capturing(&mut self, capturing: bool);
+    /// Replace the overlay's heads-up display with `hud`. Pass `None`
+    /// to clear the HUD and revert to the bare tint.
+    fn set_hud(&mut self, hud: Option<Hud>);
 }
 
 /// Owned handle to an overlay surface. Drop to destroy.
@@ -84,6 +98,9 @@ impl OverlayHandle {
     }
     pub fn set_input_capturing(&mut self, capturing: bool) {
         self.inner.set_input_capturing(capturing)
+    }
+    pub fn set_hud(&mut self, hud: Option<Hud>) {
+        self.inner.set_hud(hud)
     }
 }
 
