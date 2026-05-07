@@ -1201,11 +1201,13 @@ fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &
 
     // tiny-skia phase scoped so its &mut borrow on canvas is released
     // before we rasterize glyphs into it.
-    let pill = render_hud_strokes(canvas, buf_w, buf_h, scale, hud);
+    let pills = render_hud_strokes(canvas, buf_w, buf_h, scale, hud);
 
-    if let Some(layout) = pill {
+    if !pills.is_empty() {
         if let Some(font) = hud_font() {
-            render_pill_text(canvas, buf_w, buf_h, font, &layout);
+            for layout in &pills {
+                render_pill_text(canvas, buf_w, buf_h, font, layout);
+            }
         }
     }
 }
@@ -1216,9 +1218,11 @@ fn render_hud_strokes(
     buf_h: u32,
     scale: u32,
     hud: &Hud,
-) -> Option<PillLayout> {
+) -> Vec<PillLayout> {
     use tiny_skia::*;
-    let mut pixmap = PixmapMut::from_bytes(canvas, buf_w, buf_h)?;
+    let Some(mut pixmap) = PixmapMut::from_bytes(canvas, buf_w, buf_h) else {
+        return Vec::new();
+    };
     let scale_f = scale as f32;
 
     let fg = hud.foreground;
@@ -1239,9 +1243,98 @@ fn render_hud_strokes(
         ..Default::default()
     };
 
-    let mut pill: Option<PillLayout> = None;
+    let mut pills: Vec<PillLayout> = Vec::new();
     match &hud.kind {
         HudKind::Hover { cursor, edges } => {
+            draw_hover_indicators(
+                &mut pixmap,
+                &mut pills,
+                cursor,
+                edges,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &paint,
+                &stroke,
+                &tick_stroke,
+                true,
+            );
+        }
+        HudKind::Drawing { start, cursor } => {
+            draw_area_rect(
+                &mut pixmap,
+                &mut pills,
+                start,
+                cursor,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &stroke,
+                &paint,
+            );
+        }
+        HudKind::Held {
+            rect_start,
+            rect_end,
+            cursor,
+            edges,
+        } => {
+            draw_area_rect(
+                &mut pixmap,
+                &mut pills,
+                rect_start,
+                rect_end,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &stroke,
+                &paint,
+            );
+            draw_hover_indicators(
+                &mut pixmap,
+                &mut pills,
+                cursor,
+                edges,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &paint,
+                &stroke,
+                &tick_stroke,
+                false,
+            );
+        }
+    }
+    pills
+}
+
+/// Draw the live measure crosshair: axis lines through the cursor with
+/// tick caps where edges were detected, plus the white `+` cursor
+/// marker on top. When `show_dim_pill` is true, also emits a W×H pill
+/// in the lower-right of the cursor (Hover mode); Held mode passes
+/// false because the held rectangle has its own central pill.
+#[allow(clippy::too_many_arguments)]
+fn draw_hover_indicators(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    cursor: &(f64, f64),
+    edges: &[Option<crate::HudEdge>; 4],
+    buf_w: f32,
+    buf_h: f32,
+    scale: u32,
+    fg: Color,
+    paint: &tiny_skia::Paint,
+    stroke: &tiny_skia::Stroke,
+    tick_stroke: &tiny_skia::Stroke,
+    show_dim_pill: bool,
+) {
+    use tiny_skia::*;
+    let scale_f = scale as f32;
+    {
             // Convert surface-logical coords to buffer-physical, snap
             // to the pixel grid, offset by stroke half-width so non-AA
             // strokes land cleanly on integer columns / rows. Without
@@ -1252,8 +1345,8 @@ fn render_hud_strokes(
             let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
             let cx = snap(cursor.0);
             let cy = snap(cursor.1);
-            let surface_w = buf_w as f32;
-            let surface_h = buf_h as f32;
+            let surface_w = buf_w;
+            let surface_h = buf_h;
 
             // Horizontal axis line: spans from left snap edge (or screen
             // left) to right snap edge (or screen right), through cursor.
@@ -1400,40 +1493,220 @@ fn render_hud_strokes(
                 pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
             }
 
-            pill = Some(PillLayout {
+            pills.push(PillLayout {
                 text,
                 text_x: pill_x + pad_x,
                 baseline_y: pill_y + pad_y + ascent,
                 px_size,
             });
-        }
-        HudKind::Drawing { start, cursor } => {
-            let (sx, sy) = (start.0 as f32, start.1 as f32);
-            let (cx, cy) = (cursor.0 as f32, cursor.1 as f32);
-            let mut pb = PathBuilder::new();
-            pb.move_to(sx, sy);
-            pb.line_to(cx, cy);
-            if let Some(path) = pb.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
-            // Endpoint markers.
-            stroke_circle(&mut pixmap, sx, sy, 4.0, &paint);
-            stroke_circle(&mut pixmap, cx, cy, 4.0, &paint);
-        }
-        HudKind::Held { start, end } => {
-            let (sx, sy) = (start.0 as f32, start.1 as f32);
-            let (ex, ey) = (end.0 as f32, end.1 as f32);
-            let mut pb = PathBuilder::new();
-            pb.move_to(sx, sy);
-            pb.line_to(ex, ey);
-            if let Some(path) = pb.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
-            stroke_circle(&mut pixmap, sx, sy, 4.0, &paint);
-            stroke_circle(&mut pixmap, ex, ey, 4.0, &paint);
+    }
+}
+
+/// Draw the rectangle for an in-progress drag (Drawing) or a committed
+/// measurement (Held), plus the W×H and aspect-ratio pills.
+#[allow(clippy::too_many_arguments)]
+fn draw_area_rect(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    a: &(f64, f64),
+    b: &(f64, f64),
+    buf_w: f32,
+    buf_h: f32,
+    scale: u32,
+    fg: Color,
+    stroke: &tiny_skia::Stroke,
+    line_paint: &tiny_skia::Paint,
+) {
+    use tiny_skia::*;
+    let scale_f = scale as f32;
+    let half = scale_f * 0.5;
+    let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
+    let ax = snap(a.0);
+    let ay = snap(a.1);
+    let bx = snap(b.0);
+    let by = snap(b.1);
+    let rx = ax.min(bx);
+    let ry = ay.min(by);
+    let rw = (ax - bx).abs();
+    let rh = (ay - by).abs();
+    if rw < scale_f || rh < scale_f {
+        return;
+    }
+    if let Some(rect) = Rect::from_xywh(rx, ry, rw, rh) {
+        // Translucent fill — keeps the underlying content readable.
+        let mut fill_paint = Paint::default();
+        fill_paint.set_color_rgba8(fg.r, fg.g, fg.b, 40);
+        pixmap.fill_rect(rect, &fill_paint, Transform::identity(), None);
+        // Solid border at the same stroke as axis lines.
+        let mut pb = PathBuilder::new();
+        pb.push_rect(rect);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, line_paint, stroke, Transform::identity(), None);
         }
     }
-    pill
+    let w_logical = (rw / scale_f).round() as u32;
+    let h_logical = (rh / scale_f).round() as u32;
+
+    // W × H pill, centered inside the rectangle.
+    let dim_text = format!("{} \u{00D7} {}", w_logical, h_logical);
+    push_pill(
+        pixmap,
+        pills,
+        dim_text,
+        rx + rw * 0.5,
+        ry + rh * 0.5,
+        PillAnchor::Centered,
+        buf_w,
+        buf_h,
+        scale_f,
+    );
+
+    // Aspect ratio pill, just below the rectangle.
+    if let Some(aspect_text) = estimate_aspect_text(w_logical, h_logical) {
+        let below_y = ry + rh + 24.0 * scale_f;
+        push_pill(
+            pixmap,
+            pills,
+            aspect_text,
+            rx + rw * 0.5,
+            below_y,
+            PillAnchor::AnchorTop,
+            buf_w,
+            buf_h,
+            scale_f,
+        );
+    }
+}
+
+/// Find the simplest fraction approximating `width : height`. Returns
+/// the ratio formatted as either `A : B` (exact match against a curated
+/// common ratio) or `~ A : B` (approximate). Returns `None` if nothing
+/// within tolerance bounds is found.
+///
+/// Approach: first check a curated list of "real" display/photo ratios
+/// (16:9, 4:3, etc.) within 2% — those get displayed as-is. If nothing
+/// matches there, enumerate fractions by smallest denominator first and
+/// return the first one within 4%, marked approximate.
+fn estimate_aspect_text(width: u32, height: u32) -> Option<String> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let target = width as f64 / height as f64;
+
+    // Real-world display, photography, and print ratios. Both
+    // orientations included so portrait rectangles match too.
+    const CURATED: &[(u32, u32)] = &[
+        (1, 1),
+        (16, 9),
+        (9, 16),
+        (4, 3),
+        (3, 4),
+        (16, 10),
+        (10, 16),
+        (21, 9),
+        (9, 21),
+        (3, 2),
+        (2, 3),
+        (5, 4),
+        (4, 5),
+        (5, 3),
+        (3, 5),
+        (2, 1),
+        (1, 2),
+    ];
+
+    let mut best_curated: Option<((u32, u32), f64)> = None;
+    for &(n, d) in CURATED {
+        let r = n as f64 / d as f64;
+        let err = (r - target).abs() / target;
+        if err <= 0.02 && best_curated.map_or(true, |(_, e)| err < e) {
+            best_curated = Some(((n, d), err));
+        }
+    }
+    if let Some(((n, d), err)) = best_curated {
+        let prefix = if err < 0.005 { "" } else { "\u{223C} " };
+        return Some(format!("{}{} : {}", prefix, n, d));
+    }
+
+    // Smallest-denominator approximation. 4% tolerance picks "simple"
+    // fractions like 7 : 5 for slightly-off ratios where no curated
+    // option fits.
+    for b in 1..=10u32 {
+        let a = (target * b as f64).round() as u32;
+        if a == 0 {
+            continue;
+        }
+        if gcd_u32(a, b) != 1 {
+            continue;
+        }
+        let r = a as f64 / b as f64;
+        let err = (r - target).abs() / target;
+        if err <= 0.04 {
+            return Some(format!("\u{223C} {} : {}", a, b));
+        }
+    }
+    None
+}
+
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd_u32(b, a % b) }
+}
+
+#[derive(Copy, Clone)]
+enum PillAnchor {
+    /// Position pill so its center lands at (anchor_x, anchor_y).
+    Centered,
+    /// Position pill so its top-center lands at (anchor_x, anchor_y).
+    AnchorTop,
+    /// Lower-right of the anchor by the given buffer-pixel offset.
+    BelowRight(f32),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_pill(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    text: String,
+    anchor_x: f32,
+    anchor_y: f32,
+    anchor: PillAnchor,
+    surface_w: f32,
+    surface_h: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    let Some(font) = hud_font() else { return; };
+    let px_size = TEXT_LOGICAL_PX * scale_f;
+    let text_w = measure_text_width(font, &text, px_size);
+    let (ascent, descent) = font
+        .horizontal_line_metrics(px_size)
+        .map(|m| (m.ascent, -m.descent))
+        .unwrap_or((px_size * 0.8, px_size * 0.2));
+    let pad_x = 14.0 * scale_f;
+    let pad_y = 7.0 * scale_f;
+    let pill_w = text_w.ceil() + pad_x * 2.0;
+    let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+
+    let (mut pill_x, mut pill_y) = match anchor {
+        PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
+        PillAnchor::AnchorTop => (anchor_x - pill_w * 0.5, anchor_y),
+        PillAnchor::BelowRight(off) => (anchor_x + off, anchor_y + off),
+    };
+    pill_x = pill_x.floor().min(surface_w - pill_w - 1.0).max(0.0);
+    pill_y = pill_y.floor().min(surface_h - pill_h - 1.0).max(0.0);
+
+    let mut bg_paint = Paint::default();
+    bg_paint.set_color_rgba8(40, 40, 40, 230);
+    bg_paint.anti_alias = true;
+    if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+        pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+    }
+    pills.push(PillLayout {
+        text,
+        text_x: pill_x + pad_x,
+        baseline_y: pill_y + pad_y + ascent,
+        px_size,
+    });
 }
 
 /// Rasterize the dimension-readout text into the buffer using fontdue.

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vernier_core::{
-    classify_aspect, detect_edges, AspectMode, EdgeQuad, FrameView, InteractionMode, Measurement,
-    Px, SnapPoint, Tolerance,
+    classify_aspect, detect_edges, shrink_to_content, AspectMode, EdgeQuad, FrameView,
+    InteractionMode, Measurement, Px, SnapPoint, Tolerance,
 };
 use vernier_platform::{
     Accelerator, Frame, Hud, HudAxis, HudEdge, HudKind, MonitorId, NativeFrame, Platform,
@@ -209,7 +209,15 @@ fn run_daemon() -> Result<()> {
                 button, pressed, x, y, ..
             }) => {
                 if button == BTN_LEFT {
-                    handle_pointer_button(&mut mode, &mut overlay, pressed, x, y);
+                    handle_pointer_button(
+                        &mut mode,
+                        &mut overlay,
+                        pressed,
+                        x,
+                        y,
+                        frozen_frame.as_ref(),
+                        tolerance,
+                    );
                     last_hud_redraw = Instant::now();
                 }
             }
@@ -500,9 +508,24 @@ fn refresh_hud(
             hud.kind = HudKind::Drawing { start: start_pos, cursor: (x, y) };
             overlay.set_hud(Some(hud));
         }
-        InteractionMode::Held { .. } => {
-            // Held HUD is set when the measurement is committed and
-            // doesn't update on cursor move.
+        InteractionMode::Held { measurement, .. } => {
+            // After release, the held rectangle persists but the live
+            // crosshair tracks the cursor on top of it. Edge detection
+            // continues against the frozen frame so the user can keep
+            // measuring nearby UI without re-triggering measurement mode.
+            let edges = frozen_frame
+                .and_then(|f| detect_hud_edges(f, x, y, tolerance))
+                .unwrap_or([None; 4]);
+            let rect_start = (measurement.start.pixel.x as f64, measurement.start.pixel.y as f64);
+            let rect_end = (measurement.end.pixel.x as f64, measurement.end.pixel.y as f64);
+            let mut hud = Hud::hover((x, y));
+            hud.kind = HudKind::Held {
+                rect_start,
+                rect_end,
+                cursor: (x, y),
+                edges,
+            };
+            overlay.set_hud(Some(hud));
         }
     }
 }
@@ -600,6 +623,8 @@ fn handle_pointer_button(
     pressed: bool,
     x: f64,
     y: f64,
+    frozen_frame: Option<&vernier_platform::NativeFrame>,
+    tolerance: u32,
 ) {
     let cursor_px = Px::new(x as i32, y as i32);
     if pressed {
@@ -615,8 +640,20 @@ fn handle_pointer_button(
             _ => {}
         }
     } else if let InteractionMode::Drawing { start, .. } = mode {
-        let end = SnapPoint::loose(cursor_px);
-        let measurement = Measurement::new(*start, end);
+        let raw_start = (start.pixel.x as f64, start.pixel.y as f64);
+        let raw_end = (x, y);
+        // Snap-shrink: walk inward from each side of the dragged rect
+        // until we hit content. Matches macOS shrink-to-fit on
+        // release. Falls back to the raw rect if no frame or no
+        // content boundary was found.
+        let (snapped_start, snapped_end) =
+            snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance);
+        let snapped_start_px = Px::new(snapped_start.0.round() as i32, snapped_start.1.round() as i32);
+        let snapped_end_px = Px::new(snapped_end.0.round() as i32, snapped_end.1.round() as i32);
+        let measurement = Measurement::new(
+            SnapPoint::loose(snapped_start_px),
+            SnapPoint::loose(snapped_end_px),
+        );
         let aspect = if measurement.width() > 0 && measurement.height() > 0 {
             classify_aspect(
                 measurement.width(),
@@ -628,19 +665,61 @@ fn handle_pointer_button(
             None
         };
         log::info!(
-            "measurement: {}×{}px hypot={:.1}px aspect={:?}",
+            "measurement: {}×{}px (drag was {}×{}px) aspect={:?}",
             measurement.width(),
             measurement.height(),
-            measurement.euclid(),
+            (raw_end.0 - raw_start.0).abs() as i32,
+            (raw_end.1 - raw_start.1).abs() as i32,
             aspect,
         );
-        let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
-        let end_pos = (x, y);
         *mode = InteractionMode::Held { measurement, cursor: cursor_px };
         let mut hud = Hud::hover((x, y));
-        hud.kind = HudKind::Held { start: start_pos, end: end_pos };
+        hud.kind = HudKind::Held {
+            rect_start: snapped_start,
+            rect_end: snapped_end,
+            cursor: (x, y),
+            edges: [None; 4],
+        };
         overlay.set_hud(Some(hud));
     }
+}
+
+/// Apply [`shrink_to_content`] to a rect given in surface (logical)
+/// coords. Maps logical → frame coords, runs the shrink, maps back.
+fn snap_shrink_logical_rect(
+    frozen_frame: Option<&vernier_platform::NativeFrame>,
+    a: (f64, f64),
+    b: (f64, f64),
+    tolerance: u32,
+) -> ((f64, f64), (f64, f64)) {
+    let Some(frame) = frozen_frame else {
+        return (a, b);
+    };
+    let surface_w = frame.bounds.w as f64;
+    let surface_h = frame.bounds.h as f64;
+    if surface_w <= 0.0 || surface_h <= 0.0 {
+        return (a, b);
+    }
+    let scale_x = frame.width as f64 / surface_w;
+    let scale_y = frame.height as f64 / surface_h;
+    let view = FrameView {
+        pixels: &frame.pixels,
+        width: frame.width,
+        height: frame.height,
+        stride: frame.stride,
+    };
+    let fx0 = (a.0 * scale_x).round() as i32;
+    let fy0 = (a.1 * scale_y).round() as i32;
+    let fx1 = (b.0 * scale_x).round() as i32;
+    let fy1 = (b.1 * scale_y).round() as i32;
+    let (sx0, sy0, sx1, sy1) =
+        shrink_to_content(&view, fx0, fy0, fx1, fy1, Tolerance(tolerance));
+    let inv_x = 1.0 / scale_x;
+    let inv_y = 1.0 / scale_y;
+    (
+        (sx0 as f64 * inv_x, sy0 as f64 * inv_y),
+        (sx1 as f64 * inv_x, sy1 as f64 * inv_y),
+    )
 }
 
 fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {

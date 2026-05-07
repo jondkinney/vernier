@@ -141,9 +141,16 @@ pub enum HudKind {
     },
     /// User is mid-drag from `start` to `cursor`.
     Drawing { start: (f64, f64), cursor: (f64, f64) },
-    /// A measurement was committed; show the segment from `start` to
-    /// `end` until the user starts another one.
-    Held { start: (f64, f64), end: (f64, f64) },
+    /// A measurement was committed and is being held on screen, while the
+    /// live crosshair still tracks the cursor on top of it. Click again to
+    /// start a new measurement; click on the W×H pill to capture the held
+    /// region as a screenshot.
+    Held {
+        rect_start: (f64, f64),
+        rect_end: (f64, f64),
+        cursor: (f64, f64),
+        edges: [Option<HudEdge>; 4],
+    },
 }
 
 #[derive(Debug, Clone, Copy)]

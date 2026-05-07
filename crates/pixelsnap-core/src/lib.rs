@@ -11,7 +11,7 @@ pub mod measurement;
 
 pub use aspect::{classify as classify_aspect, CommonRatio, Mode as AspectMode, Ratio};
 pub use color::Rgba;
-pub use edge::{detect_edges, Direction, EdgeCandidate, EdgeQuad, Tolerance};
+pub use edge::{detect_edges, shrink_to_content, Direction, EdgeCandidate, EdgeQuad, Tolerance};
 pub use frame::FrameView;
 pub use geometry::{Px, PxRect};
 pub use measurement::{

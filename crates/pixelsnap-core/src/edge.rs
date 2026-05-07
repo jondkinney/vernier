@@ -133,6 +133,97 @@ fn scan(
     }
 }
 
+/// Shrink the rectangle `(x0, y0, x1, y1)` to the content bounding box
+/// within `frame`. Walks inward from each side until hitting the first
+/// row/column with pixels that differ from the rect's top-left corner
+/// pixel by more than `tolerance`. Useful for "fit-to-content" snapping
+/// on a user-dragged region.
+///
+/// Coordinates are in frame pixel space and may extend outside the
+/// frame; they're clamped before scanning. If shrinking would
+/// degenerate the rect to zero/negative area, the original
+/// (unclamped) rect is returned unchanged.
+pub fn shrink_to_content(
+    frame: &FrameView,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    tolerance: Tolerance,
+) -> (i32, i32, i32, i32) {
+    let (rx0, rx1) = (x0.min(x1), x0.max(x1));
+    let (ry0, ry1) = (y0.min(y1), y0.max(y1));
+    let fw = frame.width as i32;
+    let fh = frame.height as i32;
+    let cx0 = rx0.max(0).min(fw - 1);
+    let cy0 = ry0.max(0).min(fh - 1);
+    let cx1 = rx1.max(0).min(fw - 1);
+    let cy1 = ry1.max(0).min(fh - 1);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return (x0, y0, x1, y1);
+    }
+    let bg = match frame.pixel(cx0 as u32, cy0 as u32) {
+        Some(p) => p,
+        None => return (x0, y0, x1, y1),
+    };
+    let tol = tolerance.0;
+
+    let row_has_content = |y: i32, x_start: i32, x_end: i32| -> bool {
+        for x in x_start..=x_end {
+            if let Some(p) = frame.pixel(x as u32, y as u32) {
+                if bg.rgb_delta(p) >= tol {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let col_has_content = |x: i32, y_start: i32, y_end: i32| -> bool {
+        for y in y_start..=y_end {
+            if let Some(p) = frame.pixel(x as u32, y as u32) {
+                if bg.rgb_delta(p) >= tol {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    let mut new_top = cy0;
+    for y in cy0..=cy1 {
+        if row_has_content(y, cx0, cx1) {
+            new_top = y;
+            break;
+        }
+    }
+    let mut new_bot = cy1;
+    for y in (new_top..=cy1).rev() {
+        if row_has_content(y, cx0, cx1) {
+            new_bot = y;
+            break;
+        }
+    }
+    let mut new_left = cx0;
+    for x in cx0..=cx1 {
+        if col_has_content(x, new_top, new_bot) {
+            new_left = x;
+            break;
+        }
+    }
+    let mut new_right = cx1;
+    for x in (new_left..=cx1).rev() {
+        if col_has_content(x, new_top, new_bot) {
+            new_right = x;
+            break;
+        }
+    }
+
+    if new_right <= new_left || new_bot <= new_top {
+        return (x0, y0, x1, y1);
+    }
+    (new_left, new_top, new_right, new_bot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +338,42 @@ mod tests {
         // Strict (8): edge found at x=12.
         let edges = detect_edges(&frame, Px::new(8, 8), Tolerance::STRICT);
         assert_eq!(edges[1].expect("strict right").position, Px::new(12, 8));
+    }
+
+    #[test]
+    fn shrink_fits_inner_content() {
+        // 32x32 white frame with a black 8x8 block at (12..20, 14..22).
+        let mut buf = solid(32, 32, Rgba::WHITE);
+        for y in 14..22 {
+            for x in 12..20 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        let frame = FrameView::packed(&buf, 32, 32).unwrap();
+        // Drag rect from (5, 5) to (28, 28) — should shrink to fit
+        // the black block.
+        let (x0, y0, x1, y1) = shrink_to_content(&frame, 5, 5, 28, 28, Tolerance::DEFAULT);
+        assert_eq!((x0, y0, x1, y1), (12, 14, 19, 21));
+    }
+
+    #[test]
+    fn shrink_returns_original_on_uniform_content() {
+        // Uniform frame — no content to shrink to.
+        let buf = solid(16, 16, Rgba::WHITE);
+        let frame = FrameView::packed(&buf, 16, 16).unwrap();
+        let r = shrink_to_content(&frame, 2, 2, 14, 14, Tolerance::DEFAULT);
+        assert_eq!(r, (2, 2, 14, 14));
+    }
+
+    #[test]
+    fn shrink_handles_out_of_bounds_rect() {
+        let buf = solid(16, 16, Rgba::WHITE);
+        let frame = FrameView::packed(&buf, 16, 16).unwrap();
+        let r = shrink_to_content(&frame, -10, -10, 100, 100, Tolerance::DEFAULT);
+        // Clamps to the frame; uniform white inside means "no content
+        // boundary found", so we return the clamped rect rather than
+        // the original off-screen one.
+        assert_eq!(r, (0, 0, 15, 15));
     }
 
     #[test]
