@@ -121,7 +121,7 @@ fn run_gtk_tray(
     let icon = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(&initial.tooltip)
-        .with_icon(make_placeholder_icon())
+        .with_icon(make_app_icon())
         .build()
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("tray build: {e}")))?;
 
@@ -247,31 +247,173 @@ fn append_to_submenu(parent: &tray_icon::menu::Submenu, item: &TrayMenuItem) -> 
     Ok(())
 }
 
-fn make_placeholder_icon() -> tray_icon::Icon {
-    let size: i32 = 32;
-    let cx: i32 = size / 2;
-    let cy: i32 = size / 2;
-    let r_outer: i32 = (size / 2) - 1;
-    let r_inner: i32 = (size / 2) - 6;
-    let r_outer_sq = r_outer * r_outer;
-    let r_inner_sq = r_inner * r_inner;
+/// Render the app/tray icon procedurally. Inspired by macOS on
+/// macOS — rounded square, gradient background, black cross with
+/// T-shaped tick caps, small pill in the lower-right with measurement
+/// dashes — but with a Linux-flavored teal-to-violet palette so it
+/// reads as the Wayland port rather than a copy.
+fn make_app_icon() -> tray_icon::Icon {
+    use tiny_skia::*;
+    const SIZE: u32 = 64;
+    let s = SIZE as f32;
+    let mut pixmap = Pixmap::new(SIZE, SIZE).expect("alloc app icon pixmap");
 
-    let mut rgba: Vec<u8> = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x - cx;
-            let dy = y - cy;
-            let r2 = dx * dx + dy * dy;
-            let pixel: [u8; 4] = if r2 <= r_outer_sq && r2 > r_inner_sq {
-                [0x00, 0x88, 0xFF, 0xFF]
-            } else if r2 <= r_inner_sq {
-                [0x00, 0x44, 0x88, 0xFF]
-            } else {
-                [0x00, 0x00, 0x00, 0x00]
-            };
-            rgba.extend_from_slice(&pixel);
+    // --- Rounded-square background with a teal → violet gradient.
+    let inset = 2.0;
+    let radius = 12.0;
+    let bg_path = {
+        let mut pb = PathBuilder::new();
+        let x0 = inset;
+        let y0 = inset;
+        let x1 = s - inset;
+        let y1 = s - inset;
+        pb.move_to(x0 + radius, y0);
+        pb.line_to(x1 - radius, y0);
+        pb.quad_to(x1, y0, x1, y0 + radius);
+        pb.line_to(x1, y1 - radius);
+        pb.quad_to(x1, y1, x1 - radius, y1);
+        pb.line_to(x0 + radius, y1);
+        pb.quad_to(x0, y1, x0, y1 - radius);
+        pb.line_to(x0, y0 + radius);
+        pb.quad_to(x0, y0, x0 + radius, y0);
+        pb.close();
+        pb.finish().expect("bg path")
+    };
+    let bg_shader = LinearGradient::new(
+        Point::from_xy(inset, inset),
+        Point::from_xy(s - inset, s - inset),
+        vec![
+            GradientStop::new(0.0, Color::from_rgba8(0x4C, 0xC9, 0xF0, 0xFF)), // teal
+            GradientStop::new(1.0, Color::from_rgba8(0x7B, 0x2C, 0xBF, 0xFF)), // violet
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .expect("bg gradient");
+    let mut bg_paint = Paint {
+        shader: bg_shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    bg_paint.anti_alias = true;
+    pixmap.fill_path(
+        &bg_path,
+        &bg_paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    // --- Cross with T-shaped end caps.
+    let mut ink = Paint::default();
+    ink.set_color_rgba8(0x10, 0x10, 0x10, 0xEE);
+    ink.anti_alias = true;
+    let cross_pad = 11.0;
+    let arm_thick = 5.0;
+    let cap_thick = 4.0;
+    let cap_extent = 16.0;
+    let center = s * 0.5;
+
+    // Vertical and horizontal arms.
+    if let Some(r) =
+        Rect::from_xywh(center - arm_thick * 0.5, cross_pad, arm_thick, s - 2.0 * cross_pad)
+    {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+    if let Some(r) =
+        Rect::from_xywh(cross_pad, center - arm_thick * 0.5, s - 2.0 * cross_pad, arm_thick)
+    {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+    // Four T caps.
+    if let Some(r) =
+        Rect::from_xywh(center - cap_extent * 0.5, cross_pad, cap_extent, cap_thick)
+    {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+    if let Some(r) = Rect::from_xywh(
+        center - cap_extent * 0.5,
+        s - cross_pad - cap_thick,
+        cap_extent,
+        cap_thick,
+    ) {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+    if let Some(r) =
+        Rect::from_xywh(cross_pad, center - cap_extent * 0.5, cap_thick, cap_extent)
+    {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+    if let Some(r) = Rect::from_xywh(
+        s - cross_pad - cap_thick,
+        center - cap_extent * 0.5,
+        cap_thick,
+        cap_extent,
+    ) {
+        pixmap.fill_rect(r, &ink, Transform::identity(), None);
+    }
+
+    // --- Pill in the lower-right with dashes.
+    let pill_w = 18.0;
+    let pill_h = 8.0;
+    let pill_x = s - cross_pad - pill_w - 1.0;
+    let pill_y = center + 6.0;
+    let pill_path = {
+        let mut pb = PathBuilder::new();
+        let r = pill_h * 0.5;
+        pb.move_to(pill_x + r, pill_y);
+        pb.line_to(pill_x + pill_w - r, pill_y);
+        pb.quad_to(pill_x + pill_w, pill_y, pill_x + pill_w, pill_y + r);
+        pb.quad_to(
+            pill_x + pill_w,
+            pill_y + pill_h,
+            pill_x + pill_w - r,
+            pill_y + pill_h,
+        );
+        pb.line_to(pill_x + r, pill_y + pill_h);
+        pb.quad_to(pill_x, pill_y + pill_h, pill_x, pill_y + r);
+        pb.quad_to(pill_x, pill_y, pill_x + r, pill_y);
+        pb.close();
+        pb.finish().expect("pill path")
+    };
+    let mut pill_paint = Paint::default();
+    pill_paint.set_color_rgba8(0x18, 0x18, 0x18, 0xFF);
+    pill_paint.anti_alias = true;
+    pixmap.fill_path(
+        &pill_path,
+        &pill_paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+    let mut tick = Paint::default();
+    tick.set_color_rgba8(0xF0, 0xF0, 0xF0, 0xF0);
+    let dash_w = 2.4;
+    let dash_h = 2.4;
+    let dash_y = pill_y + pill_h * 0.5 - dash_h * 0.5;
+    let gap = 3.6;
+    let span = 4.0 * dash_w + 3.0 * gap;
+    let mut dash_x = pill_x + (pill_w - span) * 0.5;
+    for _ in 0..4 {
+        if let Some(r) = Rect::from_xywh(dash_x, dash_y, dash_w, dash_h) {
+            pixmap.fill_rect(r, &tick, Transform::identity(), None);
+        }
+        dash_x += dash_w + gap;
+    }
+
+    // --- Convert tiny-skia premultiplied RGBA to non-premultiplied for
+    // tray-icon. Most of the icon is fully opaque so this only matters
+    // along the rounded corners' anti-aliased edges, but doing it
+    // properly avoids a dark fringe.
+    let mut rgba = pixmap.data().to_vec();
+    for chunk in rgba.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a > 0 && a < 255 {
+            let a32 = a as u32;
+            chunk[0] = ((chunk[0] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+            chunk[1] = ((chunk[1] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+            chunk[2] = ((chunk[2] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
         }
     }
-    tray_icon::Icon::from_rgba(rgba, size as u32, size as u32)
-        .expect("placeholder icon construction must succeed")
+    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("app icon construction must succeed")
 }

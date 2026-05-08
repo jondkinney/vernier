@@ -113,6 +113,81 @@ pub struct Hud {
     pub background: Color,
     /// Foreground stroke color for HUD primitives.
     pub foreground: Color,
+    /// Optional dark status pill drawn on top of `kind` (e.g.
+    /// "Tolerance: High" while the user is cycling tolerance levels,
+    /// or "Screenshot taken" right after a capture).
+    pub toast: Option<HudToast>,
+    /// Persistent reference guides. Drawn last so they sit on top of
+    /// `kind` and `toast` — used as anchors to measure against.
+    pub guides: Vec<Guide>,
+    /// "Stuck" axis measurements — frozen snapshots of the live
+    /// crosshair's vertical or horizontal extent, with the pixel
+    /// distance pinned in place.
+    pub stuck_measurements: Vec<StuckMeasurement>,
+    /// Committed rectangle measurements ("held" rects). Each finished
+    /// drag pushes one into this vec — they all stay visible while
+    /// new ones are drawn on top.
+    pub held_rects: Vec<HeldRect>,
+    /// True when the cursor is currently inside any of the held
+    /// rects. Suppresses the live crosshair and draws a plain arrow
+    /// cursor instead.
+    pub cursor_in_rect: bool,
+}
+
+/// A committed rectangle measurement — the data drawn for each
+/// finished drag. `camera_armed` is per-frame transient state set by
+/// the app loop when the cursor hovers the rect's pill.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldRect {
+    pub rect_start: (f64, f64),
+    pub rect_end: (f64, f64),
+    pub camera_armed: bool,
+}
+
+/// A frozen single-axis measurement. Drawn as a coral line spanning
+/// `start..end` with tick caps on both ends and a pill showing the
+/// pixel length.
+#[derive(Debug, Clone, Copy)]
+pub struct StuckMeasurement {
+    /// `Vertical` = a vertical line measuring up-to-down extent.
+    /// `Horizontal` = a horizontal line measuring left-to-right.
+    pub axis: GuideAxis,
+    /// Perpendicular position in logical px (x for Vertical,
+    /// y for Horizontal).
+    pub at: i32,
+    /// Start of the measured span in logical px.
+    pub start: i32,
+    /// End of the measured span in logical px.
+    pub end: i32,
+    /// Transient: true when the cursor is over this measurement's
+    /// pill — renderer swaps the value text for "×" to signal
+    /// "click to remove".
+    pub hovered: bool,
+}
+
+/// A persistent measurement guide line — a 1 physical-pixel blue line
+/// spanning the full buffer along the configured axis.
+#[derive(Debug, Clone, Copy)]
+pub struct Guide {
+    pub axis: GuideAxis,
+    /// Logical pixels on the surface. For [`GuideAxis::Horizontal`]
+    /// this is the y-coordinate; for [`GuideAxis::Vertical`] it's x.
+    pub position: i32,
+    /// Transient: true when the cursor is hovering this line and the
+    /// renderer should draw an "×" hint at the cursor. Click-while-
+    /// hovered removes the guide.
+    pub hovered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuideAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone)]
+pub struct HudToast {
+    pub text: String,
 }
 
 impl Hud {
@@ -127,6 +202,11 @@ impl Hud {
             background: Color::TRANSPARENT,
             // Coral/red.
             foreground: Color::rgba(0xFF, 0x5C, 0x5C, 0xF5),
+            toast: None,
+            guides: Vec::new(),
+            stuck_measurements: Vec::new(),
+            held_rects: Vec::new(),
+            cursor_in_rect: false,
         }
     }
 }
@@ -150,7 +230,20 @@ pub enum HudKind {
         rect_end: (f64, f64),
         cursor: (f64, f64),
         edges: [Option<HudEdge>; 4],
+        /// True when the cursor is over the W×H pill — the renderer
+        /// replaces the dimension text with a camera icon to signal
+        /// that clicking will capture the held region.
+        camera_armed: bool,
+        /// True when the cursor is inside the held rectangle. Hides the
+        /// measurement guides (axis lines, ticks, cross marker) and
+        /// draws an arrow cursor instead — signals "you're inside the held region, you can click
+        /// the pill or click elsewhere to start over".
+        cursor_in_rect: bool,
     },
+    /// Render no measurement primitives at all — useful when the
+    /// overlay only needs to show a toast (e.g. immediately after a
+    /// screenshot, before the overlay closes).
+    None,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,7 +281,7 @@ impl Default for Accelerator {
     fn default() -> Self {
         Self {
             modifiers: Modifiers::CTRL | Modifiers::SHIFT,
-            key: Key::Char('p'),
+            key: Key::Char('f'),
         }
     }
 }

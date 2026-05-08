@@ -120,7 +120,11 @@ fn scan(
             return None;
         };
         let delta = anchor.rgb_delta(here);
-        if delta >= tol.0 {
+        // Strict `>` (not `>=`) so Tolerance(0) means "stop on any
+        // color change at all" rather than "stop immediately" — at
+        // Zero we still scan across uniform regions (e.g. inside a
+        // white toggle thumb) and halt at the first different pixel.
+        if delta > tol.0 {
             return Some(EdgeCandidate {
                 direction: dir,
                 distance: dist,
@@ -171,7 +175,7 @@ pub fn shrink_to_content(
     let row_has_content = |y: i32, x_start: i32, x_end: i32| -> bool {
         for x in x_start..=x_end {
             if let Some(p) = frame.pixel(x as u32, y as u32) {
-                if bg.rgb_delta(p) >= tol {
+                if bg.rgb_delta(p) > tol {
                     return true;
                 }
             }
@@ -181,7 +185,7 @@ pub fn shrink_to_content(
     let col_has_content = |x: i32, y_start: i32, y_end: i32| -> bool {
         for y in y_start..=y_end {
             if let Some(p) = frame.pixel(x as u32, y as u32) {
-                if bg.rgb_delta(p) >= tol {
+                if bg.rgb_delta(p) > tol {
                     return true;
                 }
             }

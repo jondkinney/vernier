@@ -1142,10 +1142,16 @@ struct PillLayout {
     px_size: f32,
 }
 
-/// Pixel size of the dimension-readout text in LOGICAL pixels. At
-/// HiDPI 2x this becomes 32 buffer pixels — small enough to read at a
-/// glance, smooth thanks to fontdue's grayscale rasterization.
-const TEXT_LOGICAL_PX: f32 = 16.0;
+/// Pixel size of the dimension-readout text in LOGICAL pixels. Sized
+/// to fill the pill comfortably against a 2 physical-px stroke.
+const TEXT_LOGICAL_PX: f32 = 12.5;
+/// Smaller text size for "stuck" measurement pills — keeps the
+/// frozen readouts visually subordinate to the live W×H pill.
+const TEXT_STUCK_LOGICAL_PX: f32 = 10.0;
+/// Toast pills get their own (larger) text size so status messages
+/// stay readable at a distance. Kept independent so tweaking the
+/// measurement-pill text doesn't shrink the toast.
+const TOAST_TEXT_LOGICAL_PX: f32 = 18.0;
 
 /// Lazily-loaded TTF font for the dimension readout. We try a few
 /// well-known system paths; if none are available we fall back to no
@@ -1184,6 +1190,75 @@ fn measure_text_width(font: &fontdue::Font, text: &str, px_size: f32) -> f32 {
     text.chars()
         .map(|c| font.metrics(c, px_size).advance_width)
         .sum()
+}
+
+/// Pill bg dimensions for `text` at `text_logical_px`. Padding is
+/// proportional to the text size (matches push_pill).
+fn pill_dims_at(text: &str, text_logical_px: f32, scale_f: f32) -> (f32, f32, f32, f32) {
+    let px_size = text_logical_px * scale_f;
+    let (text_w, ascent, descent) = if let Some(font) = hud_font() {
+        let w = measure_text_width(font, text, px_size);
+        let (a, d) = font
+            .horizontal_line_metrics(px_size)
+            .map(|m| (m.ascent, -m.descent))
+            .unwrap_or((px_size * 0.8, px_size * 0.2));
+        (w, a, d)
+    } else {
+        (
+            text.len() as f32 * px_size * 0.55,
+            px_size * 0.8,
+            px_size * 0.2,
+        )
+    };
+    let pad_x = 0.8 * text_logical_px * scale_f;
+    let pad_y = 0.4 * text_logical_px * scale_f;
+    let pill_w = text_w.ceil() + pad_x * 2.0;
+    let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+    (pill_w, pill_h, ascent, descent)
+}
+
+/// Draw the dark pill background only — caller is responsible for
+/// pushing the centered text glyph layout afterwards. Useful when
+/// the displayed glyph is a different size from the bg's nominal
+/// content (e.g. hover-X overlay on a stuck-measurement pill).
+fn draw_pill_bg(pixmap: &mut tiny_skia::PixmapMut, x: f32, y: f32, w: f32, h: f32) {
+    use tiny_skia::*;
+    let mut bg_paint = Paint::default();
+    bg_paint.set_color_rgba8(40, 40, 40, 230);
+    bg_paint.anti_alias = true;
+    if let Some(path) = pill_path(x, y, w, h) {
+        pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Push a glyph layout centered in the rectangle `(x, y, w, h)` at
+/// `text_logical_px`. The text may be larger than the box (e.g.
+/// stuck-pill hover X overflows).
+fn push_text_in_box(
+    pills: &mut Vec<PillLayout>,
+    text: String,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    text_logical_px: f32,
+    scale_f: f32,
+) {
+    let Some(font) = hud_font() else { return };
+    let px_size = text_logical_px * scale_f;
+    let text_w = measure_text_width(font, &text, px_size);
+    let (ascent, descent) = font
+        .horizontal_line_metrics(px_size)
+        .map(|m| (m.ascent, -m.descent))
+        .unwrap_or((px_size * 0.8, px_size * 0.2));
+    let cx = box_x + box_w * 0.5;
+    let cy = box_y + box_h * 0.5;
+    pills.push(PillLayout {
+        text,
+        text_x: (cx - text_w * 0.5).round(),
+        baseline_y: (cy + (ascent - descent) * 0.5).round(),
+        px_size,
+    });
 }
 
 /// Render a [`Hud`] into a wl_shm Abgr8888 buffer at the given buffer
@@ -1233,19 +1308,138 @@ fn render_hud_strokes(
     paint.anti_alias = false;
     // Axis lines: 1 LOGICAL pixel = `scale` buffer pixels.
     let stroke = Stroke {
-        width: scale_f,
+        // Hard 2 physical pixels regardless of buffer scale — narrow
+        // enough not to obscure the pixel boundary being measured,
+        // wide enough to stay legible against busy backgrounds.
+        width: 2.0,
         ..Default::default()
     };
     // Tick caps: ~2 LOGICAL pixels so they read as filled bars over the
-    // thinner axis lines.
+    // thinner axis lines. Hard 2
+    // physical pixels — distinct enough from the 1 px axis lines to
+    // read as caps without being chunky.
     let tick_stroke = Stroke {
-        width: 2.0 * scale_f,
+        width: 2.0,
         ..Default::default()
     };
 
     let mut pills: Vec<PillLayout> = Vec::new();
-    match &hud.kind {
-        HudKind::Hover { cursor, edges } => {
+
+    // Held rects are additive — drawn first so the live HUD sits on
+    // top. Each accumulated drag stays visible.
+    if !hud.held_rects.is_empty() {
+        for rect in &hud.held_rects {
+            // Held rect's W×H pill sits inside only if the rect is
+            // at least 70 logical px wide and 35 tall. Smaller rects
+            // get the pill anchored below to keep the readout legible.
+            let rw_logical = (rect.rect_end.0 - rect.rect_start.0).abs() as i32;
+            let rh_logical = (rect.rect_end.1 - rect.rect_start.1).abs() as i32;
+            let pill_below = rw_logical < 70 || rh_logical < 35;
+            draw_area_rect(
+                &mut pixmap,
+                &mut pills,
+                &rect.rect_start,
+                &rect.rect_end,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &stroke,
+                &paint,
+                rect.camera_armed,
+                pill_below,
+            );
+        }
+    }
+
+    // Live drag rect, BEFORE the cursor — the cursor (arrow or
+    // crosshair) is rendered last so it sits on top of every other
+    // overlay element including hover X badges.
+    if let HudKind::Drawing { start, cursor } = &hud.kind {
+        let rw_logical = (cursor.0 - start.0).abs() as i32;
+        let rh_logical = (cursor.1 - start.1).abs() as i32;
+        let pill_below = rw_logical < 70 || rh_logical < 35;
+        draw_area_rect(
+            &mut pixmap,
+            &mut pills,
+            start,
+            cursor,
+            buf_w as f32,
+            buf_h as f32,
+            scale,
+            fg,
+            &stroke,
+            &paint,
+            false,
+            pill_below,
+        );
+    }
+    if let HudKind::Held {
+        rect_start,
+        rect_end,
+        camera_armed,
+        ..
+    } = &hud.kind
+    {
+        draw_area_rect(
+            &mut pixmap,
+            &mut pills,
+            rect_start,
+            rect_end,
+            buf_w as f32,
+            buf_h as f32,
+            scale,
+            fg,
+            &stroke,
+            &paint,
+            *camera_armed,
+            false,
+        );
+    }
+    if !hud.stuck_measurements.is_empty() {
+        draw_stuck_measurements(
+            &mut pixmap,
+            &mut pills,
+            &hud.stuck_measurements,
+            fg,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
+    if !hud.guides.is_empty() {
+        // Cursor extracted from kind so the guide-hover X badge can
+        // render at the actual cursor position on the line.
+        let cursor = match &hud.kind {
+            HudKind::Hover { cursor, .. } => Some(*cursor),
+            HudKind::Drawing { cursor, .. } => Some(*cursor),
+            HudKind::Held { cursor, .. } => Some(*cursor),
+            HudKind::None => None,
+        };
+        draw_guides(
+            &mut pixmap,
+            &mut pills,
+            &hud.guides,
+            cursor,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
+    // Cursor crosshair / arrow goes on top of EVERYTHING so the
+    // user's pointer indicator never disappears behind a pill, X
+    // badge, or guide. Toast comes after so it sits above the
+    // cursor too — fine, toast is a transient status message and
+    // the cursor isn't the focus when it's up.
+    if let HudKind::Hover { cursor, edges } = &hud.kind {
+        if hud.cursor_in_rect {
+            draw_arrow_cursor(
+                &mut pixmap,
+                cursor.0 as f32 * scale as f32,
+                cursor.1 as f32 * scale as f32,
+                scale as f32,
+            );
+        } else {
             draw_hover_indicators(
                 &mut pixmap,
                 &mut pills,
@@ -1261,38 +1455,22 @@ fn render_hud_strokes(
                 true,
             );
         }
-        HudKind::Drawing { start, cursor } => {
-            draw_area_rect(
+    }
+    if let HudKind::Held {
+        cursor,
+        edges,
+        cursor_in_rect,
+        ..
+    } = &hud.kind
+    {
+        if *cursor_in_rect {
+            draw_arrow_cursor(
                 &mut pixmap,
-                &mut pills,
-                start,
-                cursor,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                fg,
-                &stroke,
-                &paint,
+                cursor.0 as f32 * scale as f32,
+                cursor.1 as f32 * scale as f32,
+                scale as f32,
             );
-        }
-        HudKind::Held {
-            rect_start,
-            rect_end,
-            cursor,
-            edges,
-        } => {
-            draw_area_rect(
-                &mut pixmap,
-                &mut pills,
-                rect_start,
-                rect_end,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                fg,
-                &stroke,
-                &paint,
-            );
+        } else {
             draw_hover_indicators(
                 &mut pixmap,
                 &mut pills,
@@ -1309,7 +1487,236 @@ fn render_hud_strokes(
             );
         }
     }
+    if let Some(toast) = &hud.toast {
+        draw_toast(
+            &mut pixmap,
+            &mut pills,
+            &toast.text,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
     pills
+}
+
+/// Draw frozen single-axis measurements — coral line + tick caps +
+/// pill with the pixel count. Same visual language as the live
+/// crosshair so the user reads them as "stuck" measurements.
+fn draw_stuck_measurements(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    measurements: &[crate::StuckMeasurement],
+    fg: Color,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    use crate::GuideAxis;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
+    paint.anti_alias = false;
+    let line_stroke = Stroke { width: 2.0, ..Default::default() };
+    let tick_stroke = Stroke { width: 2.0, ..Default::default() };
+    let tick_half = 5.0 * scale_f; // tick reach in buffer px
+    // Approximate pill height in buffer px — text + proportional pad.
+    // Used to decide "is the line long enough to fit the value pill
+    // comfortably inside?" Threshold = 3 × pill height.
+    let est_pill_h = TEXT_STUCK_LOGICAL_PX * scale_f * 1.8;
+
+    for m in measurements {
+        let length = (m.end - m.start).abs();
+        let value_text = format!("{}", length);
+        // Pill bg is ALWAYS sized for the value text so the size
+        // doesn't change when hovering. The displayed glyph may be
+        // larger (× at 1.5×) and overflow the bg slightly — that's
+        // the visual cue.
+        let (pill_w, pill_h, _, _) =
+            pill_dims_at(&value_text, TEXT_STUCK_LOGICAL_PX, scale_f);
+        let display_text = if m.hovered {
+            "\u{00D7}".to_string()
+        } else {
+            value_text.clone()
+        };
+        let display_size = if m.hovered {
+            TEXT_STUCK_LOGICAL_PX * 1.5
+        } else {
+            TEXT_STUCK_LOGICAL_PX
+        };
+        let half = 1.0; // half of the 2px stroke for pixel-grid snap
+        match m.axis {
+            GuideAxis::Vertical => {
+                let x = (m.at as f32 * scale_f).floor() + half;
+                let y0 = (m.start as f32 * scale_f).floor() + half;
+                let y1 = (m.end as f32 * scale_f).floor() + half;
+                // Main vertical line.
+                let mut pb = PathBuilder::new();
+                pb.move_to(x, y0);
+                pb.line_to(x, y1);
+                if let Some(p) = pb.finish() {
+                    pixmap.stroke_path(&p, &paint, &line_stroke, Transform::identity(), None);
+                }
+                // Horizontal tick caps at start and end.
+                for ty in [y0, y1] {
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(x - tick_half, ty);
+                    pb.line_to(x + tick_half, ty);
+                    if let Some(p) = pb.finish() {
+                        pixmap.stroke_path(&p, &paint, &tick_stroke, Transform::identity(), None);
+                    }
+                }
+                let mid_y = (y0 + y1) * 0.5;
+                let line_len = (y1 - y0).abs();
+                let (anchor_x, anchor_y, anchor) = if line_len >= 3.0 * est_pill_h {
+                    (x, mid_y, PillAnchor::Centered)
+                } else {
+                    (x + tick_half + 4.0 * scale_f, mid_y, PillAnchor::LeftCenter)
+                };
+                let (mut pill_x, mut pill_y) = match anchor {
+                    PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
+                    PillAnchor::LeftCenter => (anchor_x, anchor_y - pill_h * 0.5),
+                    _ => (anchor_x, anchor_y),
+                };
+                pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
+                pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
+                draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+                push_text_in_box(
+                    pills,
+                    display_text.clone(),
+                    pill_x,
+                    pill_y,
+                    pill_w,
+                    pill_h,
+                    display_size,
+                    scale_f,
+                );
+            }
+            GuideAxis::Horizontal => {
+                let y = (m.at as f32 * scale_f).floor() + half;
+                let x0 = (m.start as f32 * scale_f).floor() + half;
+                let x1 = (m.end as f32 * scale_f).floor() + half;
+                // Main horizontal line.
+                let mut pb = PathBuilder::new();
+                pb.move_to(x0, y);
+                pb.line_to(x1, y);
+                if let Some(p) = pb.finish() {
+                    pixmap.stroke_path(&p, &paint, &line_stroke, Transform::identity(), None);
+                }
+                // Vertical tick caps at left and right.
+                for tx in [x0, x1] {
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(tx, y - tick_half);
+                    pb.line_to(tx, y + tick_half);
+                    if let Some(p) = pb.finish() {
+                        pixmap.stroke_path(&p, &paint, &tick_stroke, Transform::identity(), None);
+                    }
+                }
+                let mid_x = (x0 + x1) * 0.5;
+                let line_len = (x1 - x0).abs();
+                let (anchor_x, anchor_y, anchor) = if line_len >= 3.0 * est_pill_h {
+                    (mid_x, y, PillAnchor::Centered)
+                } else {
+                    (mid_x, y + tick_half + 4.0 * scale_f, PillAnchor::AnchorTop)
+                };
+                let (mut pill_x, mut pill_y) = match anchor {
+                    PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
+                    PillAnchor::AnchorTop => (anchor_x - pill_w * 0.5, anchor_y),
+                    _ => (anchor_x, anchor_y),
+                };
+                pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
+                pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
+                draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+                push_text_in_box(
+                    pills,
+                    display_text.clone(),
+                    pill_x,
+                    pill_y,
+                    pill_w,
+                    pill_h,
+                    display_size,
+                    scale_f,
+                );
+            }
+        }
+    }
+}
+
+/// Draw persistent reference guides — 1 physical-pixel blue lines
+/// spanning the full buffer along each guide's axis. Drawn after the
+/// rest of the HUD so the guides sit on top of measurement strokes.
+/// When a guide is `hovered` and we have a `cursor`, draw a small dark
+/// "X" badge on the line at the cursor's free axis to signal removal.
+fn draw_guides(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    guides: &[crate::Guide],
+    cursor: Option<(f64, f64)>,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    use crate::GuideAxis;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(0x42, 0x9C, 0xFF, 0xF5);
+    paint.anti_alias = false;
+    let stroke = Stroke {
+        width: 1.0,
+        ..Default::default()
+    };
+    for guide in guides {
+        let pos = (guide.position as f32 * scale_f).floor() + 0.5;
+        let mut pb = PathBuilder::new();
+        match guide.axis {
+            GuideAxis::Horizontal => {
+                pb.move_to(0.0, pos);
+                pb.line_to(buf_w, pos);
+            }
+            GuideAxis::Vertical => {
+                pb.move_to(pos, 0.0);
+                pb.line_to(pos, buf_h);
+            }
+        }
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+        if guide.hovered {
+            if let Some((cx, cy)) = cursor {
+                let (badge_x, badge_y) = match guide.axis {
+                    GuideAxis::Horizontal => (cx as f32 * scale_f, pos),
+                    GuideAxis::Vertical => (pos, cy as f32 * scale_f),
+                };
+                draw_remove_x_badge(pixmap, pills, badge_x, badge_y, buf_w, buf_h, scale_f);
+            }
+        }
+    }
+}
+
+/// Small oval "remove" pill with a `×` glyph, drawn at the cursor
+/// position on a hovered guide. Same size and styling as the
+/// stuck-measurement pill so the affordance reads consistently.
+fn draw_remove_x_badge(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    cx: f32,
+    cy: f32,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    push_pill(
+        pixmap,
+        pills,
+        "\u{00D7}".to_string(),
+        cx,
+        cy,
+        PillAnchor::Centered,
+        buf_w,
+        buf_h,
+        scale_f,
+        TEXT_STUCK_LOGICAL_PX,
+    );
 }
 
 /// Draw the live measure crosshair: axis lines through the cursor with
@@ -1410,9 +1817,11 @@ fn draw_hover_indicators(
                 }
             }
 
-            // Cursor `+` marker: white interior with a dark outline so
-            // it stays visible against any background. Drawn after the
-            // axis lines so it sits on top of their crossing point.
+            // Cursor `+` marker: black interior with a white outline,
+            // The white outline keeps the
+            // mark visible against dark UI; the black core makes it
+            // pop on light UI. Drawn after the axis lines so it sits
+            // on top of their crossing point.
             let arm = 6.0 * scale_f;
             let mut pb = PathBuilder::new();
             pb.move_to(cx - arm, cy);
@@ -1420,14 +1829,18 @@ fn draw_hover_indicators(
             pb.move_to(cx, cy - arm);
             pb.line_to(cx, cy + arm);
             if let Some(path) = pb.finish() {
+                // Hard physical-pixel widths: 4 px white outline,
+                // 2 px black core, regardless of buffer scale.
                 let mut outline = Paint::default();
-                outline.set_color_rgba8(0, 0, 0, 200);
+                outline.set_color_rgba8(255, 255, 255, 255);
                 outline.anti_alias = true;
                 pixmap.stroke_path(
                     &path,
                     &outline,
                     &Stroke {
-                        width: 4.0 * scale_f,
+                        // Total stroke = black core 2 + 3 px white
+                        // halo on each side.
+                        width: 8.0,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -1435,13 +1848,13 @@ fn draw_hover_indicators(
                     None,
                 );
                 let mut fill = Paint::default();
-                fill.set_color_rgba8(255, 255, 255, 255);
+                fill.set_color_rgba8(0, 0, 0, 255);
                 fill.anti_alias = true;
                 pixmap.stroke_path(
                     &path,
                     &fill,
                     &Stroke {
-                        width: 2.0 * scale_f,
+                        width: 2.0,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -1471,8 +1884,8 @@ fn draw_hover_indicators(
             } else {
                 (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
             };
-            let pad_x = 14.0 * scale_f;
-            let pad_y = 7.0 * scale_f;
+            let pad_x = 10.0 * scale_f;
+            let pad_y = 5.0 * scale_f;
             let pill_w = text_w.ceil() + pad_x * 2.0;
             let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
             // Lower-right of cursor by 14 LOGICAL px each axis.
@@ -1503,7 +1916,10 @@ fn draw_hover_indicators(
 }
 
 /// Draw the rectangle for an in-progress drag (Drawing) or a committed
-/// measurement (Held), plus the W×H and aspect-ratio pills.
+/// measurement (Held), plus the W×H and aspect-ratio pills. When
+/// `camera_armed` is true, the W×H pill renders a camera icon instead
+/// of the dimension text — that signals to the user that clicking will
+/// capture the held region as a screenshot.
 #[allow(clippy::too_many_arguments)]
 fn draw_area_rect(
     pixmap: &mut tiny_skia::PixmapMut,
@@ -1516,6 +1932,8 @@ fn draw_area_rect(
     fg: Color,
     stroke: &tiny_skia::Stroke,
     line_paint: &tiny_skia::Paint,
+    camera_armed: bool,
+    pill_below: bool,
 ) {
     use tiny_skia::*;
     let scale_f = scale as f32;
@@ -1547,33 +1965,81 @@ fn draw_area_rect(
     let w_logical = (rw / scale_f).round() as u32;
     let h_logical = (rh / scale_f).round() as u32;
 
-    // W × H pill, centered inside the rectangle.
+    // W × H pill, centered inside the rectangle. When the cursor is
+    // over it (camera_armed=true), swap the text for a camera icon
+    // while keeping the same pill bounds so the visible chip doesn't
+    // jump as you hover in/out.
     let dim_text = format!("{} \u{00D7} {}", w_logical, h_logical);
-    push_pill(
-        pixmap,
-        pills,
-        dim_text,
-        rx + rw * 0.5,
-        ry + rh * 0.5,
-        PillAnchor::Centered,
-        buf_w,
-        buf_h,
-        scale_f,
-    );
+    // Drawing-mode pills sit below the rect so the user can see what
+    // they're highlighting. Held rects keep the centered position
+    // (after snap-shrink they're tight to content, less obscuring).
+    let dim_anchor_x = rx + rw * 0.5;
+    let (dim_anchor_y, dim_anchor) = if pill_below {
+        (ry + rh + 8.0 * scale_f, PillAnchor::AnchorTop)
+    } else {
+        (ry + rh * 0.5, PillAnchor::Centered)
+    };
+    if camera_armed {
+        // Use the SAME pill bounds and position as the text version
+        // would have — when the pill is below the rect, the camera
+        // icon goes below too. Then just swap the content (icon
+        // instead of text) inside that pill.
+        let (pill_w, pill_h) = pill_dimensions_for_text(&dim_text, scale_f);
+        let (mut pill_x, mut pill_y) = match dim_anchor {
+            PillAnchor::Centered => {
+                (dim_anchor_x - pill_w * 0.5, dim_anchor_y - pill_h * 0.5)
+            }
+            PillAnchor::AnchorTop => (dim_anchor_x - pill_w * 0.5, dim_anchor_y),
+            _ => (dim_anchor_x - pill_w * 0.5, dim_anchor_y - pill_h * 0.5),
+        };
+        pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
+        pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
+        let mut bg_paint = Paint::default();
+        bg_paint.set_color_rgba8(40, 40, 40, 230);
+        bg_paint.anti_alias = true;
+        if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+            pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+        }
+        draw_camera_icon(
+            pixmap,
+            pill_x + pill_w * 0.5,
+            pill_y + pill_h * 0.5,
+            scale_f,
+        );
+    } else {
+        push_pill(
+            pixmap,
+            pills,
+            dim_text,
+            dim_anchor_x,
+            dim_anchor_y,
+            dim_anchor,
+            buf_w,
+            buf_h,
+            scale_f,
+            TEXT_LOGICAL_PX,
+        );
+    }
 
-    // Aspect ratio pill, just below the rectangle.
+    // Aspect ratio pill — sits just below the dimension pill when
+    // both are below the rect, otherwise just below the rect.
     if let Some(aspect_text) = estimate_aspect_text(w_logical, h_logical) {
-        let below_y = ry + rh + 24.0 * scale_f;
+        let aspect_y = if pill_below {
+            ry + rh + 8.0 * scale_f + (TEXT_LOGICAL_PX + 2.0 * 5.0) * scale_f + 6.0 * scale_f
+        } else {
+            ry + rh + 24.0 * scale_f
+        };
         push_pill(
             pixmap,
             pills,
             aspect_text,
             rx + rw * 0.5,
-            below_y,
+            aspect_y,
             PillAnchor::AnchorTop,
             buf_w,
             buf_h,
             scale_f,
+            TEXT_LOGICAL_PX,
         );
     }
 }
@@ -1658,7 +2124,11 @@ enum PillAnchor {
     Centered,
     /// Position pill so its top-center lands at (anchor_x, anchor_y).
     AnchorTop,
+    /// Position pill so its left edge sits at `anchor_x` and its
+    /// vertical center sits at `anchor_y`.
+    LeftCenter,
     /// Lower-right of the anchor by the given buffer-pixel offset.
+    #[allow(dead_code)]
     BelowRight(f32),
 }
 
@@ -1673,23 +2143,28 @@ fn push_pill(
     surface_w: f32,
     surface_h: f32,
     scale_f: f32,
+    text_logical_px: f32,
 ) {
     use tiny_skia::*;
     let Some(font) = hud_font() else { return; };
-    let px_size = TEXT_LOGICAL_PX * scale_f;
+    let px_size = text_logical_px * scale_f;
     let text_w = measure_text_width(font, &text, px_size);
     let (ascent, descent) = font
         .horizontal_line_metrics(px_size)
         .map(|m| (m.ascent, -m.descent))
         .unwrap_or((px_size * 0.8, px_size * 0.2));
-    let pad_x = 14.0 * scale_f;
-    let pad_y = 7.0 * scale_f;
+    // Padding scales with the chosen text size so smaller pills stay
+    // visually balanced (8/4 ratio matches the active pill's 10/5 at
+    // 12.5 px).
+    let pad_x = 0.8 * text_logical_px * scale_f;
+    let pad_y = 0.4 * text_logical_px * scale_f;
     let pill_w = text_w.ceil() + pad_x * 2.0;
     let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
 
     let (mut pill_x, mut pill_y) = match anchor {
         PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
         PillAnchor::AnchorTop => (anchor_x - pill_w * 0.5, anchor_y),
+        PillAnchor::LeftCenter => (anchor_x, anchor_y - pill_h * 0.5),
         PillAnchor::BelowRight(off) => (anchor_x + off, anchor_y + off),
     };
     pill_x = pill_x.floor().min(surface_w - pill_w - 1.0).max(0.0);
@@ -1782,6 +2257,177 @@ fn composite_glyph(
             canvas[idx + 3] = (alpha as u16 + (canvas[idx + 3] as u16 * inv) / 255) as u8;
         }
     }
+}
+
+/// Compute the pill dimensions (in buffer pixels) that would house
+/// `text` at the HUD's standard text size. Used by both the text-pill
+/// path and the camera-icon path so the pill bounds stay stable when
+/// the cursor hovers in / out of the held rect.
+fn pill_dimensions_for_text(text: &str, scale_f: f32) -> (f32, f32) {
+    let px_size = TEXT_LOGICAL_PX * scale_f;
+    let (text_w, ascent, descent) = if let Some(font) = hud_font() {
+        let w = measure_text_width(font, text, px_size);
+        let (a, d) = font
+            .horizontal_line_metrics(px_size)
+            .map(|m| (m.ascent, -m.descent))
+            .unwrap_or((px_size * 0.8, px_size * 0.2));
+        (w, a, d)
+    } else {
+        (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+    };
+    let pad_x = 10.0 * scale_f;
+    let pad_y = 5.0 * scale_f;
+    (text_w.ceil() + pad_x * 2.0, (ascent + descent).ceil() + pad_y * 2.0)
+}
+
+/// Tiny line-art camera icon centered at `(cx, cy)`. Sized in LOGICAL
+/// pixels and multiplied by `scale_f` so it's crisp at HiDPI.
+fn draw_camera_icon(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f: f32) {
+    use tiny_skia::*;
+    let mut white = Paint::default();
+    white.set_color_rgba8(255, 255, 255, 245);
+    white.anti_alias = true;
+    let mut dark = Paint::default();
+    dark.set_color_rgba8(35, 35, 35, 255);
+    dark.anti_alias = true;
+
+    // Body geometry — sized smaller than the pill so it sits with
+    // visible margin around it.
+    let body_w = 17.0 * scale_f;
+    let body_h = 10.0 * scale_f;
+    let body_x = cx - body_w * 0.5;
+    let body_y = cy - body_h * 0.5 + 0.75 * scale_f;
+    let radius = 1.25 * scale_f;
+
+    // Bump (small viewfinder/hot-shoe bar) just above the body, slightly
+    // offset to one side for a less-symmetrical, more iconic camera shape.
+    let bump_w = 5.0 * scale_f;
+    let bump_h = 1.6 * scale_f;
+    let bump_x = cx - body_w * 0.5 + 2.0 * scale_f;
+    let bump_y = body_y - bump_h + 0.4 * scale_f;
+    if let Some(rect) = Rect::from_xywh(bump_x, bump_y, bump_w, bump_h) {
+        pixmap.fill_rect(rect, &white, Transform::identity(), None);
+    }
+
+    // Body — rounded rect built from cubic-free quad corners.
+    let bx2 = body_x + body_w;
+    let by2 = body_y + body_h;
+    let mut pb = PathBuilder::new();
+    pb.move_to(body_x + radius, body_y);
+    pb.line_to(bx2 - radius, body_y);
+    pb.quad_to(bx2, body_y, bx2, body_y + radius);
+    pb.line_to(bx2, by2 - radius);
+    pb.quad_to(bx2, by2, bx2 - radius, by2);
+    pb.line_to(body_x + radius, by2);
+    pb.quad_to(body_x, by2, body_x, by2 - radius);
+    pb.line_to(body_x, body_y + radius);
+    pb.quad_to(body_x, body_y, body_x + radius, body_y);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // Lens (dark filled circle) and a small highlight for liveliness.
+    let lens_cx = cx;
+    let lens_cy = body_y + body_h * 0.5;
+    let lens_r = 2.7 * scale_f;
+    let mut pb = PathBuilder::new();
+    pb.push_circle(lens_cx, lens_cy, lens_r);
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &dark, FillRule::Winding, Transform::identity(), None);
+    }
+    let hi_r = 0.8 * scale_f;
+    let mut pb = PathBuilder::new();
+    pb.push_circle(lens_cx + 0.8 * scale_f, lens_cy - 0.8 * scale_f, hi_r);
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Standard left-pointer arrow drawn at `(cx, cy)` (top-left tip).
+/// Rendered ourselves because we hide the system pointer for the whole
+/// measurement session — when the user is inside the held region we
+/// want them to see a click-affordance pointer in software.
+fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f: f32) {
+    use tiny_skia::*;
+    let s = scale_f;
+    let pts: [(f32, f32); 7] = [
+        (0.0, 0.0),
+        (0.0, 14.0),
+        (4.0, 11.0),
+        (6.5, 16.5),
+        (9.0, 15.5),
+        (6.5, 10.0),
+        (12.0, 10.0),
+    ];
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + pts[0].0 * s, cy + pts[0].1 * s);
+    for p in &pts[1..] {
+        pb.line_to(cx + p.0 * s, cy + p.1 * s);
+    }
+    pb.close();
+    let path = match pb.finish() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut black = Paint::default();
+    black.set_color_rgba8(0, 0, 0, 220);
+    black.anti_alias = true;
+    let mut white = Paint::default();
+    white.set_color_rgba8(255, 255, 255, 255);
+    white.anti_alias = true;
+    let mut stroke = Stroke::default();
+    stroke.width = 2.0 * s;
+    stroke.line_join = LineJoin::Miter;
+    pixmap.stroke_path(&path, &black, &stroke, Transform::identity(), None);
+    pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+}
+
+/// Toast pill ("Tolerance: High" / "Screenshot taken"). Anchored in
+/// the lower third of the buffer — far enough below the cursor that
+/// it doesn't visually fight the measurement crosshair, close enough
+/// to bottom that the user's gaze doesn't have to leave the work.
+fn draw_toast(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    text: &str,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    let px_size = TOAST_TEXT_LOGICAL_PX * scale_f;
+    let (text_w, ascent, descent) = if let Some(font) = hud_font() {
+        let w = measure_text_width(font, text, px_size);
+        let (a, d) = font
+            .horizontal_line_metrics(px_size)
+            .map(|m| (m.ascent, -m.descent))
+            .unwrap_or((px_size * 0.8, px_size * 0.2));
+        (w, a, d)
+    } else {
+        (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+    };
+    let pad_x = 22.0 * scale_f;
+    let pad_y = 12.0 * scale_f;
+    let pill_w = text_w.ceil() + pad_x * 2.0;
+    let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+    let pill_x = ((buf_w - pill_w) * 0.5).floor().max(0.0);
+    // Lower-third anchor: pill top at ~2/3 of the buffer height so the
+    // pill body sits inside the bottom third regardless of resolution.
+    let pill_y = (buf_h * 2.0 / 3.0).floor().max(0.0);
+
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(20, 20, 20, 235);
+    bg.anti_alias = true;
+    if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, Transform::identity(), None);
+    }
+    pills.push(PillLayout {
+        text: text.to_string(),
+        text_x: (pill_x + pad_x).round(),
+        baseline_y: (pill_y + pad_y + ascent).round(),
+        px_size,
+    });
 }
 
 /// Build a horizontal pill path (rectangle with fully-rounded ends).
