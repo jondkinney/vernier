@@ -67,6 +67,11 @@ pub trait OverlayOps: Send {
     /// Replace the overlay's heads-up display with `hud`. Pass `None`
     /// to clear the HUD and revert to the bare tint.
     fn set_hud(&mut self, hud: Option<Hud>);
+    /// Show or hide the system pointer over this overlay. `true` →
+    /// the compositor draws its theme cursor (via wp_cursor_shape v1).
+    /// `false` → the cursor is hidden so we can draw our own custom
+    /// crosshair / move / resize cursor instead.
+    fn set_system_pointer_visible(&mut self, visible: bool);
 }
 
 /// Owned handle to an overlay surface. Drop to destroy.
@@ -101,6 +106,9 @@ impl OverlayHandle {
     }
     pub fn set_hud(&mut self, hud: Option<Hud>) {
         self.inner.set_hud(hud)
+    }
+    pub fn set_system_pointer_visible(&mut self, visible: bool) {
+        self.inner.set_system_pointer_visible(visible)
     }
 }
 

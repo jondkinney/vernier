@@ -5,8 +5,8 @@ use vernier_core::{
     InteractionMode, Measurement, Px, SnapPoint, Tolerance,
 };
 use vernier_platform::{
-    Accelerator, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudEdge, HudKind, HudToast,
-    MonitorId, NativeFrame, Platform, PlatformEvent, StuckMeasurement, TrayMenu,
+    Accelerator, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudEdge, HudKind,
+    HudToast, MonitorId, NativeFrame, Platform, PlatformEvent, StuckMeasurement, TrayMenu,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
@@ -192,6 +192,35 @@ fn run_daemon() -> Result<()> {
     // from coral red to near-black for the rare cases where red
     // disappears against the underlying UI.
     let mut color_alternate: bool = false;
+    // Modifier state — tracked separately from the keysym handler so
+    // we know it across non-key events too.
+    // Shift held → "alignment crosshair" mode (full-screen axis lines,
+    // measurements suppressed). Super held → place guides freely
+    // (skip the snap-to-detected-edge default).
+    let mut shift_held: bool = false;
+    let mut super_held: bool = false;
+    // Index into `guides` of the guide currently being dragged via
+    // pointer down on the line — None when not dragging.
+    let mut dragging_guide: Option<usize> = None;
+    // Cursor position at the press that started a guide drag — used
+    // to tell a click (no movement) from a drag on release.
+    let mut guide_press_pos: Option<Px> = None;
+    // Last single-click on a guide line (idx + time). A second click
+    // on the same guide within DOUBLE_CLICK_WINDOW deletes it.
+    let mut last_guide_click: Option<(usize, Instant)> = None;
+    const GUIDE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+    // Most recent Esc press time. Esc requires a double-press within
+    // ESC_DOUBLE_WINDOW to actually exit measurement mode — single
+    // press just shows a hint toast.
+    let mut last_esc_at: Option<Instant> = None;
+    const ESC_DOUBLE_WINDOW: Duration = Duration::from_millis(700);
+    // Live resize op against a held rect — set on press over an
+    // edge/corner, cleared on release.
+    let mut resizing: Option<ResizeOp> = None;
+    // Track whether the compositor's theme cursor is currently shown
+    // over the overlay. We toggle on hover transitions instead of
+    // every frame so set_cursor / set_shape calls don't spam.
+    let mut system_pointer_visible: bool = false;
     // Snapshot taken when measurement mode is entered. Edge detection
     // runs against this frozen frame so the HUD strokes we draw don't
     // appear in subsequent captures (the Wayland screencast portal
@@ -224,8 +253,55 @@ fn run_daemon() -> Result<()> {
                 let cursor_px = Px::new(x as i32, y as i32);
                 update_cursor_in_mode(&mut mode, cursor_px);
                 last_pointer_xy = Some((x, y));
+                // While dragging a guide, every pointer-move slides
+                // it to the new cursor position on its free axis.
+                if let Some(idx) = dragging_guide {
+                    if let Some(g) = guides.get_mut(idx) {
+                        g.position = match g.axis {
+                            GuideAxis::Horizontal => y as i32,
+                            GuideAxis::Vertical => x as i32,
+                        };
+                    }
+                }
+                if let Some(op) = resizing {
+                    if let Some(rect) = held_rects.get_mut(op.rect_idx) {
+                        apply_resize(rect, &op, (x, y));
+                    }
+                }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
                     last_hud_redraw = Instant::now();
+                    // Active resize wins; otherwise compute the
+                    // handle the cursor is hovering on any held rect.
+                    let active_handle = resizing.map(|op| op.handle).or_else(|| {
+                        held_rects.iter().find_map(|r| {
+                            let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                            let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                            if cursor_over_pill(cursor_px, rs, re) {
+                                None
+                            } else {
+                                cursor_over_rect_handle(cursor_px, rs, re)
+                            }
+                        })
+                    });
+                    // Toggle the compositor's theme cursor on/off
+                    // whenever the hover state crosses the "system
+                    // pointer" boundary.
+                    let want = want_system_pointer(
+                        cursor_px,
+                        &held_rects,
+                        &guides,
+                        &stuck_measurements,
+                        pending_guide,
+                        dragging_guide,
+                        resizing,
+                        active_handle,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                    );
+                    if want != system_pointer_visible {
+                        overlay.set_system_pointer_visible(want);
+                        system_pointer_visible = want;
+                    }
                     let toast = current_toast(&active_toast, toast_until);
                     refresh_hud(
                         &mode,
@@ -240,6 +316,11 @@ fn run_daemon() -> Result<()> {
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
+                        shift_held,
+                        super_held,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                        active_handle,
                     );
                 }
             }
@@ -247,14 +328,247 @@ fn run_daemon() -> Result<()> {
                 button, pressed, x, y, ..
             }) => {
                 if button == BTN_LEFT {
+                    let cursor_px = Px::new(x as i32, y as i32);
+                    // Release ends a resize first if one is active —
+                    // before falling through to other release paths.
+                    if !pressed && resizing.is_some() {
+                        log::info!("resize released");
+                        resizing = None;
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            tol_level.value(),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                        );
+                        continue;
+                    }
+                    // Release ends a guide drag if one is active.
+                    if !pressed && dragging_guide.is_some() {
+                        let idx = dragging_guide.take().unwrap();
+                        let press_pos = guide_press_pos.take();
+                        // A press+release with virtually no cursor
+                        // movement counts as a "click" — track it for
+                        // double-click-to-delete. A real drag wipes
+                        // any pending click instead.
+                        let was_click = press_pos
+                            .map(|p| {
+                                (cursor_px.x - p.x).abs() <= 2
+                                    && (cursor_px.y - p.y).abs() <= 2
+                            })
+                            .unwrap_or(false);
+                        let mut deleted = false;
+                        if was_click {
+                            let now = Instant::now();
+                            if let Some((last_idx, last_t)) = last_guide_click {
+                                if last_idx == idx
+                                    && now.duration_since(last_t) <= GUIDE_DOUBLE_CLICK_WINDOW
+                                {
+                                    log::info!("double-click on guide {idx} — removing");
+                                    if idx < guides.len() {
+                                        guides.remove(idx);
+                                    }
+                                    last_guide_click = None;
+                                    deleted = true;
+                                }
+                            }
+                            if !deleted {
+                                last_guide_click = Some((idx, now));
+                            }
+                        } else {
+                            last_guide_click = None;
+                        }
+                        if !deleted {
+                            log::info!("guide drag released at idx {idx}");
+                        }
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            tol_level.value(),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                        );
+                        continue;
+                    }
+                    // Press on a guide × badge → remove that guide.
+                    // Press on a guide line (anywhere else) → start
+                    // dragging it. Both checks happen BEFORE the
+                    // pending-placement / rect-drag paths.
+                    if pressed {
+                        let screen_w = primary.bounds.w as i32;
+                        let screen_h = primary.bounds.h as i32;
+                        if let Some(idx) = guides.iter().position(|g| {
+                            cursor_over_guide_x_badge(cursor_px, g, screen_w, screen_h)
+                        }) {
+                            log::info!("removing guide {idx} via X badge");
+                            guides.remove(idx);
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                            );
+                            continue;
+                        }
+                        if let Some(idx) =
+                            guides.iter().position(|g| cursor_over_guide_line(cursor_px, g))
+                        {
+                            log::info!("guide drag started at idx {idx}");
+                            dragging_guide = Some(idx);
+                            guide_press_pos = Some(cursor_px);
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                            );
+                            continue;
+                        }
+                    }
+                    // Press on a held rect's edge or corner (and not
+                    // on its W×H pill) starts a resize drag — which
+                    // pre-empts both the rect-interior remove path
+                    // and the new-drag path.
+                    if pressed && pending_guide.is_none() {
+                        let mut started_resize = false;
+                        for (idx, rect) in held_rects.iter().enumerate() {
+                            let rs = Px::new(
+                                rect.rect_start.0 as i32,
+                                rect.rect_start.1 as i32,
+                            );
+                            let re = Px::new(
+                                rect.rect_end.0 as i32,
+                                rect.rect_end.1 as i32,
+                            );
+                            if cursor_over_pill(cursor_px, rs, re) {
+                                continue;
+                            }
+                            if let Some(handle) =
+                                cursor_over_rect_handle(cursor_px, rs, re)
+                            {
+                                resizing = Some(ResizeOp {
+                                    rect_idx: idx,
+                                    handle,
+                                    initial_start: rect.rect_start,
+                                    initial_end: rect.rect_end,
+                                    initial_cursor: (x, y),
+                                });
+                                log::info!(
+                                    "resize start: rect={idx} handle={:?}",
+                                    handle
+                                );
+                                started_resize = true;
+                                break;
+                            }
+                        }
+                        if started_resize {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                            );
+                            continue;
+                        }
+                    }
                     // While a guide is pending placement, the next
                     // press sticks it at the cursor instead of
                     // starting a measurement drag.
                     if pressed {
                         if let Some(axis) = pending_guide.take() {
-                            let position = match axis {
-                                GuideAxis::Horizontal => y as i32,
-                                GuideAxis::Vertical => x as i32,
+                            // Use the snapped position (matches what
+                            // the user saw under the move cursor),
+                            // unless Super is held for free-place.
+                            let position = if super_held {
+                                match axis {
+                                    GuideAxis::Horizontal => y as i32,
+                                    GuideAxis::Vertical => x as i32,
+                                }
+                            } else {
+                                let edges = edges_for_hud(
+                                    frozen_frame.as_ref(),
+                                    x,
+                                    y,
+                                    tol_level.value(),
+                                    &guides,
+                                );
+                                match axis {
+                                    GuideAxis::Horizontal => snap_to_nearest_y_edge(y, &edges) as i32,
+                                    GuideAxis::Vertical => snap_to_nearest_x_edge(x, &edges) as i32,
+                                }
                             };
                             guides.push(Guide { axis, position, hovered: false });
                             log::info!("guide stuck: {:?} @ {}", axis, position);
@@ -273,6 +587,11 @@ fn run_daemon() -> Result<()> {
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
                             );
                             continue;
                         }
@@ -325,6 +644,11 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
                 }
@@ -333,43 +657,125 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::KeyboardKey {
                 keysym, pressed, ..
             }) => {
+                // Track modifiers regardless of mode so they're
+                // current when the next non-modifier action fires.
+                let is_shift = keysym == 0xffe1 || keysym == 0xffe2;
+                let is_super = keysym == 0xffeb || keysym == 0xffec;
+                if is_shift {
+                    shift_held = pressed;
+                    if !matches!(mode, InteractionMode::Idle) {
+                        if let Some((x, y)) = last_pointer_xy {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if is_super {
+                    super_held = pressed;
+                    continue;
+                }
                 if !pressed || matches!(mode, InteractionMode::Idle) {
-                    // Idle daemon ignores keyboard; the layer surface
-                    // doesn't even hold focus then.
+                    // Idle daemon ignores non-modifier keyboard;
+                    // the layer surface doesn't even hold focus then.
                 } else if keysym == 0xff1b {
-                    // XKB_KEY_Escape = 0xff1b. Esc clears any guides
-                    // and exits measurement mode in a single press —
-                    // matches macOS "back to background daemon"
-                    // semantics.
-                    log::info!(
-                        "esc — clearing {} guide(s), {} stuck, {} held rect(s) and exiting",
-                        guides.len(),
-                        stuck_measurements.len(),
-                        held_rects.len(),
-                    );
-                    guides.clear();
-                    pending_guide = None;
-                    stuck_measurements.clear();
-                    held_rects.clear();
-                    toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &*platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
-                        color_alternate,
-                    );
-                } else if keysym == 0x0048 || keysym == 0x0056 {
-                    // Shift+H = 0x48 ('H'), Shift+V = 0x56 ('V').
-                    // Begin placing a horizontal / vertical guide that
-                    // tracks the cursor until the next click sticks it.
-                    let axis = if keysym == 0x0048 {
-                        GuideAxis::Horizontal
+                    // XKB_KEY_Escape = 0xff1b. Two quick presses
+                    // exit; a single press just hints. Lets the
+                    // user "back out" of pending placements / drags
+                    // without losing the whole session.
+                    let now = Instant::now();
+                    let is_double = last_esc_at
+                        .map(|t| now.duration_since(t) <= ESC_DOUBLE_WINDOW)
+                        .unwrap_or(false);
+                    if is_double {
+                        log::info!(
+                            "esc×2 — saving session ({} rect(s), {} guide(s), {} stuck) and exiting",
+                            held_rects.len(),
+                            guides.len(),
+                            stuck_measurements.len(),
+                        );
+                        if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
+                            log::warn!("save session: {e:#}");
+                        }
+                        last_esc_at = None;
+                        guides.clear();
+                        pending_guide = None;
+                        stuck_measurements.clear();
+                        held_rects.clear();
+                        toggle_measurement(
+                            &mut mode,
+                            &mut overlay,
+                            &*platform,
+                            primary.id,
+                            &mut frozen_frame,
+                            &held_rects,
+                            &guides,
+                            &stuck_measurements,
+                            color_alternate,
+                        );
                     } else {
+                        last_esc_at = Some(now);
+                        active_toast = Some(HudToast {
+                            text: "Press Esc again to exit".into(),
+                        });
+                        toast_until = Some(now + ESC_DOUBLE_WINDOW);
+                        spawn_toast_timer(
+                            &combined_tx,
+                            ESC_DOUBLE_WINDOW,
+                            false,
+                        );
+                        if let Some((x, y)) = last_pointer_xy {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                            );
+                        }
+                    }
+                } else if keysym == 0x0048 || keysym == 0x0042 || keysym == 0x0056 {
+                    // Capital H or B → horizontal guide; Capital V →
+                    // vertical guide. (B sits next to V on the keyboard
+                    // so the pair maps cleanly: B for horizontal, V
+                    // for vertical.)
+                    let axis = if keysym == 0x0056 {
                         GuideAxis::Vertical
+                    } else {
+                        GuideAxis::Horizontal
                     };
                     pending_guide = Some(axis);
                     log::info!("guide pending: {:?} (click to stick)", axis);
@@ -389,6 +795,11 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
                 } else if keysym == 0x0078 {
@@ -417,18 +828,22 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
-                } else if keysym == 0x0068 || keysym == 0x0076 {
-                    // Lowercase 'h' / 'v' freezes the current
-                    // horizontal / vertical axis distance (with the
-                    // pixel value pinned beside it). Stackable; Esc
-                    // clears them along with any guides.
+                } else if keysym == 0x0068 || keysym == 0x0062 || keysym == 0x0076 {
+                    // Lowercase 'h' or 'b' → horizontal stuck axis;
+                    // 'v' → vertical. Freezes the current crosshair's
+                    // extent in that axis with the pixel value pinned.
                     if let Some((x, y)) = last_pointer_xy {
-                        let axis = if keysym == 0x0068 {
-                            GuideAxis::Horizontal
-                        } else {
+                        let axis = if keysym == 0x0076 {
                             GuideAxis::Vertical
+                        } else {
+                            GuideAxis::Horizontal
                         };
                         let edges = edges_for_hud(
                             frozen_frame.as_ref(),
@@ -467,6 +882,11 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
                 } else if keysym_increases_tolerance(keysym) {
@@ -498,6 +918,11 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
                 } else if keysym_decreases_tolerance(keysym) {
@@ -529,11 +954,17 @@ fn run_daemon() -> Result<()> {
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
                         );
                     }
-                } else if keysym == 0x0072 || keysym == 0x0052 {
-                    // 'r' / 'R' — re-capture the screen so the user can
-                    // refresh after the underlying content changed.
+                } else if keysym == 0x0072 {
+                    // Lowercase 'r' — re-capture the screen so the
+                    // user can refresh after the underlying content
+                    // changed. Capital R is reserved for restore.
                     match platform.capture_screen_native(primary.id) {
                         Ok(f) => {
                             log::info!("frame refreshed");
@@ -554,10 +985,68 @@ fn run_daemon() -> Result<()> {
                                     &stuck_measurements,
                                     &held_rects,
                                     color_alternate,
+                                    shift_held,
+                                    super_held,
+                                    primary.bounds.w as i32,
+                                    primary.bounds.h as i32,
+                                    None,
                                 );
                             }
                         }
                         Err(e) => log::warn!("refresh capture failed: {e}"),
+                    }
+                } else if keysym == 0x0052 {
+                    // Capital R — restore the last saved session
+                    // (held rects, guides, stuck measurements). Saved
+                    // automatically on Esc-exit.
+                    let toast_text = match load_session() {
+                        Some((r, g, s)) => {
+                            log::info!(
+                                "session restored: {} rect(s), {} guide(s), {} stuck",
+                                r.len(),
+                                g.len(),
+                                s.len(),
+                            );
+                            held_rects = r;
+                            guides = g;
+                            stuck_measurements = s;
+                            "Session restored".to_string()
+                        }
+                        None => {
+                            log::info!("no saved session to restore");
+                            "No previous session".to_string()
+                        }
+                    };
+                    active_toast = Some(HudToast { text: toast_text });
+                    toast_until =
+                        Some(Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS));
+                    spawn_toast_timer(
+                        &combined_tx,
+                        Duration::from_millis(TOAST_TOLERANCE_MS),
+                        false,
+                    );
+                    if let Some((x, y)) = last_pointer_xy {
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            tol_level.value(),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                        );
                     }
                 }
             }
@@ -647,6 +1136,11 @@ fn run_daemon() -> Result<()> {
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
+                        shift_held,
+                        super_held,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                        None,
                     );
                 }
             }
@@ -957,13 +1451,34 @@ fn refresh_hud(
     stuck_measurements: &[StuckMeasurement],
     held_rects: &[HeldRect],
     color_alternate: bool,
+    align_mode: bool,
+    super_held: bool,
+    screen_w: i32,
+    screen_h: i32,
+    resize_handle: Option<ResizeHandle>,
 ) {
     let fg = hud_foreground(color_alternate);
     let cursor_px = Px::new(x as i32, y as i32);
+    // For pending guide placement, snap the position to the nearest
+    // detected pixel edge on the relevant axis — unless Super is
+    // held, which falls back to free placement at the cursor.
+    let (pending_x, pending_y) = if let Some(axis) = pending_guide {
+        if super_held {
+            (x, y)
+        } else {
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+            match axis {
+                GuideAxis::Horizontal => (x, snap_to_nearest_y_edge(y, &edges)),
+                GuideAxis::Vertical => (snap_to_nearest_x_edge(x, &edges), y),
+            }
+        }
+    } else {
+        (x, y)
+    };
     // Compose guides + pending guide. Mark the FIRST committed guide
     // the cursor is over as hovered so the renderer shows an X badge
     // (only one removal target at a time, prevents accidental clicks).
-    let mut composed_guides = compose_guides(guides, pending_guide, x, y);
+    let mut composed_guides = compose_guides(guides, pending_guide, pending_x, pending_y);
     if pending_guide.is_none() {
         let mut found = false;
         for g in composed_guides.iter_mut() {
@@ -1010,16 +1525,41 @@ fn refresh_hud(
         // — both cases want the arrow cursor.
         cursor_in_held_rect(cursor_px, rs, re) || cursor_over_pill(cursor_px, rs, re)
     });
-    let any_guide_hover = guides.iter().any(|g| cursor_over_guide_line(cursor_px, g));
+    let hovered_guide = guides.iter().find(|g| cursor_over_guide_line(cursor_px, g));
+    let over_guide_x = hovered_guide
+        .map(|g| cursor_over_guide_x_badge(cursor_px, g, screen_w, screen_h))
+        .unwrap_or(false);
     let any_stuck_hover = stuck_measurements
         .iter()
         .any(|m| cursor_over_stuck_pill(cursor_px, m));
-    let cursor_in_rect = cursor_in_held || any_guide_hover || any_stuck_hover;
+    // Cursor swap: any X-to-remove element (held-rect pill, stuck
+    // pill, guide X badge) becomes the arrow pointer. The guide line
+    // body (between X and edges) becomes the matching resize cursor
+    // — drag-to-relocate.
+    // Resize cursor takes priority over arrow / move when active
+    // (either a live drag is in progress or the cursor is hovering a
+    // rect edge/corner). After that, guide-line hover gets a
+    // direction-matching resize cursor; X-badge / pill / interior
+    // hover get the arrow.
+    let cursor_in_rect = (cursor_in_held || any_stuck_hover || over_guide_x)
+        && resize_handle.is_none();
+    let resize_cursor_kind = resize_handle
+        .map(handle_to_cursor_kind)
+        .or_else(|| {
+            if !over_guide_x {
+                hovered_guide.map(|g| match g.axis {
+                    GuideAxis::Horizontal => CursorKind::ResizeNS,
+                    GuideAxis::Vertical => CursorKind::ResizeEW,
+                })
+            } else {
+                None
+            }
+        });
 
     // While placing a guide, suppress the measurement crosshair —
     // only the guide line(s) should be visible. Crosshairs return as
     // soon as the guide is committed (pending_guide → None).
-    if pending_guide.is_some() {
+    if let Some(axis) = pending_guide {
         let mut hud = Hud::hover((x, y));
         hud.kind = HudKind::None;
         hud.foreground = fg;
@@ -1028,13 +1568,28 @@ fn refresh_hud(
         hud.stuck_measurements = composed_stuck;
         hud.held_rects = composed_rects;
         hud.cursor_in_rect = cursor_in_rect;
+        // Resize cursor matching the axis the new guide will move
+        // along — same affordance as dragging an existing guide.
+        hud.move_cursor_at = Some((pending_x, pending_y));
+        hud.cursor_kind = match axis {
+            GuideAxis::Horizontal => CursorKind::ResizeNS,
+            GuideAxis::Vertical => CursorKind::ResizeEW,
+        };
         overlay.set_hud(Some(hud));
         return;
     }
     match mode {
         InteractionMode::Idle => {}
         InteractionMode::Hover { .. } | InteractionMode::Held { .. } => {
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+            // Shift-held alignment mode: extend the live axis lines
+            // to the screen edges (no edge-snap clamping), but keep
+            // every other affordance — pills, X badges, hover text
+            // swaps — fully interactive.
+            let edges = if align_mode {
+                [None; 4]
+            } else {
+                edges_for_hud(frozen_frame, x, y, tolerance, guides)
+            };
             let mut hud = Hud {
                 kind: HudKind::Hover { cursor: (x, y), edges },
                 ..Hud::hover((x, y))
@@ -1045,6 +1600,11 @@ fn refresh_hud(
             hud.stuck_measurements = composed_stuck.clone();
             hud.held_rects = composed_rects.clone();
             hud.cursor_in_rect = cursor_in_rect;
+            hud.align_mode = align_mode;
+            if let Some(kind) = resize_cursor_kind {
+                hud.move_cursor_at = Some((x, y));
+                hud.cursor_kind = kind;
+            }
             overlay.set_hud(Some(hud));
         }
         InteractionMode::Drawing { start, .. } => {
@@ -1106,6 +1666,51 @@ fn edges_for_hud(
         .unwrap_or([None; 4]);
     apply_guides_to_edges(&mut edges, guides, x, y);
     edges
+}
+
+/// Snap a horizontal-guide y position to the nearest detected
+/// up/down edge if it's within 8 logical px; otherwise return the
+/// raw cursor y.
+fn snap_to_nearest_y_edge(cursor_y: f64, edges: &[Option<HudEdge>; 4]) -> f64 {
+    const SNAP_PX: f64 = 8.0;
+    let mut best = cursor_y;
+    let mut best_d = SNAP_PX;
+    if let Some(up) = edges[2] {
+        let d = (cursor_y - up.position.1).abs();
+        if d < best_d {
+            best_d = d;
+            best = up.position.1;
+        }
+    }
+    if let Some(down) = edges[3] {
+        let d = (cursor_y - down.position.1).abs();
+        if d < best_d {
+            best = down.position.1;
+        }
+    }
+    best
+}
+
+/// Same as [`snap_to_nearest_y_edge`] but for vertical guides — snaps
+/// the cursor's x to the nearest left/right edge within 8 logical px.
+fn snap_to_nearest_x_edge(cursor_x: f64, edges: &[Option<HudEdge>; 4]) -> f64 {
+    const SNAP_PX: f64 = 8.0;
+    let mut best = cursor_x;
+    let mut best_d = SNAP_PX;
+    if let Some(left) = edges[0] {
+        let d = (cursor_x - left.position.0).abs();
+        if d < best_d {
+            best_d = d;
+            best = left.position.0;
+        }
+    }
+    if let Some(right) = edges[1] {
+        let d = (cursor_x - right.position.0).abs();
+        if d < best_d {
+            best = right.position.0;
+        }
+    }
+    best
 }
 
 /// Snapshot the current axis distance into a [`StuckMeasurement`].
@@ -1263,6 +1868,22 @@ fn cursor_over_guide_line(cursor: Px, g: &Guide) -> bool {
     }
 }
 
+/// True when `cursor` is over the X-to-remove badge on a hovered
+/// guide. The badge sits at the line's midpoint on the perpendicular
+/// axis (screen center along the guide's free axis) — same place the
+/// renderer draws it.
+fn cursor_over_guide_x_badge(cursor: Px, g: &Guide, screen_w: i32, screen_h: i32) -> bool {
+    let (bx, by) = match g.axis {
+        GuideAxis::Horizontal => (screen_w / 2, g.position),
+        GuideAxis::Vertical => (g.position, screen_h / 2),
+    };
+    // Pill bounds: ~22 wide × ~14 tall logical (matches stuck pill
+    // for "0"). Hit area generous enough for an easy click target.
+    const HALF_W: i32 = 13;
+    const HALF_H: i32 = 9;
+    (cursor.x - bx).abs() <= HALF_W && (cursor.y - by).abs() <= HALF_H
+}
+
 /// True when `cursor` is inside the bounding box of a stuck
 /// measurement's value pill. Pill bounds are estimated from the
 /// digit count of the value text and the constants used by the
@@ -1301,6 +1922,183 @@ fn cursor_over_stuck_pill(cursor: Px, m: &StuckMeasurement) -> bool {
     let cx = cursor.x as f64;
     let cy = cursor.y as f64;
     cx >= px && cx <= px + pill_w && cy >= py && cy <= py + pill_h
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResizeHandle {
+    Top,
+    Right,
+    Bottom,
+    Left,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeOp {
+    rect_idx: usize,
+    handle: ResizeHandle,
+    initial_start: (f64, f64),
+    initial_end: (f64, f64),
+    initial_cursor: (f64, f64),
+}
+
+/// Hit-test the cursor against a held rect's resize handles. Corners
+/// take priority over edges. Returns `None` if the cursor isn't on
+/// any handle (in which case the click is interior — remove — or
+/// outside the rect entirely).
+fn cursor_over_rect_handle(
+    cursor: Px,
+    rect_start: Px,
+    rect_end: Px,
+) -> Option<ResizeHandle> {
+    let lo_x = rect_start.x.min(rect_end.x);
+    let hi_x = rect_start.x.max(rect_end.x);
+    let lo_y = rect_start.y.min(rect_end.y);
+    let hi_y = rect_start.y.max(rect_end.y);
+    const CORNER_PX: i32 = 7;
+    const EDGE_PX: i32 = 4;
+    if cursor.x < lo_x - EDGE_PX
+        || cursor.x > hi_x + EDGE_PX
+        || cursor.y < lo_y - EDGE_PX
+        || cursor.y > hi_y + EDGE_PX
+    {
+        return None;
+    }
+    let near_left = (cursor.x - lo_x).abs() <= CORNER_PX;
+    let near_right = (cursor.x - hi_x).abs() <= CORNER_PX;
+    let near_top = (cursor.y - lo_y).abs() <= CORNER_PX;
+    let near_bottom = (cursor.y - hi_y).abs() <= CORNER_PX;
+    if near_left && near_top {
+        return Some(ResizeHandle::TopLeft);
+    }
+    if near_right && near_top {
+        return Some(ResizeHandle::TopRight);
+    }
+    if near_left && near_bottom {
+        return Some(ResizeHandle::BottomLeft);
+    }
+    if near_right && near_bottom {
+        return Some(ResizeHandle::BottomRight);
+    }
+    let on_left = (cursor.x - lo_x).abs() <= EDGE_PX && cursor.y > lo_y && cursor.y < hi_y;
+    let on_right = (cursor.x - hi_x).abs() <= EDGE_PX && cursor.y > lo_y && cursor.y < hi_y;
+    let on_top = (cursor.y - lo_y).abs() <= EDGE_PX && cursor.x > lo_x && cursor.x < hi_x;
+    let on_bottom = (cursor.y - hi_y).abs() <= EDGE_PX && cursor.x > lo_x && cursor.x < hi_x;
+    if on_top {
+        return Some(ResizeHandle::Top);
+    }
+    if on_bottom {
+        return Some(ResizeHandle::Bottom);
+    }
+    if on_left {
+        return Some(ResizeHandle::Left);
+    }
+    if on_right {
+        return Some(ResizeHandle::Right);
+    }
+    None
+}
+
+fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
+    use ResizeHandle::*;
+    match handle {
+        Top | Bottom => CursorKind::ResizeNS,
+        Left | Right => CursorKind::ResizeEW,
+        TopLeft | BottomRight => CursorKind::ResizeNWSE,
+        TopRight | BottomLeft => CursorKind::ResizeNESW,
+    }
+}
+
+/// True when the compositor's theme cursor should show over the
+/// overlay — i.e. the user is hovering a clickable element (X badge,
+/// pill, rect interior) and we're NOT in a state that demands a
+/// custom cursor (guide line drag, rect resize, guide placement).
+#[allow(clippy::too_many_arguments)]
+fn want_system_pointer(
+    cursor_px: Px,
+    held_rects: &[HeldRect],
+    guides: &[Guide],
+    stuck_measurements: &[StuckMeasurement],
+    pending_guide: Option<GuideAxis>,
+    dragging_guide: Option<usize>,
+    resizing: Option<ResizeOp>,
+    resize_handle: Option<ResizeHandle>,
+    screen_w: i32,
+    screen_h: i32,
+) -> bool {
+    if pending_guide.is_some()
+        || dragging_guide.is_some()
+        || resizing.is_some()
+        || resize_handle.is_some()
+    {
+        return false;
+    }
+    let on_guide_x = guides
+        .iter()
+        .any(|g| cursor_over_guide_x_badge(cursor_px, g, screen_w, screen_h));
+    let on_guide_line = guides.iter().any(|g| cursor_over_guide_line(cursor_px, g));
+    if on_guide_line && !on_guide_x {
+        // Guide line body — drag handle (custom resize cursor).
+        return false;
+    }
+    let on_held = held_rects.iter().any(|r| {
+        let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+        let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+        cursor_in_held_rect(cursor_px, rs, re) || cursor_over_pill(cursor_px, rs, re)
+    });
+    let on_stuck = stuck_measurements
+        .iter()
+        .any(|m| cursor_over_stuck_pill(cursor_px, m));
+    on_held || on_stuck || on_guide_x
+}
+
+/// Apply a live resize: re-anchor the rect's appropriate edges to
+/// `cursor` based on which handle is being dragged.
+fn apply_resize(rect: &mut HeldRect, op: &ResizeOp, cursor: (f64, f64)) {
+    let initial_lo_x = op.initial_start.0.min(op.initial_end.0);
+    let initial_hi_x = op.initial_start.0.max(op.initial_end.0);
+    let initial_lo_y = op.initial_start.1.min(op.initial_end.1);
+    let initial_hi_y = op.initial_start.1.max(op.initial_end.1);
+    let dx = cursor.0 - op.initial_cursor.0;
+    let dy = cursor.1 - op.initial_cursor.1;
+    let mut lo_x = initial_lo_x;
+    let mut hi_x = initial_hi_x;
+    let mut lo_y = initial_lo_y;
+    let mut hi_y = initial_hi_y;
+    use ResizeHandle::*;
+    match op.handle {
+        Top => lo_y += dy,
+        Bottom => hi_y += dy,
+        Left => lo_x += dx,
+        Right => hi_x += dx,
+        TopLeft => {
+            lo_x += dx;
+            lo_y += dy;
+        }
+        TopRight => {
+            hi_x += dx;
+            lo_y += dy;
+        }
+        BottomLeft => {
+            lo_x += dx;
+            hi_y += dy;
+        }
+        BottomRight => {
+            hi_x += dx;
+            hi_y += dy;
+        }
+    }
+    if lo_x > hi_x {
+        std::mem::swap(&mut lo_x, &mut hi_x);
+    }
+    if lo_y > hi_y {
+        std::mem::swap(&mut lo_y, &mut hi_y);
+    }
+    rect.rect_start = (lo_x, lo_y);
+    rect.rect_end = (hi_x, hi_y);
 }
 
 /// True when `cursor` (logical pixels) is inside the held rectangle.
@@ -1428,14 +2226,9 @@ fn handle_pointer_button(
             stuck_measurements.remove(idx);
             return ButtonOutcome::None;
         }
-        if let Some(idx) = guides
-            .iter()
-            .position(|g| cursor_over_guide_line(cursor_px, g))
-        {
-            log::info!("removing guide at idx {idx}");
-            guides.remove(idx);
-            return ButtonOutcome::None;
-        }
+        // (Guide removal and drag-to-move are handled at the main
+        // loop level — see the PointerButton branch — because they
+        // need access to the dragging_guide state machine.)
         // Pressing on any held rect's W×H pill takes a screenshot of
         // that region. Otherwise the press starts a new measurement
         // drag — held rects accumulate, the new draw doesn't replace
@@ -1739,6 +2532,118 @@ fn take_held_screenshot(
     });
 
     Ok(())
+}
+
+/// Where the last-session snapshot lives (held rects + guides +
+/// stuck axis measurements). Restored on Capital R.
+fn session_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(&home).join(".local/share/vernier");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("last-session.txt")
+}
+
+/// Save the current persistent state to disk in a human-readable
+/// line-based format. Best-effort — failures are logged, not fatal.
+fn save_session(
+    rects: &[HeldRect],
+    guides: &[Guide],
+    stuck_measurements: &[StuckMeasurement],
+) -> std::io::Result<()> {
+    let path = session_path();
+    let mut s = String::new();
+    s.push_str("# vernier session v1\n");
+    for r in rects {
+        s.push_str(&format!(
+            "rect {} {} {} {}\n",
+            r.rect_start.0, r.rect_start.1, r.rect_end.0, r.rect_end.1
+        ));
+    }
+    for g in guides {
+        let axis = match g.axis {
+            GuideAxis::Horizontal => "h",
+            GuideAxis::Vertical => "v",
+        };
+        s.push_str(&format!("guide {axis} {}\n", g.position));
+    }
+    for m in stuck_measurements {
+        let axis = match m.axis {
+            GuideAxis::Horizontal => "h",
+            GuideAxis::Vertical => "v",
+        };
+        s.push_str(&format!("stuck {axis} {} {} {}\n", m.at, m.start, m.end));
+    }
+    std::fs::write(&path, s)
+}
+
+/// Load whatever was last saved. Returns empty vecs if no session
+/// file exists or it can't be parsed.
+fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> {
+    let path = session_path();
+    let s = std::fs::read_to_string(&path).ok()?;
+    let mut rects = Vec::new();
+    let mut guides = Vec::new();
+    let mut stuck = Vec::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["rect", a, b, c, d] => {
+                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by)) =
+                    (a.parse::<f64>(), b.parse::<f64>(), c.parse::<f64>(), d.parse::<f64>())
+                {
+                    rects.push(HeldRect {
+                        rect_start: (ax, ay),
+                        rect_end: (bx, by),
+                        camera_armed: false,
+                    });
+                }
+            }
+            ["guide", "h", pos] => {
+                if let Ok(p) = pos.parse() {
+                    guides.push(Guide {
+                        axis: GuideAxis::Horizontal,
+                        position: p,
+                        hovered: false,
+                    });
+                }
+            }
+            ["guide", "v", pos] => {
+                if let Ok(p) = pos.parse() {
+                    guides.push(Guide {
+                        axis: GuideAxis::Vertical,
+                        position: p,
+                        hovered: false,
+                    });
+                }
+            }
+            ["stuck", axis, at, start, end] => {
+                let ax = match *axis {
+                    "h" => GuideAxis::Horizontal,
+                    "v" => GuideAxis::Vertical,
+                    _ => continue,
+                };
+                if let (Ok(at), Ok(start), Ok(end)) =
+                    (at.parse(), start.parse(), end.parse())
+                {
+                    stuck.push(StuckMeasurement {
+                        axis: ax,
+                        at,
+                        start,
+                        end,
+                        hovered: false,
+                    });
+                }
+            }
+            _ => {
+                log::warn!("session: skipping unparsable line `{line}`");
+            }
+        }
+    }
+    Some((rects, guides, stuck))
 }
 
 fn pictures_dir() -> std::path::PathBuf {

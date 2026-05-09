@@ -18,13 +18,18 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_shm,
+    globals::GlobalData,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    reexports::protocols::wp::cursor_shape::v1::client::{
+        wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+        wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+    },
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager},
     },
     shell::{
         WaylandSurface,
@@ -295,6 +300,18 @@ enum Cmd {
     OverlaySetInputCapturing(OverlayKey, bool),
     OverlaySetHud(OverlayKey, Option<Hud>),
     OverlayDestroy(OverlayKey),
+    /// Toggle the system pointer cursor on top of the overlay. When
+    /// hidden the surface keeps the empty system cursor (we draw our
+    /// own crosshair / move / resize); when default we delegate to
+    /// the compositor's `wp_cursor_shape_v1` so the user sees their
+    /// actual theme arrow.
+    OverlaySetSystemPointer(OverlayKey, SystemPointerKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemPointerKind {
+    Hidden,
+    Default,
 }
 
 struct WaylandOverlay {
@@ -338,6 +355,14 @@ impl OverlayOps for WaylandOverlay {
     fn set_hud(&mut self, hud: Option<Hud>) {
         let _ = self.cmd_tx.send(Cmd::OverlaySetHud(self.key, hud));
     }
+    fn set_system_pointer_visible(&mut self, visible: bool) {
+        let kind = if visible {
+            SystemPointerKind::Default
+        } else {
+            SystemPointerKind::Hidden
+        };
+        let _ = self.cmd_tx.send(Cmd::OverlaySetSystemPointer(self.key, kind));
+    }
 }
 
 impl Drop for WaylandOverlay {
@@ -367,6 +392,19 @@ struct WaylandState {
     pointers: Vec<wl_pointer::WlPointer>,
     /// Live keyboards, similarly held alive.
     keyboards: Vec<wl_keyboard::WlKeyboard>,
+    /// `wp_cursor_shape_manager_v1` global if the compositor advertises
+    /// it (Hyprland does). Used to display the user's actual theme
+    /// pointer instead of a hand-drawn arrow.
+    cursor_shape_manager: Option<CursorShapeManager>,
+    /// Per-pointer cursor-shape device, lazily created on first Enter.
+    pointer_shape_devices: HashMap<wayland_client::backend::ObjectId, WpCursorShapeDeviceV1>,
+    /// Most recent pointer + Enter serial seen across any overlay —
+    /// needed so commands that arrive AFTER an Enter (e.g. main asks
+    /// for "show default arrow now") can apply the cursor change.
+    last_pointer_enter: Option<(wl_pointer::WlPointer, u32)>,
+    /// Per-overlay desired system-pointer state. Updated by main.rs;
+    /// applied to the latest pointer Enter serial.
+    overlay_pointer_kind: HashMap<OverlayKey, SystemPointerKind>,
 
     overlays: HashMap<OverlayKey, OverlayInst>,
     next_overlay_id: u64,
@@ -429,6 +467,13 @@ fn run_event_loop(
     let empty_region = Region::new(&compositor)
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("create empty region: {e}")))?;
     let seat_state = SeatState::new(&globals, &qh);
+    let cursor_shape_manager = match CursorShapeManager::bind(&globals, &qh) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            log::info!("wp_cursor_shape_v1 unavailable: {e} (falling back to drawn arrow)");
+            None
+        }
+    };
 
     let mut state = WaylandState {
         registry,
@@ -442,6 +487,10 @@ fn run_event_loop(
         seat_state,
         pointers: Vec::new(),
         keyboards: Vec::new(),
+        cursor_shape_manager,
+        pointer_shape_devices: HashMap::new(),
+        last_pointer_enter: None,
+        overlay_pointer_kind: HashMap::new(),
         overlays: HashMap::new(),
         next_overlay_id: 1,
         monitors_pub,
@@ -521,6 +570,10 @@ impl WaylandState {
                         .send(PlatformEvent::OverlayClosed(inst.monitor));
                     drop(inst);
                 }
+                self.overlay_pointer_kind.remove(&key);
+            }
+            Cmd::OverlaySetSystemPointer(key, kind) => {
+                self.set_overlay_system_pointer(key, kind);
             }
         }
     }
@@ -642,6 +695,37 @@ impl WaylandState {
     /// our handler signatures.
     fn first_overlay_monitor(&self) -> Option<MonitorId> {
         self.overlays.values().next().map(|inst| inst.monitor)
+    }
+
+    /// Apply a SystemPointerKind to the given pointer/serial — either
+    /// hide the OS cursor or set the wp_cursor_shape "default" shape.
+    fn apply_pointer_kind(
+        &self,
+        pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        kind: SystemPointerKind,
+    ) {
+        match kind {
+            SystemPointerKind::Hidden => {
+                pointer.set_cursor(serial, None, 0, 0);
+            }
+            SystemPointerKind::Default => {
+                if let Some(device) = self.pointer_shape_devices.get(&pointer.id()) {
+                    device.set_shape(serial, Shape::Default);
+                } else {
+                    // No cursor-shape support — leave the cursor as-is
+                    // rather than hiding it (compositor's default).
+                    pointer.set_cursor(serial, None, 0, 0);
+                }
+            }
+        }
+    }
+
+    fn set_overlay_system_pointer(&mut self, key: OverlayKey, kind: SystemPointerKind) {
+        self.overlay_pointer_kind.insert(key, kind);
+        if let Some((pointer, serial)) = self.last_pointer_enter.clone() {
+            self.apply_pointer_kind(&pointer, serial, kind);
+        }
     }
 
     fn draw_overlay(&mut self, key: OverlayKey) {
@@ -817,23 +901,36 @@ impl PointerHandler for WaylandState {
     ) {
         for ev in events {
             let surf_id = ev.surface.id();
-            let (monitor, capturing) = match self
+            let (monitor, capturing, overlay_key) = match self
                 .overlays
-                .values()
-                .find(|inst| inst.layer.wl_surface().id() == surf_id)
+                .iter()
+                .find(|(_, inst)| inst.layer.wl_surface().id() == surf_id)
             {
-                Some(inst) => (inst.monitor, inst.input_capturing),
+                Some((k, inst)) => (inst.monitor, inst.input_capturing, *k),
                 None => continue,
             };
-            // On Enter, hide the system cursor while measuring so the
-            // user's actual mouse pointer doesn't obscure the snap
-            // lines. The cursor is already excluded from the captured
-            // PipeWire stream (CursorMode::Hidden), so this is purely a
-            // display-side hide.
+            // On Enter, cache the serial/pointer so later Cmd::SetSystemPointer
+            // can apply visibility. Default behavior (capturing, no
+            // override yet) hides the cursor — we draw our own.
             if let PointerEventKind::Enter { serial } = ev.kind {
-                if capturing {
-                    pointer.set_cursor(serial, None, 0, 0);
+                self.last_pointer_enter = Some((pointer.clone(), serial));
+                if let Some(mgr) = &self.cursor_shape_manager {
+                    let pid = pointer.id();
+                    if !self.pointer_shape_devices.contains_key(&pid) {
+                        let device = mgr.get_shape_device(pointer, _qh);
+                        self.pointer_shape_devices.insert(pid, device);
+                    }
                 }
+                let kind = self
+                    .overlay_pointer_kind
+                    .get(&overlay_key)
+                    .copied()
+                    .unwrap_or(if capturing {
+                        SystemPointerKind::Hidden
+                    } else {
+                        SystemPointerKind::Default
+                    });
+                self.apply_pointer_kind(pointer, serial, kind);
             }
             let (x, y) = ev.position;
             let plat_event = match &ev.kind {
@@ -1088,6 +1185,8 @@ delegate_seat!(WaylandState);
 delegate_pointer!(WaylandState);
 delegate_keyboard!(WaylandState);
 delegate_registry!(WaylandState);
+// (delegate_pointer! already wires Dispatch for the wp_cursor_shape
+// manager + device through SCTK's CursorShapeManager.)
 
 // =========================================================================
 // Pixel helpers
@@ -1421,6 +1520,7 @@ fn render_hud_strokes(
             &mut pills,
             &hud.guides,
             cursor,
+            hud.align_mode,
             buf_w as f32,
             buf_h as f32,
             scale as f32,
@@ -1432,13 +1532,31 @@ fn render_hud_strokes(
     // cursor too — fine, toast is a transient status message and
     // the cursor isn't the focus when it's up.
     if let HudKind::Hover { cursor, edges } = &hud.kind {
-        if hud.cursor_in_rect {
-            draw_arrow_cursor(
+        // Shift-held alignment mode: the full-screen crosshair always
+        // shows, regardless of any hover-arrow or move-cursor swap
+        // — alignment relies on seeing those lines continuously.
+        if hud.align_mode {
+            draw_hover_indicators(
                 &mut pixmap,
-                cursor.0 as f32 * scale as f32,
-                cursor.1 as f32 * scale as f32,
-                scale as f32,
+                &mut pills,
+                cursor,
+                edges,
+                buf_w as f32,
+                buf_h as f32,
+                scale,
+                fg,
+                &paint,
+                &stroke,
+                &tick_stroke,
+                true,
             );
+        } else if hud.move_cursor_at.is_some() {
+            // The dedicated draw_move_cursor block at the end of
+            // this function paints it.
+        } else if hud.cursor_in_rect {
+            // System cursor is shown via wp_cursor_shape from main.rs
+            // when cursor_in_rect is true — no custom drawing here.
+            let _ = cursor;
         } else {
             draw_hover_indicators(
                 &mut pixmap,
@@ -1487,6 +1605,27 @@ fn render_hud_strokes(
             );
         }
     }
+    if let Some((cx, cy)) = hud.move_cursor_at {
+        let bx = cx as f32 * scale as f32;
+        let by = cy as f32 * scale as f32;
+        match hud.cursor_kind {
+            crate::CursorKind::Move => {
+                draw_move_cursor(&mut pixmap, bx, by, scale as f32);
+            }
+            crate::CursorKind::ResizeNS => {
+                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 0.0);
+            }
+            crate::CursorKind::ResizeEW => {
+                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 90.0);
+            }
+            crate::CursorKind::ResizeNWSE => {
+                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, -45.0);
+            }
+            crate::CursorKind::ResizeNESW => {
+                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 45.0);
+            }
+        }
+    }
     if let Some(toast) = &hud.toast {
         draw_toast(
             &mut pixmap,
@@ -1498,6 +1637,141 @@ fn render_hud_strokes(
         );
     }
     pills
+}
+
+/// 2-direction resize cursor — black bar with arrowheads at both
+/// ends and a white halo. `rotate_deg` orients the arrows: 0 = NS
+/// (vertical), 90 = EW (horizontal), -45 = NWSE, 45 = NESW.
+fn draw_resize_cursor(
+    pixmap: &mut tiny_skia::PixmapMut,
+    cx: f32,
+    cy: f32,
+    scale_f: f32,
+    rotate_deg: f32,
+) {
+    use tiny_skia::*;
+    let l = 7.5 * scale_f;   // half-length of arms
+    let a = 3.5 * scale_f;   // arrowhead extent — smaller arrowheads
+    let t = 1.0 * scale_f;   // arm half-thickness
+    let s = a + 4.0 * scale_f; // serif half-width — 4 px wider than the arrowhead on each side
+    let sh = 1.0 * scale_f;  // serif half-height (along arm axis)
+    let mut pb = PathBuilder::new();
+    // I-beam style: NS double-arrow with a horizontal serif at the
+    // center. Trace outer boundary clockwise from top tip.
+    pb.move_to(0.0, -l);
+    pb.line_to(-a, -l + a);
+    pb.line_to(-t, -l + a);
+    pb.line_to(-t, -sh);
+    pb.line_to(-s, -sh);
+    pb.line_to(-s, sh);
+    pb.line_to(-t, sh);
+    pb.line_to(-t, l - a);
+    pb.line_to(-a, l - a);
+    pb.line_to(0.0, l);
+    pb.line_to(a, l - a);
+    pb.line_to(t, l - a);
+    pb.line_to(t, sh);
+    pb.line_to(s, sh);
+    pb.line_to(s, -sh);
+    pb.line_to(t, -sh);
+    pb.line_to(t, -l + a);
+    pb.line_to(a, -l + a);
+    pb.close();
+    let path = match pb.finish() {
+        Some(p) => p,
+        None => return,
+    };
+    let transform = Transform::from_rotate(rotate_deg).post_translate(cx, cy);
+    let mut white = Paint::default();
+    white.set_color_rgba8(255, 255, 255, 255);
+    white.anti_alias = true;
+    pixmap.stroke_path(
+        &path,
+        &white,
+        &Stroke {
+            // Lighter white outline so the cursor stays slim against
+            // smaller geometry.
+            width: 4.0,
+            line_join: LineJoin::Miter,
+            ..Default::default()
+        },
+        transform,
+        None,
+    );
+    let mut black = Paint::default();
+    black.set_color_rgba8(0, 0, 0, 255);
+    black.anti_alias = true;
+    pixmap.fill_path(&path, &black, FillRule::Winding, transform, None);
+}
+
+/// 4-direction "move" cursor — black diamond/plus with arrowheads on
+/// each tip and a white halo, drawn while the user is placing a
+/// guide. Centered on `(cx, cy)` in BUFFER pixels.
+fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f: f32) {
+    use tiny_skia::*;
+    let l = 11.0 * scale_f; // half-length of each arm (tip distance from center)
+    let a = 5.0 * scale_f;  // arrowhead extent
+    let t = 1.5 * scale_f;  // arm half-thickness
+    // Center square matches the arm thickness so the arms flow into
+    // each other without a notch — gives the cleaner +-with-arrows
+    // shape of a standard move cursor.
+    let c = t;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx, cy - l);
+    pb.line_to(cx - a, cy - l + a);
+    pb.line_to(cx - t, cy - l + a);
+    pb.line_to(cx - t, cy - c);
+    pb.line_to(cx - c, cy - c);
+    pb.line_to(cx - c, cy - t);
+    pb.line_to(cx - l + a, cy - t);
+    pb.line_to(cx - l + a, cy - a);
+    pb.line_to(cx - l, cy);
+    pb.line_to(cx - l + a, cy + a);
+    pb.line_to(cx - l + a, cy + t);
+    pb.line_to(cx - c, cy + t);
+    pb.line_to(cx - c, cy + c);
+    pb.line_to(cx - t, cy + c);
+    pb.line_to(cx - t, cy + l - a);
+    pb.line_to(cx - a, cy + l - a);
+    pb.line_to(cx, cy + l);
+    pb.line_to(cx + a, cy + l - a);
+    pb.line_to(cx + t, cy + l - a);
+    pb.line_to(cx + t, cy + c);
+    pb.line_to(cx + c, cy + c);
+    pb.line_to(cx + c, cy + t);
+    pb.line_to(cx + l - a, cy + t);
+    pb.line_to(cx + l - a, cy + a);
+    pb.line_to(cx + l, cy);
+    pb.line_to(cx + l - a, cy - a);
+    pb.line_to(cx + l - a, cy - t);
+    pb.line_to(cx + c, cy - t);
+    pb.line_to(cx + c, cy - c);
+    pb.line_to(cx + t, cy - c);
+    pb.line_to(cx + t, cy - l + a);
+    pb.line_to(cx + a, cy - l + a);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        // White halo first, then black fill on top — same contrast
+        // affordance as the regular cross marker.
+        let mut white = Paint::default();
+        white.set_color_rgba8(255, 255, 255, 255);
+        white.anti_alias = true;
+        pixmap.stroke_path(
+            &path,
+            &white,
+            &Stroke {
+                width: 4.0,
+                line_join: LineJoin::Miter,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+        let mut black = Paint::default();
+        black.set_color_rgba8(0, 0, 0, 255);
+        black.anti_alias = true;
+        pixmap.fill_path(&path, &black, FillRule::Winding, Transform::identity(), None);
+    }
 }
 
 /// Draw frozen single-axis measurements — coral line + tick caps +
@@ -1652,6 +1926,7 @@ fn draw_guides(
     pills: &mut Vec<PillLayout>,
     guides: &[crate::Guide],
     cursor: Option<(f64, f64)>,
+    align_mode: bool,
     buf_w: f32,
     buf_h: f32,
     scale_f: f32,
@@ -1682,20 +1957,101 @@ fn draw_guides(
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
         if guide.hovered {
-            if let Some((cx, cy)) = cursor {
-                let (badge_x, badge_y) = match guide.axis {
-                    GuideAxis::Horizontal => (cx as f32 * scale_f, pos),
-                    GuideAxis::Vertical => (pos, cy as f32 * scale_f),
-                };
-                draw_remove_x_badge(pixmap, pills, badge_x, badge_y, buf_w, buf_h, scale_f);
-            }
+            // Anchor the X badge at the line's midpoint on the
+            // perpendicular axis (screen center) — the cursor itself
+            // becomes a drag handle instead of being the X target.
+            let _ = cursor;
+            let (badge_x, badge_y) = match guide.axis {
+                GuideAxis::Horizontal => (buf_w * 0.5, pos),
+                GuideAxis::Vertical => (pos, buf_h * 0.5),
+            };
+            draw_remove_x_badge(pixmap, pills, badge_x, badge_y, buf_w, buf_h, scale_f);
         }
+    }
+
+    let _ = align_mode;
+    // Inter-guide distance pills. For each adjacent pair of guides
+    // sharing an axis, render a small pill (same style as a stuck
+    // measurement) showing the px gap between them, centered between
+    // the two guides on the spanning axis.
+    let mut horiz: Vec<i32> = guides
+        .iter()
+        .filter(|g| g.axis == GuideAxis::Horizontal)
+        .map(|g| g.position)
+        .collect();
+    horiz.sort_unstable();
+    horiz.dedup();
+    for win in horiz.windows(2) {
+        let dist = (win[1] - win[0]).abs();
+        if dist == 0 {
+            continue;
+        }
+        let value = format!("{}", dist);
+        let (pill_w, pill_h, _, _) =
+            pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
+        // Horizontal pair (gap is vertical) → label anchored at the
+        // LEFT of the screen, vertically centered between the two
+        // guide ys.
+        let mid_y = (win[0] + win[1]) as f32 * 0.5 * scale_f;
+        let pill_x = (50.0 * scale_f).floor().max(0.0);
+        let pill_y = (mid_y - pill_h * 0.5)
+            .floor()
+            .min(buf_h - pill_h - 1.0)
+            .max(0.0);
+        draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+        push_text_in_box(
+            pills,
+            value,
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            TEXT_STUCK_LOGICAL_PX,
+            scale_f,
+        );
+    }
+    let mut vert: Vec<i32> = guides
+        .iter()
+        .filter(|g| g.axis == GuideAxis::Vertical)
+        .map(|g| g.position)
+        .collect();
+    vert.sort_unstable();
+    vert.dedup();
+    for win in vert.windows(2) {
+        let dist = (win[1] - win[0]).abs();
+        if dist == 0 {
+            continue;
+        }
+        let value = format!("{}", dist);
+        let (pill_w, pill_h, _, _) =
+            pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
+        // Vertical pair (gap is horizontal) → label anchored at the
+        // TOP of the screen, horizontally centered between the two
+        // guide xs.
+        let mid_x = (win[0] + win[1]) as f32 * 0.5 * scale_f;
+        let pill_x = (mid_x - pill_w * 0.5)
+            .floor()
+            .min(buf_w - pill_w - 1.0)
+            .max(0.0);
+        let pill_y = (50.0 * scale_f).floor().max(0.0);
+        draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+        push_text_in_box(
+            pills,
+            value,
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            TEXT_STUCK_LOGICAL_PX,
+            scale_f,
+        );
     }
 }
 
-/// Small oval "remove" pill with a `×` glyph, drawn at the cursor
-/// position on a hovered guide. Same size and styling as the
-/// stuck-measurement pill so the affordance reads consistently.
+/// Small oval "remove" pill with a `×` glyph, drawn on a hovered
+/// guide. Same visual treatment as a hovered stuck-measurement pill
+/// — bg sized for a single digit at TEXT_STUCK_LOGICAL_PX, × glyph
+/// rendered at 1.5× that size and overflowing slightly.
 fn draw_remove_x_badge(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
@@ -1705,17 +2061,25 @@ fn draw_remove_x_badge(
     buf_h: f32,
     scale_f: f32,
 ) {
-    push_pill(
-        pixmap,
+    let (pill_w, pill_h, _, _) = pill_dims_at("0", TEXT_STUCK_LOGICAL_PX, scale_f);
+    let pill_x = (cx - pill_w * 0.5)
+        .floor()
+        .min(buf_w - pill_w - 1.0)
+        .max(0.0);
+    let pill_y = (cy - pill_h * 0.5)
+        .floor()
+        .min(buf_h - pill_h - 1.0)
+        .max(0.0);
+    draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+    push_text_in_box(
         pills,
         "\u{00D7}".to_string(),
-        cx,
-        cy,
-        PillAnchor::Centered,
-        buf_w,
-        buf_h,
+        pill_x,
+        pill_y,
+        pill_w,
+        pill_h,
+        TEXT_STUCK_LOGICAL_PX * 1.5,
         scale_f,
-        TEXT_STUCK_LOGICAL_PX,
     );
 }
 
@@ -2351,14 +2715,16 @@ fn draw_camera_icon(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
 fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f: f32) {
     use tiny_skia::*;
     let s = scale_f;
+    // Slimmer and slightly taller — closer to the Hyprland default
+    // silhouette in image #30 (sharp tip, refined tail).
     let pts: [(f32, f32); 7] = [
-        (0.0, 0.0),
-        (0.0, 14.0),
-        (4.0, 11.0),
-        (6.5, 16.5),
-        (9.0, 15.5),
-        (6.5, 10.0),
-        (12.0, 10.0),
+        (0.0, 0.0),    // sharp tip
+        (0.0, 17.0),   // bottom of left edge
+        (4.5, 13.5),   // notch where tail starts
+        (7.5, 18.0),   // tail bottom-left
+        (9.0, 17.5),   // tail bottom-right
+        (5.5, 11.5),   // right notch
+        (10.5, 11.0),  // top of right edge
     ];
     let mut pb = PathBuilder::new();
     pb.move_to(cx + pts[0].0 * s, cy + pts[0].1 * s);
@@ -2370,17 +2736,20 @@ fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_
         Some(p) => p,
         None => return,
     };
-    let mut black = Paint::default();
-    black.set_color_rgba8(0, 0, 0, 220);
-    black.anti_alias = true;
+    // Hyprland-style pointer: black body with a thin white halo.
+    // Stroke white first (forms the outline), then fill black on top
+    // so the halo is visible only along the arrow's edge.
     let mut white = Paint::default();
     white.set_color_rgba8(255, 255, 255, 255);
     white.anti_alias = true;
+    let mut black = Paint::default();
+    black.set_color_rgba8(0, 0, 0, 255);
+    black.anti_alias = true;
     let mut stroke = Stroke::default();
-    stroke.width = 2.0 * s;
+    stroke.width = 2.0;
     stroke.line_join = LineJoin::Miter;
-    pixmap.stroke_path(&path, &black, &stroke, Transform::identity(), None);
-    pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+    pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+    pixmap.fill_path(&path, &black, FillRule::Winding, Transform::identity(), None);
 }
 
 /// Toast pill ("Tolerance: High" / "Screenshot taken"). Anchored in

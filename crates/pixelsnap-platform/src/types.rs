@@ -132,6 +132,20 @@ pub struct Hud {
     /// rects. Suppresses the live crosshair and draws a plain arrow
     /// cursor instead.
     pub cursor_in_rect: bool,
+    /// When set, the renderer draws a non-default cursor at this
+    /// position (logical px). Used during guide placement /
+    /// dragging, and over the resize handles of held rects.
+    pub move_cursor_at: Option<(f64, f64)>,
+    /// Style of cursor to draw when [`Hud::move_cursor_at`] is set.
+    /// `Move` is the 4-direction arrow used by guides; the four
+    /// `Resize*` variants are 2-headed arrows aligned with the edge
+    /// or corner the cursor is hovering on a held rect.
+    pub cursor_kind: CursorKind,
+    /// "Crosshairs alignment" mode (held while Shift is down). When
+    /// true, the renderer suppresses every measurement value and
+    /// extends the live axis lines to the screen edges, leaving just
+    /// guides + a clean crosshair for visual alignment.
+    pub align_mode: bool,
 }
 
 /// A committed rectangle measurement — the data drawn for each
@@ -185,6 +199,20 @@ pub enum GuideAxis {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    /// 4-direction arrows (used while placing or dragging a guide).
+    Move,
+    /// Vertical double-arrow — top/bottom edge of a held rect.
+    ResizeNS,
+    /// Horizontal double-arrow — left/right edge.
+    ResizeEW,
+    /// `↖↘` diagonal — top-left or bottom-right corner.
+    ResizeNWSE,
+    /// `↗↙` diagonal — top-right or bottom-left corner.
+    ResizeNESW,
+}
+
 #[derive(Debug, Clone)]
 pub struct HudToast {
     pub text: String,
@@ -207,6 +235,9 @@ impl Hud {
             stuck_measurements: Vec::new(),
             held_rects: Vec::new(),
             cursor_in_rect: false,
+            move_cursor_at: None,
+            cursor_kind: CursorKind::Move,
+            align_mode: false,
         }
     }
 }
