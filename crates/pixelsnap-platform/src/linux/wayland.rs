@@ -1285,9 +1285,55 @@ fn hud_font() -> Option<&'static fontdue::Font> {
     .as_ref()
 }
 
+/// Fallback font for glyphs the primary HUD font doesn't carry —
+/// notably the macOS modifier symbols (⇧⌃⌘⌥). Adwaita Sans includes
+/// them; we also try DejaVu / Noto as additional fallbacks for less
+/// common Linux distros.
+fn hud_symbol_font() -> Option<&'static fontdue::Font> {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<Option<fontdue::Font>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        ];
+        for path in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(f) = fontdue::Font::from_bytes(
+                    bytes.as_slice(),
+                    fontdue::FontSettings::default(),
+                ) {
+                    log::info!("hud symbol font: {path}");
+                    return Some(f);
+                }
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+/// Pick the best font for `c`: primary if it carries the glyph,
+/// otherwise the symbol fallback. Used so per-glyph rendering can
+/// substitute for missing characters without leaving tofu boxes.
+fn font_for_char<'a>(primary: &'a fontdue::Font, c: char) -> &'a fontdue::Font {
+    if primary.lookup_glyph_index(c) != 0 {
+        return primary;
+    }
+    if let Some(symbol) = hud_symbol_font() {
+        if symbol.lookup_glyph_index(c) != 0 {
+            return symbol;
+        }
+    }
+    primary
+}
+
 fn measure_text_width(font: &fontdue::Font, text: &str, px_size: f32) -> f32 {
     text.chars()
-        .map(|c| font.metrics(c, px_size).advance_width)
+        .map(|c| font_for_char(font, c).metrics(c, px_size).advance_width)
         .sum()
 }
 
@@ -1631,6 +1677,16 @@ fn render_hud_strokes(
             &mut pixmap,
             &mut pills,
             &toast.text,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
+    if let Some(menu) = &hud.context_menu {
+        draw_context_menu(
+            &mut pixmap,
+            &mut pills,
+            menu,
             buf_w as f32,
             buf_h as f32,
             scale as f32,
@@ -2564,7 +2620,8 @@ fn render_pill_text(
     let mut pen_x = layout.text_x;
     let baseline = layout.baseline_y;
     for ch in layout.text.chars() {
-        let (metrics, bitmap) = font.rasterize(ch, layout.px_size);
+        let active = font_for_char(font, ch);
+        let (metrics, bitmap) = active.rasterize(ch, layout.px_size);
         let glyph_origin_x = pen_x + metrics.xmin as f32;
         let glyph_origin_y = baseline - metrics.ymin as f32 - metrics.height as f32;
         composite_glyph(
@@ -2797,6 +2854,353 @@ fn draw_toast(
         baseline_y: (pill_y + pad_y + ascent).round(),
         px_size,
     });
+}
+
+/// Right-click context menu — floating list of actions anchored at
+/// the cursor where the right-click happened. Drawn last (on top of
+/// every other HUD layer including the toast). Hovered row gets a
+/// lighter bg; each row is icon + label + optional shortcut hint.
+fn draw_context_menu(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    menu: &crate::HudContextMenu,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    let Some(font) = hud_font() else { return };
+
+    const ROW_H: f32 = 32.0;
+    const RADIUS: f32 = 12.0;
+    const PAD_X: f32 = 14.0;
+    const PAD_Y: f32 = 10.0;
+    const ICON_COL_W: f32 = 32.0;
+    const SHORTCUT_GAP: f32 = 16.0;
+    const DIV_PAD_V: f32 = 8.0;
+    const DIV_HEIGHT: f32 = 1.0;
+
+    let label_px = TEXT_LOGICAL_PX * scale_f;
+    let shortcut_px = TEXT_STUCK_LOGICAL_PX * scale_f;
+
+    let icon_col = ICON_COL_W * scale_f;
+    let pad_x = PAD_X * scale_f;
+    let pad_y = PAD_Y * scale_f;
+    let row_h = ROW_H * scale_f;
+    let radius = RADIUS * scale_f;
+    let div_pad_v = DIV_PAD_V * scale_f;
+    let div_h = DIV_HEIGHT * scale_f;
+    let _ = SHORTCUT_GAP; // kept for parity with hit-tester
+
+    let inner_label_x = pad_x + icon_col;
+    let menu_w = (menu.width as f32) * scale_f;
+
+    let mut content_h = pad_y * 2.0;
+    for (i, it) in menu.items.iter().enumerate() {
+        content_h += row_h;
+        if it.divider_after && i + 1 < menu.items.len() {
+            content_h += 2.0 * div_pad_v + div_h;
+        }
+    }
+
+    let mx = (menu.origin.0 as f32) * scale_f;
+    let my = (menu.origin.1 as f32) * scale_f;
+    let mx = mx.min(buf_w - menu_w - 1.0).max(0.0);
+    let my = my.min(buf_h - content_h - 1.0).max(0.0);
+
+    // Drop any pre-existing (measurement) pills whose text would
+    // bleed through the menu — the menu sits on top, so its area
+    // should be clean. Menu pills themselves are pushed below this
+    // filter, so they're not affected.
+    pills.retain(|p| !pill_text_overlaps_rect(p, mx, my, menu_w, content_h, font));
+
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(22, 22, 22, 248);
+    bg.anti_alias = true;
+    if let Some(path) = rounded_rect_path(mx, my, menu_w, content_h, radius) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, Transform::identity(), None);
+    }
+
+    let mut row_y = my + pad_y;
+    for (i, it) in menu.items.iter().enumerate() {
+        if menu.hovered == Some(i) {
+            let mut hbg = Paint::default();
+            hbg.set_color_rgba8(48, 48, 48, 235);
+            hbg.anti_alias = true;
+            let inset = pad_x * 0.5;
+            if let Some(path) =
+                rounded_rect_path(mx + inset, row_y, menu_w - inset * 2.0, row_h, radius * 0.5)
+            {
+                pixmap.fill_path(&path, &hbg, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+
+        let icon_cx = mx + pad_x + icon_col * 0.5;
+        let icon_cy = row_y + row_h * 0.5;
+        draw_menu_icon(pixmap, it.icon, icon_cx, icon_cy, scale_f);
+
+        let (l_asc, l_desc) = font
+            .horizontal_line_metrics(label_px)
+            .map(|m| (m.ascent, -m.descent))
+            .unwrap_or((label_px * 0.8, label_px * 0.2));
+        pills.push(PillLayout {
+            text: it.label.clone(),
+            text_x: (mx + inner_label_x).round(),
+            baseline_y: (icon_cy + (l_asc - l_desc) * 0.5).round(),
+            px_size: label_px,
+        });
+
+        if let Some(s) = &it.shortcut {
+            let sw = measure_text_width(font, s, shortcut_px);
+            let (s_asc, s_desc) = font
+                .horizontal_line_metrics(shortcut_px)
+                .map(|m| (m.ascent, -m.descent))
+                .unwrap_or((shortcut_px * 0.8, shortcut_px * 0.2));
+            let shortcut_x_end = mx + menu_w - pad_x;
+            pills.push(PillLayout {
+                text: s.clone(),
+                text_x: (shortcut_x_end - sw).round(),
+                baseline_y: (icon_cy + (s_asc - s_desc) * 0.5).round(),
+                px_size: shortcut_px,
+            });
+        }
+
+        row_y += row_h;
+        if it.divider_after && i + 1 < menu.items.len() {
+            row_y += div_pad_v;
+            let mut dpaint = Paint::default();
+            dpaint.set_color_rgba8(60, 60, 60, 235);
+            dpaint.anti_alias = false;
+            let dx0 = mx + pad_x;
+            let dx1 = mx + menu_w - pad_x;
+            let mut dpb = PathBuilder::new();
+            dpb.move_to(dx0, row_y);
+            dpb.line_to(dx1, row_y);
+            dpb.line_to(dx1, row_y + div_h);
+            dpb.line_to(dx0, row_y + div_h);
+            dpb.close();
+            if let Some(path) = dpb.finish() {
+                pixmap.fill_path(&path, &dpaint, FillRule::Winding, Transform::identity(), None);
+            }
+            row_y += div_h + div_pad_v;
+        }
+    }
+}
+
+/// True when `pill`'s rasterized text region intersects the rect
+/// `(mx, my, mw, mh)`. Used by the context menu to suppress
+/// underlying measurement pill text from bleeding through.
+fn pill_text_overlaps_rect(
+    pill: &PillLayout,
+    mx: f32,
+    my: f32,
+    mw: f32,
+    mh: f32,
+    font: &fontdue::Font,
+) -> bool {
+    let text_w = measure_text_width(font, &pill.text, pill.px_size);
+    let p_left = pill.text_x;
+    let p_right = pill.text_x + text_w;
+    let p_top = pill.baseline_y - pill.px_size;
+    let p_bot = pill.baseline_y + pill.px_size * 0.3;
+    p_right > mx && p_left < mx + mw && p_bot > my && p_top < my + mh
+}
+
+/// Build a path for a rectangle with all four corners rounded by
+/// radius `r`. `r` is clamped to `min(w/2, h/2)`.
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    use tiny_skia::PathBuilder;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
+    let k = r * 0.5523;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// Render the small (~16 logical px) icon for a context-menu row.
+/// `cx`/`cy` are the icon's center in BUFFER pixels.
+fn draw_menu_icon(
+    pixmap: &mut tiny_skia::PixmapMut,
+    icon: crate::HudContextMenuIcon,
+    cx: f32,
+    cy: f32,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    let mut accent = Paint::default();
+    accent.set_color_rgba8(120, 180, 255, 240);
+    accent.anti_alias = true;
+    let mut coral = Paint::default();
+    coral.set_color_rgba8(0xFF, 0x5C, 0x5C, 245);
+    coral.anti_alias = true;
+    let mut white = Paint::default();
+    white.set_color_rgba8(220, 220, 220, 240);
+    white.anti_alias = true;
+    let stroke = Stroke {
+        width: 1.5 * scale_f,
+        line_cap: LineCap::Round,
+        ..Default::default()
+    };
+
+    use crate::HudContextMenuIcon as I;
+    match icon {
+        I::GuideH => {
+            let half = 8.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - half, cy);
+            pb.line_to(cx + half, cy);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &accent, &stroke, Transform::identity(), None);
+            }
+        }
+        I::GuideV => {
+            let half = 8.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx, cy - half);
+            pb.line_to(cx, cy + half);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &accent, &stroke, Transform::identity(), None);
+            }
+        }
+        I::StuckH => {
+            let len = 6.0 * scale_f;
+            let cap = 4.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - len, cy);
+            pb.line_to(cx + len, cy);
+            pb.move_to(cx - len, cy - cap);
+            pb.line_to(cx - len, cy + cap);
+            pb.move_to(cx + len, cy - cap);
+            pb.line_to(cx + len, cy + cap);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &coral, &stroke, Transform::identity(), None);
+            }
+        }
+        I::StuckV => {
+            let len = 6.0 * scale_f;
+            let cap = 4.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx, cy - len);
+            pb.line_to(cx, cy + len);
+            pb.move_to(cx - cap, cy - len);
+            pb.line_to(cx + cap, cy - len);
+            pb.move_to(cx - cap, cy + len);
+            pb.line_to(cx + cap, cy + len);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &coral, &stroke, Transform::identity(), None);
+            }
+        }
+        I::Camera => {
+            let bw = 12.0 * scale_f;
+            let bh = 8.0 * scale_f;
+            let bx = cx - bw * 0.5;
+            let by = cy - bh * 0.5 + 1.0 * scale_f;
+            if let Some(path) = rounded_rect_path(bx, by, bw, bh, 1.5 * scale_f) {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+            let mut pb = PathBuilder::new();
+            pb.push_circle(cx, cy + 1.0 * scale_f, 2.0 * scale_f);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+            let bump_w = 4.0 * scale_f;
+            let bump_h = 2.0 * scale_f;
+            let bump_x = cx - bump_w * 0.5;
+            let bump_y = by - bump_h;
+            let mut pb = PathBuilder::new();
+            pb.move_to(bump_x, bump_y);
+            pb.line_to(bump_x + bump_w, bump_y);
+            pb.line_to(bump_x + bump_w, bump_y + bump_h);
+            pb.line_to(bump_x, bump_y + bump_h);
+            pb.close();
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+        }
+        I::Background => {
+            let s = 12.0 * scale_f;
+            let x = cx - s * 0.5;
+            let y = cy - s * 0.5;
+            if let Some(path) = rounded_rect_path(x, y, s, s, 2.0 * scale_f) {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+            let dot_r = 1.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.push_circle(cx - 2.5 * scale_f, cy + 1.0 * scale_f, dot_r);
+            pb.push_circle(cx + 2.5 * scale_f, cy + 1.0 * scale_f, dot_r);
+            if let Some(path) = pb.finish() {
+                pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        I::Restore => {
+            let r = 5.0 * scale_f;
+            let k = r * 0.5523;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - r, cy);
+            pb.cubic_to(cx - r, cy + k, cx - k, cy + r, cx, cy + r);
+            pb.cubic_to(cx + k, cy + r, cx + r, cy + k, cx + r, cy);
+            pb.cubic_to(cx + r, cy - k, cx + k, cy - r, cx, cy - r);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+            let a = 2.5 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx, cy - r);
+            pb.line_to(cx - a, cy - r - a);
+            pb.move_to(cx, cy - r);
+            pb.line_to(cx + a, cy - r - a);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+        }
+        I::Clear => {
+            let bw = 8.0 * scale_f;
+            let bh = 9.0 * scale_f;
+            let bx = cx - bw * 0.5;
+            let by = cy - bh * 0.5 + 1.5 * scale_f;
+            if let Some(path) = rounded_rect_path(bx, by, bw, bh, 1.5 * scale_f) {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+            let lid_w = 11.0 * scale_f;
+            let lid_x = cx - lid_w * 0.5;
+            let lid_y = by - 1.5 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(lid_x, lid_y);
+            pb.line_to(lid_x + lid_w, lid_y);
+            let h_w = 4.0 * scale_f;
+            let h_x = cx - h_w * 0.5;
+            pb.move_to(h_x, lid_y);
+            pb.line_to(h_x, lid_y - 1.5 * scale_f);
+            pb.line_to(h_x + h_w, lid_y - 1.5 * scale_f);
+            pb.line_to(h_x + h_w, lid_y);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+        }
+        I::Close => {
+            let s = 5.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - s, cy - s);
+            pb.line_to(cx + s, cy + s);
+            pb.move_to(cx + s, cy - s);
+            pb.line_to(cx - s, cy + s);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
+            }
+        }
+    }
 }
 
 /// Build a horizontal pill path (rectangle with fully-rounded ends).

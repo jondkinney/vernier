@@ -146,6 +146,53 @@ pub struct Hud {
     /// extends the live axis lines to the screen edges, leaving just
     /// guides + a clean crosshair for visual alignment.
     pub align_mode: bool,
+    /// Right-click context menu, drawn on top of every other HUD
+    /// layer. `None` while the menu is closed.
+    pub context_menu: Option<HudContextMenu>,
+}
+
+/// A floating right-click menu rendered by the overlay. The list of
+/// items, including their labels and shortcut hints, is supplied by
+/// the app loop; the renderer just draws and tracks hover.
+#[derive(Debug, Clone)]
+pub struct HudContextMenu {
+    /// Top-left of the menu in logical pixels. The app loop is
+    /// responsible for clamping this so the menu fits on-screen,
+    /// since hit-testing has to use the same clamped origin.
+    pub origin: (f64, f64),
+    /// Menu width in logical px, set by the app loop so that both
+    /// renderer and hit-tester agree on layout (no font-measurement
+    /// drift between the two).
+    pub width: f64,
+    pub items: Vec<HudContextMenuItem>,
+    /// Index into `items` of the row currently under the cursor, or
+    /// `None` if the cursor is outside any row (e.g. on a divider).
+    pub hovered: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HudContextMenuItem {
+    pub label: String,
+    /// Optional right-aligned shortcut hint (e.g. "⇧H"). Rendered in a
+    /// muted color at a smaller size than `label`.
+    pub shortcut: Option<String>,
+    pub icon: HudContextMenuIcon,
+    /// When `true`, the renderer draws a thin separator line below this
+    /// row (groups items into sections).
+    pub divider_after: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudContextMenuIcon {
+    GuideH,
+    GuideV,
+    StuckH,
+    StuckV,
+    Camera,
+    Background,
+    Restore,
+    Clear,
+    Close,
 }
 
 /// A committed rectangle measurement — the data drawn for each
@@ -238,6 +285,7 @@ impl Hud {
             move_cursor_at: None,
             cursor_kind: CursorKind::Move,
             align_mode: false,
+            context_menu: None,
         }
     }
 }
