@@ -265,7 +265,7 @@ fn run_daemon() -> Result<()> {
                 }
                 if let Some(op) = resizing {
                     if let Some(rect) = held_rects.get_mut(op.rect_idx) {
-                        apply_resize(rect, &op, (x, y));
+                        apply_resize(rect, &op, (x, y), &guides, super_held);
                     }
                 }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
@@ -333,7 +333,25 @@ fn run_daemon() -> Result<()> {
                     // before falling through to other release paths.
                     if !pressed && resizing.is_some() {
                         log::info!("resize released");
-                        resizing = None;
+                        let op = resizing.take().unwrap();
+                        // Snap-shrink the rect to the nearest content
+                        // boundary inside its current bounds, matching
+                        // the draw-release behavior. Super skips the
+                        // snap so the user can park edges arbitrarily.
+                        if !super_held {
+                            if let Some(rect) = held_rects.get_mut(op.rect_idx) {
+                                let raw_start = rect.rect_start;
+                                let raw_end = rect.rect_end;
+                                let (snapped_start, snapped_end) = snap_shrink_logical_rect(
+                                    frozen_frame.as_ref(),
+                                    raw_start,
+                                    raw_end,
+                                    tol_level.value(),
+                                );
+                                rect.rect_start = snapped_start;
+                                rect.rect_end = snapped_end;
+                            }
+                        }
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
@@ -608,6 +626,7 @@ fn run_daemon() -> Result<()> {
                         &mut stuck_measurements,
                         &mut held_rects,
                         color_alternate,
+                        super_held,
                     );
                     last_hud_redraw = Instant::now();
                     if let ButtonOutcome::ScreenshotTaken = outcome {
@@ -1612,7 +1631,14 @@ fn refresh_hud(
             hud.foreground = fg;
             if has_drag_distance(start.pixel, cursor_px) {
                 let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
-                hud.kind = HudKind::Drawing { start: start_pos, cursor: (x, y) };
+                // Snap the moving end of the rect to nearby guides on
+                // each axis. Super disables snap for free placement.
+                let (cx, cy) = if super_held {
+                    (x, y)
+                } else {
+                    (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
+                };
+                hud.kind = HudKind::Drawing { start: start_pos, cursor: (cx, cy) };
             } else {
                 // Below the drag threshold the rect would just be a
                 // 1×1 dot — fall back to the live measurement HUD so a
@@ -1708,6 +1734,38 @@ fn snap_to_nearest_x_edge(cursor_x: f64, edges: &[Option<HudEdge>; 4]) -> f64 {
         let d = (cursor_x - right.position.0).abs();
         if d < best_d {
             best = right.position.0;
+        }
+    }
+    best
+}
+
+/// Snap an x coordinate to the nearest vertical guide within 8 logical
+/// px. Used while drawing or resizing held rects so edges align cleanly
+/// with reference guides.
+fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
+    const SNAP_PX: f64 = 8.0;
+    let mut best = x;
+    let mut best_d = SNAP_PX;
+    for g in guides.iter().filter(|g| g.axis == GuideAxis::Vertical) {
+        let d = (x - g.position as f64).abs();
+        if d < best_d {
+            best_d = d;
+            best = g.position as f64;
+        }
+    }
+    best
+}
+
+/// Mirror of [`snap_x_to_guides`] for horizontal guides.
+fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
+    const SNAP_PX: f64 = 8.0;
+    let mut best = y;
+    let mut best_d = SNAP_PX;
+    for g in guides.iter().filter(|g| g.axis == GuideAxis::Horizontal) {
+        let d = (y - g.position as f64).abs();
+        if d < best_d {
+            best_d = d;
+            best = g.position as f64;
         }
     }
     best
@@ -2057,7 +2115,13 @@ fn want_system_pointer(
 
 /// Apply a live resize: re-anchor the rect's appropriate edges to
 /// `cursor` based on which handle is being dragged.
-fn apply_resize(rect: &mut HeldRect, op: &ResizeOp, cursor: (f64, f64)) {
+fn apply_resize(
+    rect: &mut HeldRect,
+    op: &ResizeOp,
+    cursor: (f64, f64),
+    guides: &[Guide],
+    super_held: bool,
+) {
     let initial_lo_x = op.initial_start.0.min(op.initial_end.0);
     let initial_hi_x = op.initial_start.0.max(op.initial_end.0);
     let initial_lo_y = op.initial_start.1.min(op.initial_end.1);
@@ -2089,6 +2153,20 @@ fn apply_resize(rect: &mut HeldRect, op: &ResizeOp, cursor: (f64, f64)) {
         BottomRight => {
             hi_x += dx;
             hi_y += dy;
+        }
+    }
+    // Snap the moving edges to nearby guides — corner handles move
+    // both axes, side handles only move one. Super disables snap.
+    if !super_held {
+        match op.handle {
+            Top | TopLeft | TopRight => lo_y = snap_y_to_guides(lo_y, guides),
+            Bottom | BottomLeft | BottomRight => hi_y = snap_y_to_guides(hi_y, guides),
+            _ => {}
+        }
+        match op.handle {
+            Left | TopLeft | BottomLeft => lo_x = snap_x_to_guides(lo_x, guides),
+            Right | TopRight | BottomRight => hi_x = snap_x_to_guides(hi_x, guides),
+            _ => {}
         }
     }
     if lo_x > hi_x {
@@ -2211,6 +2289,7 @@ fn handle_pointer_button(
     stuck_measurements: &mut Vec<StuckMeasurement>,
     held_rects: &mut Vec<HeldRect>,
     color_alternate: bool,
+    super_held: bool,
 ) -> ButtonOutcome {
     let fg = hud_foreground(color_alternate);
     let cursor_px = Px::new(x as i32, y as i32);
@@ -2292,7 +2371,14 @@ fn handle_pointer_button(
             return ButtonOutcome::None;
         }
         let raw_start = (start.pixel.x as f64, start.pixel.y as f64);
-        let raw_end = (x, y);
+        // Snap the moving end of the rect to nearby guides on release
+        // so the committed rect aligns with whatever guide the user
+        // saw it snap to mid-drag. Super disables snap.
+        let raw_end = if super_held {
+            (x, y)
+        } else {
+            (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
+        };
         // Snap-shrink to fit content.
         let (snapped_start, snapped_end) =
             snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance);
