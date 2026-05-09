@@ -5,8 +5,9 @@ use vernier_core::{
     InteractionMode, Measurement, Px, SnapPoint, Tolerance,
 };
 use vernier_platform::{
-    Accelerator, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudEdge, HudKind,
-    HudToast, MonitorId, NativeFrame, Platform, PlatformEvent, StuckMeasurement, TrayMenu,
+    Accelerator, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudContextMenu,
+    HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind, HudToast, MonitorId, NativeFrame,
+    Platform, PlatformEvent, StuckMeasurement, TrayMenu,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
@@ -217,6 +218,10 @@ fn run_daemon() -> Result<()> {
     // Live resize op against a held rect — set on press over an
     // edge/corner, cleared on release.
     let mut resizing: Option<ResizeOp> = None;
+    // Right-click context menu state. `Some` while open; the renderer
+    // reads it to draw the menu, the pointer/keyboard handlers route
+    // input to it.
+    let mut context_menu: Option<ContextMenuState> = None;
     // Track whether the compositor's theme cursor is currently shown
     // over the overlay. We toggle on hover transitions instead of
     // every frame so set_cursor / set_shape calls don't spam.
@@ -253,6 +258,51 @@ fn run_daemon() -> Result<()> {
                 let cursor_px = Px::new(x as i32, y as i32);
                 update_cursor_in_mode(&mut mode, cursor_px);
                 last_pointer_xy = Some((x, y));
+                // Context menu open → only update its hover row and
+                // refresh; suppress the regular crosshair / drag /
+                // resize logic until the menu closes.
+                if context_menu.is_some() {
+                    if !system_pointer_visible {
+                        overlay.set_system_pointer_visible(true);
+                        system_pointer_visible = true;
+                    }
+                    let new_hovered = {
+                        let m = context_menu.as_ref().unwrap();
+                        menu_hit_row(m.origin, MENU_ITEMS, (x, y))
+                    };
+                    let needs_redraw = context_menu
+                        .as_ref()
+                        .map(|m| m.hovered != new_hovered)
+                        .unwrap_or(false);
+                    if let Some(m) = context_menu.as_mut() {
+                        m.hovered = new_hovered;
+                    }
+                    if needs_redraw && last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            tol_level.value(),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            shift_held,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                            context_menu.as_ref(),
+                        );
+                    }
+                    continue;
+                }
                 // While dragging a guide, every pointer-move slides
                 // it to the new cursor position on its free axis.
                 if let Some(idx) = dragging_guide {
@@ -295,6 +345,7 @@ fn run_daemon() -> Result<()> {
                         dragging_guide,
                         resizing,
                         active_handle,
+                        context_menu.is_some(),
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                     );
@@ -321,12 +372,248 @@ fn run_daemon() -> Result<()> {
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         active_handle,
+                        context_menu.as_ref(),
                     );
                 }
             }
             MainEvent::Platform(PlatformEvent::PointerButton {
                 button, pressed, x, y, ..
             }) => {
+                // Right-click toggles the floating context menu. An
+                // active drag / resize blocks it (don't disrupt
+                // in-flight gestures).
+                if button == BTN_RIGHT {
+                    if !pressed {
+                        continue;
+                    }
+                    if dragging_guide.is_some() || resizing.is_some() {
+                        continue;
+                    }
+                    if context_menu.is_some() {
+                        context_menu = None;
+                    } else {
+                        // Cancel any pending guide placement so we
+                        // don't end up with both UI states fighting
+                        // for the next click.
+                        pending_guide = None;
+                        let menu_h = menu_content_height_logical(MENU_ITEMS);
+                        // Anchor the menu so it doesn't overlap the
+                        // crosshair: 10 logical px right of the
+                        // vertical axis line and below the horizontal
+                        // one.
+                        const MENU_CURSOR_GAP: f64 = 10.0;
+                        let mut ox = x + MENU_CURSOR_GAP;
+                        let mut oy = y + MENU_CURSOR_GAP;
+                        ox = ox
+                            .min(primary.bounds.w as f64 - MENU_WIDTH_LOGICAL - 1.0)
+                            .max(0.0);
+                        oy = oy.min(primary.bounds.h as f64 - menu_h - 1.0).max(0.0);
+                        let hovered = menu_hit_row((ox, oy), MENU_ITEMS, (x, y));
+                        context_menu = Some(ContextMenuState {
+                            origin: (ox, oy),
+                            cursor_at_open: (x, y),
+                            hovered,
+                        });
+                        // Force the system arrow on so the user has a
+                        // visible pointer to click rows with — the
+                        // next PointerMove will recompute when needed.
+                        if !system_pointer_visible {
+                            overlay.set_system_pointer_visible(true);
+                            system_pointer_visible = true;
+                        }
+                        log::info!("context menu opened at ({:.0},{:.0})", ox, oy);
+                    }
+                    last_hud_redraw = Instant::now();
+                    let toast = current_toast(&active_toast, toast_until);
+                    refresh_hud(
+                        &mode,
+                        &mut overlay,
+                        frozen_frame.as_ref(),
+                        x,
+                        y,
+                        tol_level.value(),
+                        toast,
+                        &guides,
+                        pending_guide,
+                        &stuck_measurements,
+                        &held_rects,
+                        color_alternate,
+                        shift_held,
+                        super_held,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                        None,
+                        context_menu.as_ref(),
+                    );
+                    continue;
+                }
+                // While the context menu is open, BTN_LEFT routes to
+                // the menu — dispatch the hovered row, or close if
+                // the click landed outside the menu bounds.
+                if button == BTN_LEFT && context_menu.is_some() {
+                    if !pressed {
+                        // Absorb release so the underlying click logic
+                        // doesn't fire after a row was dispatched.
+                        continue;
+                    }
+                    let (origin, hit) = {
+                        let m = context_menu.as_ref().unwrap();
+                        (m.origin, menu_hit_row(m.origin, MENU_ITEMS, (x, y)))
+                    };
+                    let action = hit.map(|i| MENU_ITEMS[i].action);
+                    let _was_inside = menu_contains(origin, MENU_ITEMS, (x, y));
+                    context_menu = None;
+                    if let Some(action) = action {
+                        match action {
+                            MenuAction::AddHorizontalGuide => {
+                                pending_guide = Some(GuideAxis::Horizontal);
+                                log::info!("guide pending: Horizontal (menu)");
+                            }
+                            MenuAction::AddVerticalGuide => {
+                                pending_guide = Some(GuideAxis::Vertical);
+                                log::info!("guide pending: Vertical (menu)");
+                            }
+                            MenuAction::HoldHorizontalDistance => {
+                                if let Some((cx, cy)) = last_pointer_xy {
+                                    let edges = edges_for_hud(
+                                        frozen_frame.as_ref(),
+                                        cx,
+                                        cy,
+                                        tol_level.value(),
+                                        &guides,
+                                    );
+                                    let m = freeze_axis_measurement(
+                                        GuideAxis::Horizontal,
+                                        cx,
+                                        cy,
+                                        &edges,
+                                        primary.bounds.w,
+                                        primary.bounds.h,
+                                    );
+                                    stuck_measurements.push(m);
+                                }
+                            }
+                            MenuAction::HoldVerticalDistance => {
+                                if let Some((cx, cy)) = last_pointer_xy {
+                                    let edges = edges_for_hud(
+                                        frozen_frame.as_ref(),
+                                        cx,
+                                        cy,
+                                        tol_level.value(),
+                                        &guides,
+                                    );
+                                    let m = freeze_axis_measurement(
+                                        GuideAxis::Vertical,
+                                        cx,
+                                        cy,
+                                        &edges,
+                                        primary.bounds.w,
+                                        primary.bounds.h,
+                                    );
+                                    stuck_measurements.push(m);
+                                }
+                            }
+                            MenuAction::OpenScreenshotTool => {
+                                log::info!("opening omarchy-cmd-screenshot");
+                                if let Err(e) =
+                                    std::process::Command::new("omarchy-cmd-screenshot").spawn()
+                                {
+                                    log::warn!("spawn screenshot tool: {e}");
+                                }
+                                // Step out of measure mode so the
+                                // screenshot tool gets a clean desktop.
+                                toggle_measurement(
+                                    &mut mode,
+                                    &mut overlay,
+                                    &*platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &held_rects,
+                                    &guides,
+                                    &stuck_measurements,
+                                    color_alternate,
+                                );
+                            }
+                            MenuAction::EnterBackgroundMode => {
+                                log::info!("entering background mode (toggle off)");
+                                toggle_measurement(
+                                    &mut mode,
+                                    &mut overlay,
+                                    &*platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &held_rects,
+                                    &guides,
+                                    &stuck_measurements,
+                                    color_alternate,
+                                );
+                            }
+                            MenuAction::RestoreLastSession => {
+                                let toast_text = match load_session() {
+                                    Some((r, g, s)) => {
+                                        log::info!(
+                                            "session restored (menu): {} rect(s), {} guide(s), {} stuck",
+                                            r.len(),
+                                            g.len(),
+                                            s.len(),
+                                        );
+                                        held_rects = r;
+                                        guides = g;
+                                        stuck_measurements = s;
+                                        "Session restored".to_string()
+                                    }
+                                    None => {
+                                        log::info!("no saved session to restore");
+                                        "No previous session".to_string()
+                                    }
+                                };
+                                active_toast = Some(HudToast { text: toast_text });
+                                toast_until = Some(
+                                    Instant::now()
+                                        + Duration::from_millis(TOAST_TOLERANCE_MS),
+                                );
+                                spawn_toast_timer(
+                                    &combined_tx,
+                                    Duration::from_millis(TOAST_TOLERANCE_MS),
+                                    false,
+                                );
+                            }
+                            MenuAction::ClearAll => {
+                                log::info!("clear all (menu)");
+                                guides.clear();
+                                stuck_measurements.clear();
+                                held_rects.clear();
+                            }
+                            MenuAction::ClosemacOS => {
+                                log::info!("close requested via context menu");
+                                break;
+                            }
+                        }
+                    }
+                    last_hud_redraw = Instant::now();
+                    let toast = current_toast(&active_toast, toast_until);
+                    refresh_hud(
+                        &mode,
+                        &mut overlay,
+                        frozen_frame.as_ref(),
+                        x,
+                        y,
+                        tol_level.value(),
+                        toast,
+                        &guides,
+                        pending_guide,
+                        &stuck_measurements,
+                        &held_rects,
+                        color_alternate,
+                        shift_held,
+                        super_held,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                        None,
+                        context_menu.as_ref(),
+                    );
+                    continue;
+                }
                 if button == BTN_LEFT {
                     let cursor_px = Px::new(x as i32, y as i32);
                     // Release ends a resize first if one is active —
@@ -372,6 +659,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                         continue;
                     }
@@ -433,6 +721,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                         continue;
                     }
@@ -468,6 +757,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -497,6 +787,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -558,6 +849,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -610,6 +902,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -668,6 +961,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 }
@@ -704,6 +998,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                         }
                     }
@@ -716,6 +1011,38 @@ fn run_daemon() -> Result<()> {
                 if !pressed || matches!(mode, InteractionMode::Idle) {
                     // Idle daemon ignores non-modifier keyboard;
                     // the layer surface doesn't even hold focus then.
+                } else if context_menu.is_some() {
+                    // Context menu absorbs keyboard input — only Esc
+                    // closes it. Other keys are ignored so the menu
+                    // doesn't fire surprise side-actions.
+                    if keysym == 0xff1b {
+                        log::info!("context menu closed via Esc");
+                        context_menu = None;
+                        if let Some((x, y)) = last_pointer_xy {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                                context_menu.as_ref(),
+                            );
+                        }
+                    }
                 } else if keysym == 0xff1b {
                     // XKB_KEY_Escape = 0xff1b. Two quick presses
                     // exit; a single press just hints. Lets the
@@ -783,6 +1110,7 @@ fn run_daemon() -> Result<()> {
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
+                                context_menu.as_ref(),
                             );
                         }
                     }
@@ -819,6 +1147,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 } else if keysym == 0x0078 {
@@ -852,6 +1181,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 } else if keysym == 0x0068 || keysym == 0x0062 || keysym == 0x0076 {
@@ -906,6 +1236,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 } else if keysym_increases_tolerance(keysym) {
@@ -942,6 +1273,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 } else if keysym_decreases_tolerance(keysym) {
@@ -978,6 +1310,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 } else if keysym == 0x0072 {
@@ -1009,6 +1342,7 @@ fn run_daemon() -> Result<()> {
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
+                                    context_menu.as_ref(),
                                 );
                             }
                         }
@@ -1065,6 +1399,7 @@ fn run_daemon() -> Result<()> {
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
+                            context_menu.as_ref(),
                         );
                     }
                 }
@@ -1160,6 +1495,7 @@ fn run_daemon() -> Result<()> {
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
+                        context_menu.as_ref(),
                     );
                 }
             }
@@ -1361,6 +1697,187 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
 
 /// Linux input event code for the left mouse button (BTN_LEFT).
 const BTN_LEFT: u32 = 0x110;
+/// Linux input event code for the right mouse button (BTN_RIGHT).
+const BTN_RIGHT: u32 = 0x111;
+
+/// Width of the right-click context menu in logical pixels. Hard-coded
+/// (rather than auto-fit) so the renderer and the main-loop hit-tester
+/// stay in sync without sharing fontdue measurements across crates.
+/// Sized to comfortably fit the longest label ("Hold Horizontal
+/// Distance") + its shortcut hint with generous padding.
+const MENU_WIDTH_LOGICAL: f64 = 340.0;
+
+/// In-flight state of the right-click context menu.
+#[derive(Clone, Copy, Debug)]
+struct ContextMenuState {
+    /// Top-left in logical pixels, already clamped at open-time so the
+    /// menu fits on-screen.
+    origin: (f64, f64),
+    /// Cursor position at the moment the menu opened. While the menu
+    /// is open, the live measurement crosshair / edge detection
+    /// freezes here so the readout doesn't track the mouse as the
+    /// user navigates rows.
+    cursor_at_open: (f64, f64),
+    hovered: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MenuAction {
+    AddHorizontalGuide,
+    AddVerticalGuide,
+    HoldHorizontalDistance,
+    HoldVerticalDistance,
+    OpenScreenshotTool,
+    EnterBackgroundMode,
+    RestoreLastSession,
+    ClearAll,
+    ClosemacOS,
+}
+
+struct MenuItemDef {
+    label: &'static str,
+    shortcut: Option<&'static str>,
+    icon: HudContextMenuIcon,
+    action: MenuAction,
+    divider_after: bool,
+}
+
+const MENU_ITEMS: &[MenuItemDef] = &[
+    MenuItemDef {
+        label: "Add Horizontal Guide",
+        shortcut: Some("\u{21E7}H"),
+        icon: HudContextMenuIcon::GuideH,
+        action: MenuAction::AddHorizontalGuide,
+        divider_after: false,
+    },
+    MenuItemDef {
+        label: "Add Vertical Guide",
+        shortcut: Some("\u{21E7}V"),
+        icon: HudContextMenuIcon::GuideV,
+        action: MenuAction::AddVerticalGuide,
+        divider_after: true,
+    },
+    MenuItemDef {
+        label: "Hold Horizontal Distance",
+        shortcut: Some("H"),
+        icon: HudContextMenuIcon::StuckH,
+        action: MenuAction::HoldHorizontalDistance,
+        divider_after: false,
+    },
+    MenuItemDef {
+        label: "Hold Vertical Distance",
+        shortcut: Some("V"),
+        icon: HudContextMenuIcon::StuckV,
+        action: MenuAction::HoldVerticalDistance,
+        divider_after: true,
+    },
+    MenuItemDef {
+        label: "Open Screenshot Tool",
+        shortcut: Some("\u{2318}S"),
+        icon: HudContextMenuIcon::Camera,
+        action: MenuAction::OpenScreenshotTool,
+        divider_after: false,
+    },
+    MenuItemDef {
+        label: "Enter Background Mode",
+        shortcut: Some("\u{2303}\u{21E7}\u{2318}F"),
+        icon: HudContextMenuIcon::Background,
+        action: MenuAction::EnterBackgroundMode,
+        divider_after: false,
+    },
+    MenuItemDef {
+        label: "Restore Last Session",
+        shortcut: Some("\u{21E7}R"),
+        icon: HudContextMenuIcon::Restore,
+        action: MenuAction::RestoreLastSession,
+        divider_after: true,
+    },
+    MenuItemDef {
+        label: "Clear All",
+        shortcut: None,
+        icon: HudContextMenuIcon::Clear,
+        action: MenuAction::ClearAll,
+        divider_after: false,
+    },
+    MenuItemDef {
+        label: "Close macOS",
+        shortcut: None,
+        icon: HudContextMenuIcon::Close,
+        action: MenuAction::ClosemacOS,
+        divider_after: false,
+    },
+];
+
+/// Layout constants shared with `draw_context_menu` in the renderer.
+/// Keep these in sync — they're the source of truth for both the
+/// hit-test here and the visual layout in wayland.rs.
+const MENU_ROW_H: f64 = 32.0;
+const MENU_PAD_Y: f64 = 10.0;
+const MENU_DIV_PAD_V: f64 = 8.0;
+const MENU_DIV_HEIGHT: f64 = 1.0;
+
+/// Total height of the menu in logical px — pad + rows + dividers.
+/// Identical formula to the renderer's so clamping stays in sync.
+fn menu_content_height_logical(items: &[MenuItemDef]) -> f64 {
+    let mut h = MENU_PAD_Y * 2.0;
+    for (i, it) in items.iter().enumerate() {
+        h += MENU_ROW_H;
+        if it.divider_after && i + 1 < items.len() {
+            h += 2.0 * MENU_DIV_PAD_V + MENU_DIV_HEIGHT;
+        }
+    }
+    h
+}
+
+/// Hit-test the cursor against the menu. Returns the row index under
+/// the cursor, or `None` if the cursor is on a divider gap or outside
+/// the menu bounds.
+fn menu_hit_row(
+    origin: (f64, f64),
+    items: &[MenuItemDef],
+    cursor: (f64, f64),
+) -> Option<usize> {
+    let cx = cursor.0 - origin.0;
+    let cy = cursor.1 - origin.1;
+    if cx < 0.0 || cx >= MENU_WIDTH_LOGICAL {
+        return None;
+    }
+    let mut row_y = MENU_PAD_Y;
+    for (i, it) in items.iter().enumerate() {
+        if cy >= row_y && cy < row_y + MENU_ROW_H {
+            return Some(i);
+        }
+        row_y += MENU_ROW_H;
+        if it.divider_after && i + 1 < items.len() {
+            row_y += 2.0 * MENU_DIV_PAD_V + MENU_DIV_HEIGHT;
+        }
+    }
+    None
+}
+
+/// Cursor inside the menu's outer bounding box (used to decide whether
+/// a left-click means "click outside → close" or "click on a row").
+fn menu_contains(origin: (f64, f64), items: &[MenuItemDef], cursor: (f64, f64)) -> bool {
+    let cx = cursor.0 - origin.0;
+    let cy = cursor.1 - origin.1;
+    cx >= 0.0
+        && cx < MENU_WIDTH_LOGICAL
+        && cy >= 0.0
+        && cy < menu_content_height_logical(items)
+}
+
+/// Convert the static items table to the renderer-friendly form.
+fn build_hud_menu_items() -> Vec<HudContextMenuItem> {
+    MENU_ITEMS
+        .iter()
+        .map(|it| HudContextMenuItem {
+            label: it.label.into(),
+            shortcut: it.shortcut.map(|s| s.into()),
+            icon: it.icon,
+            divider_after: it.divider_after,
+        })
+        .collect()
+}
 
 fn toggle_measurement(
     mode: &mut InteractionMode,
@@ -1457,6 +1974,7 @@ fn update_cursor_in_mode(mode: &mut InteractionMode, cursor_px: Px) {
 /// In Hover mode this also runs live edge detection at the cursor
 /// pixel, producing the four cardinal snap candidates that drive the
 /// extending HUD lines.
+#[allow(clippy::too_many_arguments)]
 fn refresh_hud(
     mode: &InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
@@ -1475,8 +1993,20 @@ fn refresh_hud(
     screen_w: i32,
     screen_h: i32,
     resize_handle: Option<ResizeHandle>,
+    context_menu: Option<&ContextMenuState>,
 ) {
     let fg = hud_foreground(color_alternate);
+    // While the context menu is open, freeze the live measurement at
+    // the cursor's position when the menu opened — the crosshair, edge
+    // ticks, and any cursor-driven hover state stop tracking the mouse
+    // so the user can navigate menu rows without the readout jumping
+    // around. The actual mouse position is still used for menu hover
+    // (handled separately in the PointerMove path).
+    let (x, y) = if let Some(m) = context_menu {
+        m.cursor_at_open
+    } else {
+        (x, y)
+    };
     let cursor_px = Px::new(x as i32, y as i32);
     // For pending guide placement, snap the position to the nearest
     // detected pixel edge on the relevant axis — unless Super is
@@ -1575,6 +2105,16 @@ fn refresh_hud(
             }
         });
 
+    // Right-click context menu: built once here and attached to
+    // whichever HUD the regular branches end up producing. The menu
+    // stacks on top of the live measurement crosshair / held content,
+    // so the user can read measurements while picking actions.
+    let menu_for_hud = context_menu.map(|m| HudContextMenu {
+        origin: m.origin,
+        width: MENU_WIDTH_LOGICAL,
+        items: build_hud_menu_items(),
+        hovered: m.hovered,
+    });
     // While placing a guide, suppress the measurement crosshair —
     // only the guide line(s) should be visible. Crosshairs return as
     // soon as the guide is committed (pending_guide → None).
@@ -1594,11 +2134,28 @@ fn refresh_hud(
             GuideAxis::Horizontal => CursorKind::ResizeNS,
             GuideAxis::Vertical => CursorKind::ResizeEW,
         };
+        hud.context_menu = menu_for_hud.clone();
         overlay.set_hud(Some(hud));
         return;
     }
     match mode {
-        InteractionMode::Idle => {}
+        InteractionMode::Idle => {
+            // Idle daemon shouldn't normally reach here, but if it
+            // does (e.g. a stray PointerMove during teardown) just
+            // push an empty HUD with the menu attached so the menu
+            // still draws if someone opened it via tray.
+            if menu_for_hud.is_some() {
+                let mut hud = Hud::hover((x, y));
+                hud.kind = HudKind::None;
+                hud.foreground = fg;
+                hud.toast = toast.cloned();
+                hud.guides = composed_guides;
+                hud.stuck_measurements = composed_stuck;
+                hud.held_rects = composed_rects;
+                hud.context_menu = menu_for_hud;
+                overlay.set_hud(Some(hud));
+            }
+        }
         InteractionMode::Hover { .. } | InteractionMode::Held { .. } => {
             // Shift-held alignment mode: extend the live axis lines
             // to the screen edges (no edge-snap clamping), but keep
@@ -1620,10 +2177,16 @@ fn refresh_hud(
             hud.held_rects = composed_rects.clone();
             hud.cursor_in_rect = cursor_in_rect;
             hud.align_mode = align_mode;
-            if let Some(kind) = resize_cursor_kind {
-                hud.move_cursor_at = Some((x, y));
-                hud.cursor_kind = kind;
+            // Suppress custom move/resize cursors while the context
+            // menu is open — the system arrow takes over so the menu
+            // is comfortable to point at.
+            if menu_for_hud.is_none() {
+                if let Some(kind) = resize_cursor_kind {
+                    hud.move_cursor_at = Some((x, y));
+                    hud.cursor_kind = kind;
+                }
             }
+            hud.context_menu = menu_for_hud.clone();
             overlay.set_hud(Some(hud));
         }
         InteractionMode::Drawing { start, .. } => {
@@ -1651,6 +2214,7 @@ fn refresh_hud(
             hud.stuck_measurements = composed_stuck;
             hud.held_rects = composed_rects;
             hud.cursor_in_rect = cursor_in_rect;
+            hud.context_menu = menu_for_hud.clone();
             overlay.set_hud(Some(hud));
         }
     }
@@ -2084,9 +2648,15 @@ fn want_system_pointer(
     dragging_guide: Option<usize>,
     resizing: Option<ResizeOp>,
     resize_handle: Option<ResizeHandle>,
+    menu_open: bool,
     screen_w: i32,
     screen_h: i32,
 ) -> bool {
+    // The context menu always wants the system arrow, even when it
+    // overlaps clickable elements underneath.
+    if menu_open {
+        return true;
+    }
     if pending_guide.is_some()
         || dragging_guide.is_some()
         || resizing.is_some()
