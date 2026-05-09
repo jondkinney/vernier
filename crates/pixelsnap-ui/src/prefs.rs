@@ -4,6 +4,9 @@
 //! the daemon via the supplied callback so it can reload without
 //! restart.
 
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+
 use anyhow::Result;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
 use vernier_core::{
@@ -64,6 +67,10 @@ struct PrefsApp {
     on_restart: Box<dyn FnMut() + Send>,
     last_status: Option<String>,
     logo: Option<egui::TextureHandle>,
+    /// Receives the path the user picked from the folder dialog.
+    /// `Some(rx)` while the dialog is open; cleared once the user
+    /// either picks a folder or cancels.
+    folder_pick: Option<Receiver<Option<PathBuf>>>,
 }
 
 impl PrefsApp {
@@ -85,6 +92,7 @@ impl PrefsApp {
             on_restart,
             last_status: None,
             logo,
+            folder_pick: None,
         }
     }
 
@@ -113,6 +121,27 @@ impl PrefsApp {
 
 impl App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Pick up a folder-dialog result if one came in since last
+        // frame. `try_recv` returns Ok(_) once exactly — either the
+        // chosen path or `None` for "user canceled" — and we drop
+        // the receiver in either case so the next click reopens
+        // the dialog cleanly.
+        if let Some(rx) = self.folder_pick.as_ref() {
+            match rx.try_recv() {
+                Ok(Some(path)) => {
+                    self.edited.screenshots.output_dir = Some(path);
+                    self.folder_pick = None;
+                }
+                Ok(None) => {
+                    self.folder_pick = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.folder_pick = None;
+                }
+            }
+        }
+
         egui::SidePanel::left("prefs_sidebar")
             .resizable(false)
             .default_width(200.0)
@@ -197,7 +226,11 @@ impl App for PrefsApp {
                             false
                         }
                         Section::Screenshots => {
-                            screenshots_section(ui, &mut self.edited.screenshots);
+                            screenshots_section(
+                                ui,
+                                &mut self.edited.screenshots,
+                                &mut self.folder_pick,
+                            );
                             false
                         }
                         Section::Tolerance => {
@@ -320,21 +353,51 @@ fn general_section(ui: &mut egui::Ui, s: &mut GeneralSettings) {
     });
 }
 
-fn screenshots_section(ui: &mut egui::Ui, s: &mut ScreenshotSettings) {
+fn screenshots_section(
+    ui: &mut egui::Ui,
+    s: &mut ScreenshotSettings,
+    folder_pick: &mut Option<Receiver<Option<PathBuf>>>,
+) {
     setting(ui, |ui| {
         field_label(ui, "Output directory");
-        let mut dir_str = s
-            .output_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if padded_text_edit(ui, &mut dir_str).changed() {
-            s.output_dir = if dir_str.trim().is_empty() {
-                None
-            } else {
-                Some(std::path::PathBuf::from(dir_str.trim()))
-            };
-        }
+        ui.horizontal(|ui| {
+            let mut dir_str = s
+                .output_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut dir_str)
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .desired_width(ui.available_width() - 96.0),
+            );
+            if resp.changed() {
+                s.output_dir = if dir_str.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(dir_str.trim()))
+                };
+            }
+            // Disabled while a previous picker is still open — rfd
+            // doesn't gate concurrent invocations and the user will
+            // get two stacked portal dialogs.
+            let browse_enabled = folder_pick.is_none();
+            if ui
+                .add_enabled(browse_enabled, egui::Button::new("Browse…"))
+                .clicked()
+            {
+                let starting = s.output_dir.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut dialog = rfd::FileDialog::new().set_title("Output directory");
+                    if let Some(d) = starting.as_ref().filter(|p| p.exists()) {
+                        dialog = dialog.set_directory(d);
+                    }
+                    let _ = tx.send(dialog.pick_folder());
+                });
+                *folder_pick = Some(rx);
+            }
+        });
         ui.label(caption(
             "Empty = $XDG_PICTURES_DIR (or ~/Pictures). Non-existent paths are created on capture.",
         ));
