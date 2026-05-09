@@ -26,6 +26,14 @@ enum Section {
     About,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutId {
+    Toggle,
+    Background,
+    Restore,
+    Capture,
+}
+
 impl Section {
     fn label(self) -> &'static str {
         match self {
@@ -71,6 +79,10 @@ struct PrefsApp {
     /// `Some(rx)` while the dialog is open; cleared once the user
     /// either picks a folder or cancels.
     folder_pick: Option<Receiver<Option<PathBuf>>>,
+    /// While `Some(id)`, the prefs window is in capture mode for
+    /// the matching Shortcuts row — the next key press (with
+    /// modifiers) is recorded as that shortcut's accelerator.
+    capturing_shortcut: Option<ShortcutId>,
 }
 
 impl PrefsApp {
@@ -93,6 +105,7 @@ impl PrefsApp {
             last_status: None,
             logo,
             folder_pick: None,
+            capturing_shortcut: None,
         }
     }
 
@@ -121,6 +134,46 @@ impl PrefsApp {
 
 impl App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // While in shortcut-capture mode, drain key events from
+        // egui's input queue (so other widgets don't act on them)
+        // and apply the first non-modifier key as the new
+        // shortcut. Esc cancels capture without changing the
+        // value.
+        if let Some(target) = self.capturing_shortcut {
+            let captured = ctx.input_mut(|i| {
+                let result = i.events.iter().find_map(|ev| match ev {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                });
+                i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
+                result
+            });
+            if let Some((key, modifiers)) = captured {
+                let plain_modifiers = !(modifiers.shift
+                    || modifiers.ctrl
+                    || modifiers.alt
+                    || modifiers.command
+                    || modifiers.mac_cmd);
+                if key == egui::Key::Escape && plain_modifiers {
+                    self.capturing_shortcut = None;
+                } else {
+                    let s = format_accelerator(key, modifiers);
+                    match target {
+                        ShortcutId::Toggle => self.edited.shortcuts.toggle = s,
+                        ShortcutId::Background => self.edited.shortcuts.background_mode = s,
+                        ShortcutId::Restore => self.edited.shortcuts.restore_session = s,
+                        ShortcutId::Capture => self.edited.shortcuts.capture = s,
+                    }
+                    self.capturing_shortcut = None;
+                }
+            }
+        }
+
         // Pick up a folder-dialog result if one came in since last
         // frame. `try_recv` returns Ok(_) once exactly — either the
         // chosen path or `None` for "user canceled" — and we drop
@@ -248,6 +301,7 @@ impl App for PrefsApp {
                         Section::Shortcuts => shortcuts_section(
                             ui,
                             &mut self.edited.shortcuts,
+                            &mut self.capturing_shortcut,
                             self.on_restart.as_mut(),
                         ),
                         Section::About => {
@@ -544,16 +598,41 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
 fn shortcuts_section(
     ui: &mut egui::Ui,
     s: &mut ShortcutSettings,
+    capturing: &mut Option<ShortcutId>,
     on_restart: &mut dyn FnMut(),
 ) -> bool {
     ui.label(caption(
         "Keyboard shortcuts. Restart the daemon for changes to take effect.",
     ));
     ui.add_space(16.0);
-    shortcut_row(ui, "Toggle measure mode", &mut s.toggle);
-    shortcut_row(ui, "Background mode", &mut s.background_mode);
-    shortcut_row(ui, "Restore session", &mut s.restore_session);
-    shortcut_row(ui, "Capture (copy dimensions)", &mut s.capture);
+    shortcut_row(
+        ui,
+        "Toggle measure mode",
+        &mut s.toggle,
+        ShortcutId::Toggle,
+        capturing,
+    );
+    shortcut_row(
+        ui,
+        "Background mode",
+        &mut s.background_mode,
+        ShortcutId::Background,
+        capturing,
+    );
+    shortcut_row(
+        ui,
+        "Restore session",
+        &mut s.restore_session,
+        ShortcutId::Restore,
+        capturing,
+    );
+    shortcut_row(
+        ui,
+        "Capture (copy dimensions)",
+        &mut s.capture,
+        ShortcutId::Capture,
+        capturing,
+    );
     ui.add_space(8.0);
     let clicked = ui
         .add(
@@ -569,13 +648,16 @@ fn shortcuts_section(
     clicked
 }
 
-fn shortcut_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+fn shortcut_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    id: ShortcutId,
+    capturing: &mut Option<ShortcutId>,
+) {
     ui.horizontal(|ui| {
         // Manual paint for left-aligned label — `ui.add_sized` with
         // `Label` ends up right-justified inside the allocated rect.
-        // 200 px is enough for the longest label ("Capture (copy
-        // dimensions)") with ~12 px of trailing space before the
-        // input begins.
         let label_w = 200.0;
         let resp = ui.allocate_response(egui::vec2(label_w, 28.0), egui::Sense::hover());
         ui.painter().text(
@@ -585,12 +667,82 @@ fn shortcut_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
             egui::FontId::proportional(14.0),
             ui.visuals().text_color(),
         );
-        ui.add_sized(
-            [220.0, 28.0],
-            egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8, 6)),
+
+        let is_capturing = *capturing == Some(id);
+        let display = if is_capturing {
+            "Press a shortcut…".to_string()
+        } else if value.is_empty() {
+            "Click to set".to_string()
+        } else {
+            value.clone()
+        };
+        let mut button = egui::Button::new(
+            egui::RichText::new(display).monospace().size(13.0),
         );
+        if is_capturing {
+            button = button.fill(egui::Color32::from_rgb(50, 90, 140));
+        } else if value.is_empty() {
+            button = button.fill(egui::Color32::from_rgb(40, 40, 40));
+        }
+        if ui.add_sized([200.0, 28.0], button).clicked() {
+            *capturing = Some(id);
+        }
+
+        ui.add_space(2.0);
+        let clear_btn = egui::Button::new(
+            egui::RichText::new("×")
+                .size(16.0)
+                .color(egui::Color32::from_gray(200)),
+        );
+        if ui.add_sized([28.0, 28.0], clear_btn).clicked() {
+            value.clear();
+            *capturing = Some(id);
+        }
     });
     ui.add_space(12.0);
+}
+
+/// Render an egui key + modifier combo into the same
+/// `SHIFT+CTRL+ALT+SUPER+KEY` text the platform Accelerator parser
+/// already understands.
+fn format_accelerator(key: egui::Key, modifiers: egui::Modifiers) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if modifiers.shift {
+        parts.push("SHIFT");
+    }
+    if modifiers.ctrl {
+        parts.push("CTRL");
+    }
+    if modifiers.alt {
+        parts.push("ALT");
+    }
+    if modifiers.command || modifiers.mac_cmd {
+        parts.push("SUPER");
+    }
+    let key_str = match key {
+        egui::Key::Space => "SPACE",
+        egui::Key::Enter => "ENTER",
+        egui::Key::Escape => "ESC",
+        egui::Key::Tab => "TAB",
+        egui::Key::Backspace => "BACKSPACE",
+        egui::Key::Delete => "DELETE",
+        egui::Key::ArrowUp => "UP",
+        egui::Key::ArrowDown => "DOWN",
+        egui::Key::ArrowLeft => "LEFT",
+        egui::Key::ArrowRight => "RIGHT",
+        _ => return finalize_with_key(parts, &key.name().to_uppercase()),
+    };
+    finalize_with_key(parts, key_str)
+}
+
+fn finalize_with_key(mut parts: Vec<&'static str>, key: &str) -> String {
+    let owned: Vec<String> = parts.drain(..).map(|s| s.to_string()).collect();
+    let mut out = owned.join("+");
+    if !out.is_empty() {
+        out.push('+');
+    }
+    out.push_str(key);
+    out
 }
 
 fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
