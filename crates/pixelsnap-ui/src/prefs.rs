@@ -463,7 +463,7 @@ fn shortcut_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
             egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8, 6)),
         );
     });
-    ui.add_space(6.0);
+    ui.add_space(12.0);
 }
 
 fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
@@ -510,7 +510,7 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
 /// while consistent spacing comes from one place.
 fn setting<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let r = ui.vertical(|ui| content(ui)).inner;
-    ui.add_space(14.0);
+    ui.add_space(22.0);
     r
 }
 
