@@ -258,14 +258,24 @@ fn append_to_submenu(parent: &tray_icon::menu::Submenu, item: &TrayMenuItem) -> 
 /// dashes — but with a Linux-flavored teal-to-violet palette so it
 /// reads as the Wayland port rather than a copy.
 fn make_app_icon() -> tray_icon::Icon {
+    let rgba = render_app_icon_rgba(64);
+    tray_icon::Icon::from_rgba(rgba, 64, 64).expect("app icon construction must succeed")
+}
+
+/// Render the procedural app icon to a non-premultiplied RGBA8
+/// buffer at `size × size` pixels. Same purple-gradient + cross +
+/// T-caps + ticks the tray uses. Exposed so the daemon can also
+/// drop a PNG on disk for the desktop / launcher entry to
+/// reference.
+pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
     use tiny_skia::*;
-    const SIZE: u32 = 64;
-    let s = SIZE as f32;
-    let mut pixmap = Pixmap::new(SIZE, SIZE).expect("alloc app icon pixmap");
+    let s = size as f32;
+    let scale = s / 64.0;
+    let mut pixmap = Pixmap::new(size, size).expect("alloc app icon pixmap");
 
     // --- Rounded-square background with a teal → violet gradient.
-    let inset = 2.0;
-    let radius = 12.0;
+    let inset = 2.0 * scale;
+    let radius = 12.0 * scale;
     let bg_path = {
         let mut pb = PathBuilder::new();
         let x0 = inset;
@@ -313,10 +323,10 @@ fn make_app_icon() -> tray_icon::Icon {
     let mut ink = Paint::default();
     ink.set_color_rgba8(0x10, 0x10, 0x10, 0xEE);
     ink.anti_alias = true;
-    let cross_pad = 11.0;
-    let arm_thick = 5.0;
-    let cap_thick = 4.0;
-    let cap_extent = 16.0;
+    let cross_pad = 11.0 * scale;
+    let arm_thick = 5.0 * scale;
+    let cap_thick = 4.0 * scale;
+    let cap_extent = 16.0 * scale;
     let center = s * 0.5;
 
     // Vertical and horizontal arms.
@@ -359,10 +369,10 @@ fn make_app_icon() -> tray_icon::Icon {
     }
 
     // --- Pill in the lower-right with dashes.
-    let pill_w = 18.0;
-    let pill_h = 8.0;
-    let pill_x = s - cross_pad - pill_w - 1.0;
-    let pill_y = center + 6.0;
+    let pill_w = 18.0 * scale;
+    let pill_h = 8.0 * scale;
+    let pill_x = s - cross_pad - pill_w - 1.0 * scale;
+    let pill_y = center + 6.0 * scale;
     let pill_path = {
         let mut pb = PathBuilder::new();
         let r = pill_h * 0.5;
@@ -393,10 +403,10 @@ fn make_app_icon() -> tray_icon::Icon {
     );
     let mut tick = Paint::default();
     tick.set_color_rgba8(0xF0, 0xF0, 0xF0, 0xF0);
-    let dash_w = 2.4;
-    let dash_h = 2.4;
+    let dash_w = 2.4 * scale;
+    let dash_h = 2.4 * scale;
     let dash_y = pill_y + pill_h * 0.5 - dash_h * 0.5;
-    let gap = 3.6;
+    let gap = 3.6 * scale;
     let span = 4.0 * dash_w + 3.0 * gap;
     let mut dash_x = pill_x + (pill_w - span) * 0.5;
     for _ in 0..4 {
@@ -406,8 +416,8 @@ fn make_app_icon() -> tray_icon::Icon {
         dash_x += dash_w + gap;
     }
 
-    // --- Convert tiny-skia premultiplied RGBA to non-premultiplied for
-    // tray-icon. Most of the icon is fully opaque so this only matters
+    // --- Convert tiny-skia premultiplied RGBA to non-premultiplied
+    // RGBA. Most of the icon is fully opaque so this only matters
     // along the rounded corners' anti-aliased edges, but doing it
     // properly avoids a dark fringe.
     let mut rgba = pixmap.data().to_vec();
@@ -420,5 +430,5 @@ fn make_app_icon() -> tray_icon::Icon {
             chunk[2] = ((chunk[2] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
         }
     }
-    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("app icon construction must succeed")
+    rgba
 }

@@ -151,10 +151,17 @@ fn run_daemon() -> Result<()> {
             Settings::default()
         }
     };
+    let icon_path = match ensure_app_icon_png() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("app icon: {e:#}");
+            None
+        }
+    };
     apply_autostart(&initial_settings.general).unwrap_or_else(|e| {
         log::warn!("autostart: {e:#}");
     });
-    ensure_application_desktop_file().unwrap_or_else(|e| {
+    ensure_application_desktop_file(icon_path.as_deref()).unwrap_or_else(|e| {
         log::warn!("desktop entry: {e:#}");
     });
     replace_settings(initial_settings.clone());
@@ -1845,18 +1852,41 @@ fn populate_hud_appearance(hud: &mut Hud) {
     };
 }
 
+/// XDG data dir (`$XDG_DATA_HOME` with `~/.local/share` fallback).
+fn xdg_data_dir() -> Result<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .context("no XDG_DATA_HOME or HOME")
+}
+
+/// Drop the procedural app icon onto disk under the XDG hicolor
+/// theme (256×256 PNG). Both desktop entries reference it as
+/// `Icon=vernier`, so launchers (walker, rofi, GNOME activities)
+/// resolve it via the standard icon-theme lookup. Returns the
+/// installed path so callers can also use it as an absolute Icon=
+/// fallback.
+fn ensure_app_icon_png() -> Result<PathBuf> {
+    let dir = xdg_data_dir()?.join("icons/hicolor/256x256/apps");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("vernier.png");
+    let rgba = vernier_platform::render_app_icon_rgba(256);
+    let img = image::RgbaImage::from_raw(256, 256, rgba)
+        .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw"))?;
+    img.save(&path).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
 /// Write the application desktop entry (`vernier.desktop`) to
 /// `$XDG_DATA_HOME/applications` so app launchers (walker, rofi,
 /// the GNOME activity overview, …) find it. Idempotent — overwritten
 /// each daemon start so changes to the binary path show up. Exec
 /// runs `vernier prefs` so launching from a UI surfaces the
-/// preferences window rather than starting a second daemon.
-fn ensure_application_desktop_file() -> Result<()> {
-    let dir = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("no XDG_DATA_HOME or HOME")?
-        .join("applications");
+/// preferences window rather than starting a second daemon. Icon
+/// uses the absolute path to the PNG we just dropped, so launchers
+/// pick it up even on systems without an `index.theme`.
+fn ensure_application_desktop_file(icon_path: Option<&Path>) -> Result<()> {
+    let dir = xdg_data_dir()?.join("applications");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("vernier.desktop");
@@ -1864,12 +1894,16 @@ fn ensure_application_desktop_file() -> Result<()> {
         .context("current_exe")?
         .display()
         .to_string();
+    let icon = icon_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "vernier".into());
     let body = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=macOS\n\
          GenericName=Measurement Overlay\n\
          Comment=Cross-platform measurement overlay (macOS clone)\n\
+         Icon={icon}\n\
          Exec={exe} prefs\n\
          Terminal=false\n\
          Categories=Utility;Graphics;\n\
@@ -1879,6 +1913,13 @@ fn ensure_application_desktop_file() -> Result<()> {
     std::fs::write(&path, body)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Helper: read the PNG path the daemon just installed, fall back
+/// to `Icon=vernier` (XDG name lookup) if it isn't present.
+fn icon_path_for_desktop_entries() -> Option<PathBuf> {
+    let p = xdg_data_dir().ok()?.join("icons/hicolor/256x256/apps/vernier.png");
+    if p.exists() { Some(p) } else { None }
 }
 
 /// Write or remove `~/.config/autostart/vernier.desktop` depending
@@ -1897,9 +1938,14 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
             .context("current_exe")?
             .display()
             .to_string();
+        let icon = icon_path_for_desktop_entries()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "vernier".into());
         let body = format!(
             "[Desktop Entry]\nType=Application\nName=macOS\n\
-             Comment=Measurement overlay\nExec={exe}\nTerminal=false\n\
+             Comment=Measurement overlay\n\
+             Icon={icon}\n\
+             Exec={exe}\nTerminal=false\n\
              Categories=Utility;\nX-GNOME-Autostart-enabled=true\n"
         );
         std::fs::write(&path, body)
@@ -2743,28 +2789,33 @@ fn freeze_axis_measurement(
     surface_w: u32,
     surface_h: u32,
 ) -> StuckMeasurement {
+    // Keep edge positions as floats so the renderer's pill text
+    // matches the live W×H readout (subtract first, then round).
+    // Rounding individually here loses the sub-pixel info detected
+    // on HiDPI displays and was the source of an off-by-1 between
+    // live and frozen values.
     match axis {
         GuideAxis::Vertical => {
-            let up = edges[2].map(|e| e.position.1.round() as i32).unwrap_or(0);
+            let up = edges[2].map(|e| e.position.1).unwrap_or(0.0);
             let down = edges[3]
-                .map(|e| e.position.1.round() as i32)
-                .unwrap_or(surface_h as i32);
+                .map(|e| e.position.1)
+                .unwrap_or(surface_h as f64);
             StuckMeasurement {
                 axis,
-                at: x.round() as i32,
+                at: x,
                 start: up,
                 end: down,
                 hovered: false,
             }
         }
         GuideAxis::Horizontal => {
-            let left = edges[0].map(|e| e.position.0.round() as i32).unwrap_or(0);
+            let left = edges[0].map(|e| e.position.0).unwrap_or(0.0);
             let right = edges[1]
-                .map(|e| e.position.0.round() as i32)
-                .unwrap_or(surface_w as i32);
+                .map(|e| e.position.0)
+                .unwrap_or(surface_w as f64);
             StuckMeasurement {
                 axis,
-                at: y.round() as i32,
+                at: y,
                 start: left,
                 end: right,
                 hovered: false,
@@ -2907,33 +2958,31 @@ fn cursor_over_guide_x_badge(cursor: Px, g: &Guide, screen_w: i32, screen_h: i32
 /// digit count of the value text and the constants used by the
 /// renderer (TEXT_STUCK_LOGICAL_PX = 10, proportional padding).
 fn cursor_over_stuck_pill(cursor: Px, m: &StuckMeasurement) -> bool {
-    let value_text = format!("{}", (m.end - m.start).abs());
+    let length = (m.end - m.start).abs().round() as i64;
+    let value_text = format!("{length}");
     let chars = value_text.len() as f64;
     // Approximation: avg glyph advance ≈ 0.55 × text size.
     let pill_w = (chars * 10.0 * 0.55 + 2.0 * 8.0).max(20.0);
     let pill_h = 10.0 * 1.8; // text + 2 × pad
-    let est_pill_h = pill_h as f32;
-    let inside_long = match m.axis {
-        GuideAxis::Vertical => (m.end - m.start).abs() as f32 >= 3.0 * est_pill_h,
-        GuideAxis::Horizontal => (m.end - m.start).abs() as f32 >= 3.0 * est_pill_h,
-    };
+    let est_pill_h = pill_h;
+    let inside_long = (m.end - m.start).abs() >= 3.0 * est_pill_h;
     let (px, py) = match m.axis {
         GuideAxis::Vertical => {
-            let mid = (m.start + m.end) as f64 * 0.5;
+            let mid = (m.start + m.end) * 0.5;
             if inside_long {
-                (m.at as f64 - pill_w * 0.5, mid - pill_h * 0.5)
+                (m.at - pill_w * 0.5, mid - pill_h * 0.5)
             } else {
                 // LeftCenter at (m.at + tick_half + 4, mid)
-                (m.at as f64 + 9.0, mid - pill_h * 0.5)
+                (m.at + 9.0, mid - pill_h * 0.5)
             }
         }
         GuideAxis::Horizontal => {
-            let mid = (m.start + m.end) as f64 * 0.5;
+            let mid = (m.start + m.end) * 0.5;
             if inside_long {
-                (mid - pill_w * 0.5, m.at as f64 - pill_h * 0.5)
+                (mid - pill_w * 0.5, m.at - pill_h * 0.5)
             } else {
                 // AnchorTop at (mid, m.at + tick_half + 4)
-                (mid - pill_w * 0.5, m.at as f64 + 9.0)
+                (mid - pill_w * 0.5, m.at + 9.0)
             }
         }
     };

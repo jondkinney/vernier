@@ -7,6 +7,14 @@ mod tray;
 mod types;
 pub use types::*;
 
+/// Render the procedural app icon (purple/teal gradient with the
+/// cross + T-caps + tick pill) as a non-premultiplied RGBA8 buffer
+/// at `size × size`. Used by the daemon to drop a PNG on disk so
+/// app launchers can show the same icon as the tray.
+pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
+    tray::render_app_icon_rgba(size)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

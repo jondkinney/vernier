@@ -245,7 +245,10 @@ pub struct HeldRect {
 
 /// A frozen single-axis measurement. Drawn as a coral line spanning
 /// `start..end` with tick caps on both ends and a pill showing the
-/// pixel length.
+/// pixel length. Positions are kept as `f64` so the renderer can do
+/// the same `subtract-then-round` step the live W×H pill uses; if
+/// the endpoints were rounded individually before subtraction, HiDPI
+/// edge positions could drift the displayed length by 1 px.
 #[derive(Debug, Clone, Copy)]
 pub struct StuckMeasurement {
     /// `Vertical` = a vertical line measuring up-to-down extent.
@@ -253,11 +256,11 @@ pub struct StuckMeasurement {
     pub axis: GuideAxis,
     /// Perpendicular position in logical px (x for Vertical,
     /// y for Horizontal).
-    pub at: i32,
+    pub at: f64,
     /// Start of the measured span in logical px.
-    pub start: i32,
+    pub start: f64,
     /// End of the measured span in logical px.
-    pub end: i32,
+    pub end: f64,
     /// Transient: true when the cursor is over this measurement's
     /// pill — renderer swaps the value text for "×" to signal
     /// "click to remove".
