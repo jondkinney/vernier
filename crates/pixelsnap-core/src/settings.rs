@@ -294,7 +294,9 @@ pub struct ShortcutSettings {
 impl Default for ShortcutSettings {
     fn default() -> Self {
         Self {
-            toggle: "SUPER+CTRL+SHIFT+F".to_string(),
+            // Hyprland's binding-line wraps SUPER around this; the
+            // GlobalShortcuts portal sees CTRL+SHIFT+F.
+            toggle: "CTRL+SHIFT+F".to_string(),
             background_mode: "ESC".to_string(),
             restore_session: "SHIFT+R".to_string(),
             capture: "ENTER".to_string(),

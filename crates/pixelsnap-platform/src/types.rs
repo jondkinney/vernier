@@ -405,6 +405,91 @@ impl Default for Accelerator {
     }
 }
 
+impl Accelerator {
+    /// Parse a `+`-separated accelerator string like `"CTRL+SHIFT+F"`,
+    /// `"super+space"`, or `"alt+f12"`. Tokens are case-insensitive;
+    /// modifiers must precede the single key. Returns `None` on
+    /// unrecognised input so the caller can fall back to the default
+    /// accelerator without crashing the daemon.
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut modifiers = Modifiers::NONE;
+        let mut key: Option<Key> = None;
+        for tok_raw in s.split('+') {
+            let tok = tok_raw.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let lower = tok.to_ascii_lowercase();
+            match lower.as_str() {
+                "shift" => modifiers |= Modifiers::SHIFT,
+                "ctrl" | "control" => modifiers |= Modifiers::CTRL,
+                "alt" | "opt" | "option" => modifiers |= Modifiers::ALT,
+                "super" | "meta" | "cmd" | "command" | "win" => modifiers |= Modifiers::META,
+                "esc" | "escape" => key = Some(Key::Escape),
+                "enter" | "return" => key = Some(Key::Enter),
+                "space" => key = Some(Key::Space),
+                "tab" => key = Some(Key::Tab),
+                "backspace" => key = Some(Key::Backspace),
+                "delete" | "del" => key = Some(Key::Delete),
+                "up" => key = Some(Key::Up),
+                "down" => key = Some(Key::Down),
+                "left" => key = Some(Key::Left),
+                "right" => key = Some(Key::Right),
+                other => {
+                    if let Some(rest) = other.strip_prefix('f') {
+                        if let Ok(n) = rest.parse::<u8>() {
+                            if (1..=24).contains(&n) {
+                                key = Some(Key::F(n));
+                                continue;
+                            }
+                        }
+                    }
+                    if other.chars().count() == 1 {
+                        key = other.chars().next().map(|c| Key::Char(c.to_ascii_lowercase()));
+                        continue;
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(Self { modifiers, key: key? })
+    }
+
+    /// Render back to a stable text form (`SHIFT+CTRL+ALT+SUPER+KEY`)
+    /// — handy for prefs UI display and round-trip tests.
+    pub fn to_string_key(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.contains(Modifiers::SHIFT) {
+            parts.push("SHIFT".to_string());
+        }
+        if self.modifiers.contains(Modifiers::CTRL) {
+            parts.push("CTRL".to_string());
+        }
+        if self.modifiers.contains(Modifiers::ALT) {
+            parts.push("ALT".to_string());
+        }
+        if self.modifiers.contains(Modifiers::META) {
+            parts.push("SUPER".to_string());
+        }
+        let key_str = match self.key {
+            Key::Char(c) => c.to_ascii_uppercase().to_string(),
+            Key::F(n) => format!("F{n}"),
+            Key::Escape => "ESC".to_string(),
+            Key::Enter => "ENTER".to_string(),
+            Key::Space => "SPACE".to_string(),
+            Key::Tab => "TAB".to_string(),
+            Key::Backspace => "BACKSPACE".to_string(),
+            Key::Delete => "DELETE".to_string(),
+            Key::Up => "UP".to_string(),
+            Key::Down => "DOWN".to_string(),
+            Key::Left => "LEFT".to_string(),
+            Key::Right => "RIGHT".to_string(),
+        };
+        parts.push(key_str);
+        parts.join("+")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Modifiers(pub u8);
 
