@@ -128,15 +128,9 @@ impl App for PrefsApp {
                 ui.add_space(8.0);
                 for section in SECTIONS {
                     let selected = self.section == *section;
-                    let label = egui::RichText::new(section.label()).size(15.0);
-                    let resp = ui.add_sized(
-                        [ui.available_width(), 32.0],
-                        egui::SelectableLabel::new(selected, label),
-                    );
-                    if resp.clicked() {
+                    if sidebar_item(ui, selected, section.label()).clicked() {
                         self.section = *section;
                     }
-                    ui.add_space(2.0);
                 }
             });
 
@@ -203,16 +197,16 @@ impl App for PrefsApp {
 }
 
 /// Apply the prefs window's font + spacing scale on init. Egui's
-/// defaults are quite tight; bumping body text to 14, headings to
-/// 22, button/input padding to ~10×8, and item spacing to 8 brings
-/// the prefs UI closer to a typical native settings pane.
+/// defaults are quite tight; bumping headings to 21 / body to 14 /
+/// captions to 12 with consistent button + input padding lines up
+/// with what most native settings panes use.
 fn apply_style(ctx: &egui::Context) {
     use egui::FontFamily::Proportional;
     use egui::TextStyle::*;
     ctx.style_mut(|style| {
         style.text_styles = [
-            (Heading, egui::FontId::new(22.0, Proportional)),
-            (Body, egui::FontId::new(14.5, Proportional)),
+            (Heading, egui::FontId::new(21.0, Proportional)),
+            (Body, egui::FontId::new(14.0, Proportional)),
             (Monospace, egui::FontId::new(13.0, egui::FontFamily::Monospace)),
             (Button, egui::FontId::new(14.0, Proportional)),
             (Small, egui::FontId::new(12.0, Proportional)),
@@ -226,6 +220,35 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.icon_spacing = 6.0;
         style.visuals.widgets.inactive.expansion = 0.0;
     });
+}
+
+/// Left-aligned, full-width sidebar row. Egui's stock
+/// `SelectableLabel` centers its text inside its rect; we want a
+/// settings-pane look (`Section name      `), so paint it
+/// ourselves with `Align2::LEFT_CENTER` over a clickable rect.
+fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let height = 32.0;
+    let response = ui.allocate_response(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            response.rect.expand(-2.0),
+            egui::CornerRadius::same(6),
+            visuals.bg_fill,
+        );
+    }
+    let text_pos = response.rect.left_center() + egui::vec2(12.0, 0.0);
+    ui.painter().text(
+        text_pos,
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        visuals.text_color(),
+    );
+    response
 }
 
 /// Render the procedural app icon at 256×256 and load it as an
@@ -501,7 +524,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 fn caption(text: &str) -> egui::RichText {
     egui::RichText::new(text)
         .color(egui::Color32::from_gray(170))
-        .size(12.5)
+        .size(12.0)
 }
 
 /// Single-line text input with consistent inner padding so the
