@@ -10,3 +10,6 @@ rust-version.workspace = true
 vernier-core = { workspace = true }
 vernier-platform = { workspace = true }
 log = { workspace = true }
+anyhow = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
