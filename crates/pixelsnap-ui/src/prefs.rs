@@ -836,6 +836,20 @@ fn color_picker(ui: &mut egui::Ui, c: &mut ColorRgba) {
     ));
 }
 
+/// Optional initial size + screen position. Wayland doesn't let
+/// the client position itself, so the window briefly appears at
+/// the compositor's chosen spot before we dispatch
+/// `hyprctl movewindowpixel` to it. Set by the caller from the
+/// previous prefs window's geometry so the post-Restart prefs
+/// reopens in the same place.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrefsGeometry {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub w: Option<u32>,
+    pub h: Option<u32>,
+}
+
 /// Open the prefs window. Returns when the user closes it.
 /// `on_saved` runs synchronously after each successful save (the
 /// caller plugs in an IPC reload ping). `on_quit` runs when the
@@ -848,14 +862,46 @@ pub fn run_prefs(
     on_saved: Box<dyn FnMut() + Send>,
     on_quit: Box<dyn FnMut() + Send>,
     on_restart: Box<dyn FnMut() + Send>,
+    geometry: PrefsGeometry,
 ) -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("macOS Preferences")
+        .with_app_id("vernier-prefs")
+        .with_min_inner_size([520.0, 360.0]);
+    let initial_w = geometry.w.unwrap_or(720) as f32;
+    let initial_h = geometry.h.unwrap_or(520) as f32;
+    viewport = viewport.with_inner_size([initial_w, initial_h]);
     let options = NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("macOS Preferences")
-            .with_inner_size([720.0, 520.0])
-            .with_min_inner_size([520.0, 360.0]),
+        viewport,
         ..Default::default()
     };
+    if geometry.x.is_some() || geometry.y.is_some() {
+        // Wayland clients can't set their own position, so once
+        // the window's app_id is registered with Hyprland we ask
+        // the compositor to slide it into place. Tiny delay so
+        // the window is mapped first.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            if let (Some(x), Some(y)) = (geometry.x, geometry.y) {
+                let _ = std::process::Command::new("hyprctl")
+                    .args([
+                        "dispatch",
+                        "movewindowpixel",
+                        &format!("exact {x} {y}, class:vernier-prefs"),
+                    ])
+                    .output();
+            }
+            if let (Some(w), Some(h)) = (geometry.w, geometry.h) {
+                let _ = std::process::Command::new("hyprctl")
+                    .args([
+                        "dispatch",
+                        "resizewindowpixel",
+                        &format!("exact {w} {h}, class:vernier-prefs"),
+                    ])
+                    .output();
+            }
+        });
+    }
     eframe::run_native(
         "macOS Preferences",
         options,

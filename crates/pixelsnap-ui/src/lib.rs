@@ -5,4 +5,4 @@
 
 pub mod prefs;
 
-pub use prefs::run_prefs;
+pub use prefs::{run_prefs, PrefsGeometry};

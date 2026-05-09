@@ -51,8 +51,20 @@ enum Cmd {
     /// `~/.config/vernier/settings.toml`, lets the user edit them
     /// across the General / Screenshots / Tolerance / Appearance /
     /// Integrations / Shortcuts / About sections, and pings the
-    /// running daemon to reload after each save.
-    Prefs,
+    /// running daemon to reload after each save. Optional `--x` /
+    /// `--y` / `--w` / `--h` re-anchor + resize the window via
+    /// hyprctl after it appears (used by the Restart flow to put
+    /// the new prefs back where the previous one was).
+    Prefs {
+        #[arg(long)]
+        x: Option<i32>,
+        #[arg(long)]
+        y: Option<i32>,
+        #[arg(long)]
+        w: Option<u32>,
+        #[arg(long)]
+        h: Option<u32>,
+    },
     /// Tell the running daemon to re-read its settings file. Sent
     /// automatically by the prefs window after each save.
     ReloadSettings,
@@ -76,7 +88,7 @@ fn main() -> Result<()> {
         Some(Cmd::DetectEdges { x, y, tolerance }) => {
             run_client_command(&format!("detect-edges {x} {y} {tolerance}"))
         }
-        Some(Cmd::Prefs) => run_prefs_window(),
+        Some(Cmd::Prefs { x, y, w, h }) => run_prefs_window(PrefsGeometry { x, y, w, h }),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
         None => {
             // If a daemon is already running, treat the bare invocation
@@ -110,12 +122,25 @@ fn existing_daemon_responsive() -> bool {
     std::os::unix::net::UnixStream::connect(&path).is_ok()
 }
 
+/// Optional initial geometry (in compositor logical px) for the
+/// prefs window — populated by the Restart flow so the new window
+/// reopens where the old one was.
+#[derive(Debug, Clone, Copy, Default)]
+struct PrefsGeometry {
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<u32>,
+    h: Option<u32>,
+}
+
 /// Open the egui prefs window. After each successful save the
 /// in-process callback pings the running daemon over IPC so it
 /// reloads `settings.toml` without restart. The Quit button in
 /// the prefs window dispatches the same `vernier quit` IPC the
-/// CLI uses.
-fn run_prefs_window() -> Result<()> {
+/// CLI uses. Restart preserves the window geometry by querying
+/// hyprctl, killing+respawning the daemon, and respawning a fresh
+/// `vernier prefs --x --y --w --h`.
+fn run_prefs_window(geometry: PrefsGeometry) -> Result<()> {
     let on_saved: Box<dyn FnMut() + Send> = Box::new(|| {
         // Best-effort: if no daemon is running, the prefs window
         // still works — settings just take effect on next launch.
@@ -129,25 +154,93 @@ fn run_prefs_window() -> Result<()> {
         }
     });
     let on_restart: Box<dyn FnMut() + Send> = Box::new(|| {
-        // Stop the running daemon, then spawn a fresh one. The
-        // smart bare-launch path inside `vernier` (no args)
-        // sees no live IPC socket and starts the daemon for us.
+        let saved_geom = read_prefs_window_geometry();
         if let Err(e) = run_client_command("quit") {
             log::warn!("daemon quit IPC failed during restart: {e:#}");
         }
         // Wait for the dbus name + IPC socket to release.
         std::thread::sleep(Duration::from_millis(300));
-        let exe = std::env::current_exe().ok();
-        let mut cmd = match exe {
-            Some(p) => std::process::Command::new(p),
-            None => std::process::Command::new("vernier"),
-        };
-        match cmd.spawn() {
+        let exe = std::env::current_exe()
+            .ok()
+            .unwrap_or_else(|| std::path::PathBuf::from("vernier"));
+        match std::process::Command::new(&exe).spawn() {
             Ok(child) => log::info!("daemon respawned (pid {})", child.id()),
             Err(e) => log::warn!("respawn daemon: {e:#}"),
         }
+        // Give the new daemon a moment to bind its IPC socket
+        // before the new prefs window starts pinging it.
+        std::thread::sleep(Duration::from_millis(400));
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("prefs");
+        if let Some((x, y, w, h)) = saved_geom {
+            cmd.args([
+                "--x",
+                &x.to_string(),
+                "--y",
+                &y.to_string(),
+                "--w",
+                &w.to_string(),
+                "--h",
+                &h.to_string(),
+            ]);
+        }
+        match cmd.spawn() {
+            Ok(child) => log::info!("prefs respawned (pid {})", child.id()),
+            Err(e) => log::warn!("respawn prefs: {e:#}"),
+        }
     });
-    vernier_ui::run_prefs(on_saved, on_quit, on_restart)
+    vernier_ui::run_prefs(on_saved, on_quit, on_restart, geometry_into_ui(geometry))
+}
+
+fn geometry_into_ui(g: PrefsGeometry) -> vernier_ui::PrefsGeometry {
+    vernier_ui::PrefsGeometry { x: g.x, y: g.y, w: g.w, h: g.h }
+}
+
+/// Find the current prefs window in `hyprctl clients` (matched on
+/// the `vernier-prefs` app_id we set on the eframe viewport) and
+/// return its `(x, y, w, h)` in compositor logical px. Returns
+/// `None` if the binary isn't available, the JSON can't be
+/// parsed, or the window isn't there.
+fn read_prefs_window_geometry() -> Option<(i32, i32, u32, u32)> {
+    let out = std::process::Command::new("hyprctl")
+        .args(["-j", "clients"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    parse_prefs_geometry_from_clients_json(&body)
+}
+
+/// Tiny ad-hoc parser for the fields we need from `hyprctl -j
+/// clients` — full JSON parsing would pull in serde_json just for
+/// this. The structure is an array of objects each with `class`,
+/// `at: [x, y]`, and `size: [w, h]` keys; we look for the first
+/// object whose class is exactly `vernier-prefs`.
+fn parse_prefs_geometry_from_clients_json(s: &str) -> Option<(i32, i32, u32, u32)> {
+    // Find a `"class": "vernier-prefs"` occurrence.
+    let class_idx = s.find("\"class\": \"vernier-prefs\"")?;
+    // From there, look forward for `"at":` and `"size":` within a
+    // small window.
+    let tail = &s[class_idx..];
+    let at_start = tail.find("\"at\":")? + class_idx;
+    let after_at = &s[at_start..];
+    let bracket = after_at.find('[')?;
+    let close = after_at[bracket..].find(']')?;
+    let at_inner = &after_at[bracket + 1..bracket + close];
+    let mut at_parts = at_inner.split(',').map(|p| p.trim().parse::<i32>().ok());
+    let x = at_parts.next()??;
+    let y = at_parts.next()??;
+    let size_start = tail.find("\"size\":")? + class_idx;
+    let after_sz = &s[size_start..];
+    let bracket = after_sz.find('[')?;
+    let close = after_sz[bracket..].find(']')?;
+    let sz_inner = &after_sz[bracket + 1..bracket + close];
+    let mut sz_parts = sz_inner.split(',').map(|p| p.trim().parse::<i32>().ok());
+    let w = sz_parts.next()?? as u32;
+    let h = sz_parts.next()?? as u32;
+    Some((x, y, w, h))
 }
 
 fn run_client_command(cmd: &str) -> Result<()> {
@@ -225,8 +318,21 @@ fn run_daemon() -> Result<()> {
             );
             Accelerator::default()
         });
-    let mut current_hotkey: Option<HotkeyId> =
-        match platform.register_hotkey(initial_accel, "Toggle vernier") {
+    // On Hyprland, registering through xdg-desktop-portal often
+    // doesn't actually intercept the keypress (the portal accepts
+    // the binding silently but never fires the activation). The
+    // user's hyprland.conf binding is what actually triggers the
+    // action. Bypass the portal: dispatch a Hyprland keyword bind
+    // at runtime so the configured shortcut intercepts directly.
+    // Off Hyprland we keep the portal route as a fallback.
+    let on_hyprland = is_hyprland_session();
+    let mut current_hotkey: Option<HotkeyId> = None;
+    if on_hyprland {
+        if !register_hyprland_toggle(&initial_accel) {
+            log::warn!("hyprctl bind for toggle failed");
+        }
+    } else {
+        current_hotkey = match platform.register_hotkey(initial_accel, "Toggle vernier") {
             Ok(id) => {
                 log::info!(
                     "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
@@ -241,6 +347,7 @@ fn run_daemon() -> Result<()> {
                 None
             }
         };
+    }
     let mut current_accel = initial_accel;
 
     let (combined_tx, combined_rx) = std::sync::mpsc::channel::<MainEvent>();
@@ -1770,24 +1877,40 @@ fn run_daemon() -> Result<()> {
                         // changed it.
                         if let Some(new_accel) = Accelerator::parse(&s.shortcuts.toggle) {
                             if new_accel != current_accel {
-                                if let Some(prev) = current_hotkey.take() {
-                                    if let Err(e) = platform.unregister_hotkey(prev) {
-                                        log::warn!("unregister old hotkey: {e:#}");
-                                    }
-                                }
-                                match platform.register_hotkey(new_accel, "Toggle vernier") {
-                                    Ok(id) => {
+                                if on_hyprland {
+                                    let _ = unregister_hyprland_toggle(&current_accel);
+                                    if register_hyprland_toggle(&new_accel) {
                                         log::info!(
                                             "toggle hotkey changed to {}",
                                             new_accel.to_string_key(),
                                         );
-                                        current_hotkey = Some(id);
                                         current_accel = new_accel;
+                                    } else {
+                                        log::warn!(
+                                            "hyprctl bind for new toggle {} failed",
+                                            new_accel.to_string_key(),
+                                        );
                                     }
-                                    Err(e) => log::warn!(
-                                        "register new hotkey {}: {e:#}",
-                                        new_accel.to_string_key(),
-                                    ),
+                                } else {
+                                    if let Some(prev) = current_hotkey.take() {
+                                        if let Err(e) = platform.unregister_hotkey(prev) {
+                                            log::warn!("unregister old hotkey: {e:#}");
+                                        }
+                                    }
+                                    match platform.register_hotkey(new_accel, "Toggle vernier") {
+                                        Ok(id) => {
+                                            log::info!(
+                                                "toggle hotkey changed to {}",
+                                                new_accel.to_string_key(),
+                                            );
+                                            current_hotkey = Some(id);
+                                            current_accel = new_accel;
+                                        }
+                                        Err(e) => log::warn!(
+                                            "register new hotkey {}: {e:#}",
+                                            new_accel.to_string_key(),
+                                        ),
+                                    }
                                 }
                             }
                         } else {
@@ -2031,6 +2154,102 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
             .with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
+}
+
+/// True when launched inside a Hyprland session (env var set by
+/// the compositor on each spawned client).
+fn is_hyprland_session() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+/// Convert an `Accelerator` to the `(MODS, KEY)` pair Hyprland's
+/// `bind`/`unbind` keywords expect. Modifier order is the
+/// canonical Hyprland one (`SUPER CTRL ALT SHIFT`).
+fn accel_to_hyprland(accel: &Accelerator) -> (String, String) {
+    use vernier_platform::{Key, Modifiers};
+    let mut mods: Vec<&str> = Vec::new();
+    if accel.modifiers.contains(Modifiers::META) {
+        mods.push("SUPER");
+    }
+    if accel.modifiers.contains(Modifiers::CTRL) {
+        mods.push("CTRL");
+    }
+    if accel.modifiers.contains(Modifiers::ALT) {
+        mods.push("ALT");
+    }
+    if accel.modifiers.contains(Modifiers::SHIFT) {
+        mods.push("SHIFT");
+    }
+    let key = match accel.key {
+        Key::Char(c) => c.to_ascii_uppercase().to_string(),
+        Key::F(n) => format!("F{n}"),
+        Key::Escape => "Escape".to_string(),
+        Key::Enter => "Return".to_string(),
+        Key::Space => "Space".to_string(),
+        Key::Tab => "Tab".to_string(),
+        Key::Backspace => "BackSpace".to_string(),
+        Key::Delete => "Delete".to_string(),
+        Key::Up => "Up".to_string(),
+        Key::Down => "Down".to_string(),
+        Key::Left => "Left".to_string(),
+        Key::Right => "Right".to_string(),
+    };
+    (mods.join(" "), key)
+}
+
+/// Register the toggle accelerator as a runtime Hyprland bind
+/// that runs `vernier toggle` (the IPC client command). Returns
+/// `false` if the spawn or hyprctl call failed.
+fn register_hyprland_toggle(accel: &Accelerator) -> bool {
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "vernier".to_string());
+    let (mods, key) = accel_to_hyprland(accel);
+    let arg = format!("bind = {mods}, {key}, exec, {exe} toggle");
+    match std::process::Command::new("hyprctl")
+        .args(["keyword", &arg])
+        .output()
+    {
+        Ok(out) => {
+            if !out.status.success() {
+                log::warn!(
+                    "hyprctl bind exit={:?} stdout={} stderr={}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                );
+                return false;
+            }
+            log::info!(
+                "hyprctl bind: {mods}, {key} → {exe} toggle ({})",
+                accel.to_string_key()
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("hyprctl bind spawn: {e:#}");
+            false
+        }
+    }
+}
+
+/// Drop a previously-registered runtime bind so it doesn't pile up
+/// across reloads. Best-effort — Hyprland tolerates duplicates and
+/// unbind-on-not-bound is a no-op.
+fn unregister_hyprland_toggle(accel: &Accelerator) -> bool {
+    let (mods, key) = accel_to_hyprland(accel);
+    let arg = format!("unbind = {mods}, {key}");
+    match std::process::Command::new("hyprctl")
+        .args(["keyword", &arg])
+        .output()
+    {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("hyprctl unbind spawn: {e:#}");
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
