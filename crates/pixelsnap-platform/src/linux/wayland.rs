@@ -1863,8 +1863,16 @@ fn draw_stuck_measurements(
     let est_pill_h = TEXT_STUCK_LOGICAL_PX * scale_f * 1.8;
 
     for m in measurements {
-        let length = (m.end - m.start).abs();
-        let value_text = format_value(length as f64, fmt);
+        // Snap endpoints to the physical pixel grid (same `floor`
+        // step the live crosshair uses), subtract in buffer px, and
+        // divide back by scale. Rounded to an integer so the pill
+        // matches the live W×H readout exactly — without it, HiDPI
+        // half-pixel offsets and fractional rounding modes can drift
+        // the displayed length relative to the live pill.
+        let start_buf = (m.start as f32 * scale_f).floor();
+        let end_buf = (m.end as f32 * scale_f).floor();
+        let length = ((end_buf - start_buf).abs() / scale_f).round() as f64;
+        let value_text = format_value(length, fmt);
         // Pill bg is ALWAYS sized for the value text so the size
         // doesn't change when hovering. The displayed glyph may be
         // larger (× at 1.5×) and overflow the bg slightly — that's

@@ -11,16 +11,15 @@ vernier-core = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
-tray-icon = { version = "0.23", default-features = false }
 tiny-skia = "0.12"
 fontdue = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
-gtk = "0.18"
 ashpd = { version = "0.13", features = ["global_shortcuts", "screencast", "pipewire"] }
 pipewire = "0.9"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
