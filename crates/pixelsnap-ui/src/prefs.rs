@@ -189,19 +189,43 @@ impl App for PrefsApp {
                     ui.heading(self.section.label());
                     ui.add_space(14.0);
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.section {
-                    Section::General => general_section(ui, &mut self.edited.general),
-                    Section::Screenshots => screenshots_section(ui, &mut self.edited.screenshots),
-                    Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
-                    Section::Appearance => appearance_section(ui, &mut self.edited.appearance),
-                    Section::Integrations => integrations_section(ui, &mut self.edited.integrations),
-                    Section::Shortcuts => shortcuts_section(
-                        ui,
-                        &mut self.edited.shortcuts,
-                        self.on_restart.as_mut(),
-                    ),
-                    Section::About => about_section(ui, self.logo.as_ref()),
-                });
+                let restart_clicked = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.section {
+                        Section::General => {
+                            general_section(ui, &mut self.edited.general);
+                            false
+                        }
+                        Section::Screenshots => {
+                            screenshots_section(ui, &mut self.edited.screenshots);
+                            false
+                        }
+                        Section::Tolerance => {
+                            tolerance_section(ui, &mut self.edited.tolerance);
+                            false
+                        }
+                        Section::Appearance => {
+                            appearance_section(ui, &mut self.edited.appearance);
+                            false
+                        }
+                        Section::Integrations => {
+                            integrations_section(ui, &mut self.edited.integrations);
+                            false
+                        }
+                        Section::Shortcuts => shortcuts_section(
+                            ui,
+                            &mut self.edited.shortcuts,
+                            self.on_restart.as_mut(),
+                        ),
+                        Section::About => {
+                            about_section(ui, self.logo.as_ref());
+                            false
+                        }
+                    })
+                    .inner;
+                if restart_clicked {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
     }
 }
@@ -451,11 +475,14 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
     });
 }
 
+/// Returns `true` if the Restart button was clicked (so the
+/// caller can close the prefs window — the running daemon is on
+/// its way out).
 fn shortcuts_section(
     ui: &mut egui::Ui,
     s: &mut ShortcutSettings,
     on_restart: &mut dyn FnMut(),
-) {
+) -> bool {
     ui.label(caption(
         "Keyboard shortcuts. Restart the daemon for changes to take effect.",
     ));
@@ -465,24 +492,28 @@ fn shortcuts_section(
     shortcut_row(ui, "Restore session", &mut s.restore_session);
     shortcut_row(ui, "Capture (copy dimensions)", &mut s.capture);
     ui.add_space(8.0);
-    if ui
+    let clicked = ui
         .add(
             egui::Button::new(
                 egui::RichText::new("Restart vernier")
                     .color(egui::Color32::from_rgb(120, 180, 255)),
             ),
         )
-        .clicked()
-    {
+        .clicked();
+    if clicked {
         on_restart();
     }
+    clicked
 }
 
 fn shortcut_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         // Manual paint for left-aligned label — `ui.add_sized` with
         // `Label` ends up right-justified inside the allocated rect.
-        let label_w = 220.0;
+        // 200 px is enough for the longest label ("Capture (copy
+        // dimensions)") with ~12 px of trailing space before the
+        // input begins.
+        let label_w = 200.0;
         let resp = ui.allocate_response(egui::vec2(label_w, 28.0), egui::Sense::hover());
         ui.painter().text(
             resp.rect.left_center(),
