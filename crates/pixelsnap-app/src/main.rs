@@ -128,7 +128,26 @@ fn run_prefs_window() -> Result<()> {
             log::warn!("daemon quit IPC failed: {e:#}");
         }
     });
-    vernier_ui::run_prefs(on_saved, on_quit)
+    let on_restart: Box<dyn FnMut() + Send> = Box::new(|| {
+        // Stop the running daemon, then spawn a fresh one. The
+        // smart bare-launch path inside `vernier` (no args)
+        // sees no live IPC socket and starts the daemon for us.
+        if let Err(e) = run_client_command("quit") {
+            log::warn!("daemon quit IPC failed during restart: {e:#}");
+        }
+        // Wait for the dbus name + IPC socket to release.
+        std::thread::sleep(Duration::from_millis(300));
+        let exe = std::env::current_exe().ok();
+        let mut cmd = match exe {
+            Some(p) => std::process::Command::new(p),
+            None => std::process::Command::new("vernier"),
+        };
+        match cmd.spawn() {
+            Ok(child) => log::info!("daemon respawned (pid {})", child.id()),
+            Err(e) => log::warn!("respawn daemon: {e:#}"),
+        }
+    });
+    vernier_ui::run_prefs(on_saved, on_quit, on_restart)
 }
 
 fn run_client_command(cmd: &str) -> Result<()> {

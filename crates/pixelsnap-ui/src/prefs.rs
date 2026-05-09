@@ -58,6 +58,10 @@ struct PrefsApp {
     /// Invoked when the user clicks "Quit vernier" — the caller
     /// is responsible for telling the running daemon to exit.
     on_quit: Box<dyn FnMut() + Send>,
+    /// Invoked when the user clicks "Restart vernier" on the
+    /// Shortcuts pane. Caller stops the daemon and respawns a
+    /// fresh one so re-registered hotkey bindings take effect.
+    on_restart: Box<dyn FnMut() + Send>,
     last_status: Option<String>,
     logo: Option<egui::TextureHandle>,
 }
@@ -67,6 +71,7 @@ impl PrefsApp {
         cc: &CreationContext<'_>,
         on_saved: Box<dyn FnMut() + Send>,
         on_quit: Box<dyn FnMut() + Send>,
+        on_restart: Box<dyn FnMut() + Send>,
     ) -> Self {
         apply_style(&cc.egui_ctx);
         let logo = load_logo_texture(&cc.egui_ctx);
@@ -77,6 +82,7 @@ impl PrefsApp {
             saved: initial,
             on_saved,
             on_quit,
+            on_restart,
             last_status: None,
             logo,
         }
@@ -189,7 +195,11 @@ impl App for PrefsApp {
                     Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
                     Section::Appearance => appearance_section(ui, &mut self.edited.appearance),
                     Section::Integrations => integrations_section(ui, &mut self.edited.integrations),
-                    Section::Shortcuts => shortcuts_section(ui, &mut self.edited.shortcuts),
+                    Section::Shortcuts => shortcuts_section(
+                        ui,
+                        &mut self.edited.shortcuts,
+                        self.on_restart.as_mut(),
+                    ),
                     Section::About => about_section(ui, self.logo.as_ref()),
                 });
             });
@@ -441,22 +451,45 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
     });
 }
 
-fn shortcuts_section(ui: &mut egui::Ui, s: &mut ShortcutSettings) {
+fn shortcuts_section(
+    ui: &mut egui::Ui,
+    s: &mut ShortcutSettings,
+    on_restart: &mut dyn FnMut(),
+) {
     ui.label(caption(
-        "Keyboard shortcuts. Restart the daemon (`vernier quit && vernier`) for changes to register globally.",
+        "Keyboard shortcuts. Restart the daemon for changes to take effect.",
     ));
-    ui.add_space(12.0);
+    ui.add_space(16.0);
     shortcut_row(ui, "Toggle measure mode", &mut s.toggle);
     shortcut_row(ui, "Background mode", &mut s.background_mode);
     shortcut_row(ui, "Restore session", &mut s.restore_session);
     shortcut_row(ui, "Capture (copy dimensions)", &mut s.capture);
+    ui.add_space(8.0);
+    if ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new("Restart vernier")
+                    .color(egui::Color32::from_rgb(120, 180, 255)),
+            ),
+        )
+        .clicked()
+    {
+        on_restart();
+    }
 }
 
 fn shortcut_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [200.0, 28.0],
-            egui::Label::new(egui::RichText::new(label).size(14.0)),
+        // Manual paint for left-aligned label — `ui.add_sized` with
+        // `Label` ends up right-justified inside the allocated rect.
+        let label_w = 220.0;
+        let resp = ui.allocate_response(egui::vec2(label_w, 28.0), egui::Sense::hover());
+        ui.painter().text(
+            resp.rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
         );
         ui.add_sized(
             [220.0, 28.0],
@@ -561,10 +594,14 @@ fn color_picker(ui: &mut egui::Ui, c: &mut ColorRgba) {
 /// `on_saved` runs synchronously after each successful save (the
 /// caller plugs in an IPC reload ping). `on_quit` runs when the
 /// user clicks the "Quit vernier" button so the caller can send
-/// the daemon-shutdown IPC.
+/// the daemon-shutdown IPC. `on_restart` runs from the Shortcuts
+/// pane's "Restart vernier" button so the caller can stop the
+/// daemon and respawn it (so re-registered hotkey bindings take
+/// effect).
 pub fn run_prefs(
     on_saved: Box<dyn FnMut() + Send>,
     on_quit: Box<dyn FnMut() + Send>,
+    on_restart: Box<dyn FnMut() + Send>,
 ) -> Result<()> {
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -576,7 +613,7 @@ pub fn run_prefs(
     eframe::run_native(
         "macOS Preferences",
         options,
-        Box::new(move |cc| Ok(Box::new(PrefsApp::new(cc, on_saved, on_quit)))),
+        Box::new(move |cc| Ok(Box::new(PrefsApp::new(cc, on_saved, on_quit, on_restart)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
