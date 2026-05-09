@@ -345,6 +345,11 @@ fn run_daemon() -> Result<()> {
     // windows.
     let mut last_tray_click: Option<Instant> = None;
     const TRAY_CLICK_DEDUPE: Duration = Duration::from_millis(500);
+    // Handle to the in-flight prefs subprocess, if any. Tray click
+    // toggles it (open if not running, close if running); the
+    // OpenPrefs IPC opens-if-closed (no double window when the
+    // user runs `vernier` from a terminal while prefs is up).
+    let mut prefs_child: Option<std::process::Child> = None;
     // Right-click context menu state. `Some` while open; the renderer
     // reads it to draw the menu, the pointer/keyboard handlers route
     // input to it.
@@ -370,7 +375,7 @@ fn run_daemon() -> Result<()> {
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
-                spawn_prefs_window();
+                ensure_prefs_window(&mut prefs_child);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) => {
                 log::info!("unhandled tray menu id: {id}");
@@ -388,8 +393,7 @@ fn run_daemon() -> Result<()> {
                     continue;
                 }
                 last_tray_click = Some(now);
-                log::info!("tray icon clicked — opening prefs");
-                spawn_prefs_window();
+                toggle_prefs_window(&mut prefs_child);
             }
             MainEvent::Platform(PlatformEvent::PointerEnter { x, y, .. })
             | MainEvent::Platform(PlatformEvent::PointerMove {
@@ -1769,7 +1773,7 @@ fn run_daemon() -> Result<()> {
                 }
             }
             MainEvent::Ipc(IpcCmd::OpenPrefs) => {
-                spawn_prefs_window();
+                ensure_prefs_window(&mut prefs_child);
             }
             MainEvent::ToastElapsed { exit_measurement } => {
                 // A timer thread fires when its toast duration elapses.
@@ -2000,12 +2004,11 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `vernier prefs` so the tray "Preferences…" entry can
-/// open the settings UI without the daemon hosting an egui window
-/// inside its own event loop. If the current binary path can't be
-/// resolved (very unusual), fall back to looking up `vernier` on
-/// PATH.
-fn spawn_prefs_window() {
+/// Spawn `vernier prefs` and return the `Child` handle so the
+/// caller can track whether the window is still open. Used by the
+/// toggle (tray click) and the open-if-closed (IPC `open-prefs`)
+/// paths. Returns `None` if the spawn failed.
+fn spawn_prefs_window() -> Option<std::process::Child> {
     let exe = std::env::current_exe().ok();
     let mut cmd = match exe {
         Some(p) => std::process::Command::new(p),
@@ -2013,9 +2016,49 @@ fn spawn_prefs_window() {
     };
     cmd.arg("prefs");
     match cmd.spawn() {
-        Ok(child) => log::info!("prefs window spawned (pid {})", child.id()),
-        Err(e) => log::warn!("spawn prefs: {e:#}"),
+        Ok(child) => {
+            log::info!("prefs window spawned (pid {})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            log::warn!("spawn prefs: {e:#}");
+            None
+        }
     }
+}
+
+/// Tray click semantics: open prefs if not running, close it if
+/// running. Closing kills the subprocess (egui shuts down cleanly
+/// on SIGKILL — there's no editable state besides the in-memory
+/// settings copy, which the user already had a chance to save).
+fn toggle_prefs_window(handle: &mut Option<std::process::Child>) {
+    if let Some(child) = handle.as_mut() {
+        // try_wait returns Ok(None) while the child is still alive.
+        if matches!(child.try_wait(), Ok(None)) {
+            if let Some(mut c) = handle.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            log::info!("prefs window closed via tray toggle");
+            return;
+        }
+    }
+    // Either no child or it has already exited — replace with a
+    // fresh one.
+    *handle = spawn_prefs_window();
+}
+
+/// Open prefs only if there isn't already a window up — keeps the
+/// `vernier` (no-args) IPC path from spawning a duplicate when
+/// the tray icon already brought a window up.
+fn ensure_prefs_window(handle: &mut Option<std::process::Child>) {
+    if let Some(child) = handle.as_mut() {
+        if matches!(child.try_wait(), Ok(None)) {
+            log::info!("prefs window already open — ignoring open request");
+            return;
+        }
+    }
+    *handle = spawn_prefs_window();
 }
 
 /// Returns the active toast iff its dismissal time hasn't passed.
