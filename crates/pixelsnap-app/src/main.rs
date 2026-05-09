@@ -6,8 +6,8 @@ use vernier_core::{
     Tolerance, Units,
 };
 use vernier_platform::{
-    Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis,
-    HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
+    Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId,
+    Hud, HudAxis, HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
     HudMeasurementFormat, HudRounding, HudToast, MonitorId, NativeFrame, Platform, PlatformEvent,
     StuckMeasurement, TrayMenu,
 };
@@ -145,23 +145,39 @@ fn run_daemon() -> Result<()> {
         .context("no monitors available")?;
     set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
-    let _tray = platform.create_tray(TrayMenu::minimal("vernier"))?;
-
-    let _hotkey = match platform.register_hotkey(Accelerator::default(), "Toggle vernier") {
-        Ok(id) => {
-            log::info!(
-                "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
-            );
-            Some(id)
-        }
-        Err(e) => {
-            log::warn!(
-                "hotkey registration failed: {e}; falling back to CLI/IPC. \
-                 Bind a key in Hyprland: bind = ALT SHIFT, P, exec, vernier toggle"
-            );
-            None
-        }
+    let _tray = if !initial_settings.general.hide_tray_icon {
+        Some(platform.create_tray(TrayMenu::minimal("vernier"))?)
+    } else {
+        log::info!("tray icon hidden via settings.general.hide_tray_icon");
+        None
     };
+
+    let initial_accel = Accelerator::parse(&initial_settings.shortcuts.toggle)
+        .unwrap_or_else(|| {
+            log::warn!(
+                "could not parse settings.shortcuts.toggle = {:?}; using default {:?}",
+                initial_settings.shortcuts.toggle,
+                Accelerator::default().to_string_key(),
+            );
+            Accelerator::default()
+        });
+    let mut current_hotkey: Option<HotkeyId> =
+        match platform.register_hotkey(initial_accel, "Toggle vernier") {
+            Ok(id) => {
+                log::info!(
+                    "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
+                );
+                Some(id)
+            }
+            Err(e) => {
+                log::warn!(
+                    "hotkey registration failed: {e}; falling back to CLI/IPC. \
+                     Bind a key in Hyprland: bind = ALT SHIFT, P, exec, vernier toggle"
+                );
+                None
+            }
+        };
+    let mut current_accel = initial_accel;
 
     let (combined_tx, combined_rx) = std::sync::mpsc::channel::<MainEvent>();
 
@@ -1105,14 +1121,18 @@ fn run_daemon() -> Result<()> {
                         .map(|t| now.duration_since(t) <= ESC_DOUBLE_WINDOW)
                         .unwrap_or(false);
                     if is_double {
+                        let persist = current_settings().general.session_persistence;
                         log::info!(
-                            "esc×2 — saving session ({} rect(s), {} guide(s), {} stuck) and exiting",
+                            "esc×2 — {} session ({} rect(s), {} guide(s), {} stuck) and exiting",
+                            if persist { "saving" } else { "discarding" },
                             held_rects.len(),
                             guides.len(),
                             stuck_measurements.len(),
                         );
-                        if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
-                            log::warn!("save session: {e:#}");
+                        if persist {
+                            if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
+                                log::warn!("save session: {e:#}");
+                            }
                         }
                         last_esc_at = None;
                         guides.clear();
@@ -1454,6 +1474,126 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
+                } else if keysym == 0xff0d || keysym == 0xff8d {
+                    // Enter / KP_Enter — copy the dimensions of the
+                    // hovered held rect (or the only rect if just
+                    // one exists) using the configured CopyFormat.
+                    let cursor_px = last_pointer_xy
+                        .map(|(x, y)| Px::new(x as i32, y as i32));
+                    let target = cursor_px
+                        .and_then(|c| {
+                            held_rects.iter().find(|r| {
+                                let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                                let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                                cursor_in_held_rect(c, rs, re) || cursor_over_pill(c, rs, re)
+                            })
+                        })
+                        .or_else(|| {
+                            (held_rects.len() == 1).then(|| &held_rects[0])
+                        });
+                    if let Some(rect) = target {
+                        let w = (rect.rect_end.0 - rect.rect_start.0).abs().round() as u32;
+                        let h = (rect.rect_end.1 - rect.rect_start.1).abs().round() as u32;
+                        let fmt = current_settings().integrations.copy_dimensions_format;
+                        let text = fmt.render(w, h);
+                        if let Err(e) = write_clipboard_text(&text) {
+                            log::warn!("copy dimensions: {e:#}");
+                        } else {
+                            log::info!("copied dimensions: {text:?}");
+                            active_toast = Some(HudToast {
+                                text: format!("Copied: {text}"),
+                            });
+                            toast_until = Some(
+                                Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS),
+                            );
+                            spawn_toast_timer(
+                                &combined_tx,
+                                Duration::from_millis(TOAST_TOLERANCE_MS),
+                                false,
+                            );
+                            if let Some((x, y)) = last_pointer_xy {
+                                last_hud_redraw = Instant::now();
+                                let toast = current_toast(&active_toast, toast_until);
+                                refresh_hud(
+                                    &mode,
+                                    &mut overlay,
+                                    frozen_frame.as_ref(),
+                                    x,
+                                    y,
+                                    tol_level.value(),
+                                    toast,
+                                    &guides,
+                                    pending_guide,
+                                    &stuck_measurements,
+                                    &held_rects,
+                                    color_alternate,
+                                    shift_held,
+                                    super_held,
+                                    primary.bounds.w as i32,
+                                    primary.bounds.h as i32,
+                                    None,
+                                    context_menu.as_ref(),
+                                );
+                            }
+                        }
+                    } else {
+                        log::info!("Enter: no held rect under cursor — nothing to copy");
+                    }
+                } else if matches!(
+                    keysym,
+                    0xff51 | 0xff52 | 0xff53 | 0xff54
+                ) {
+                    // Arrow keys — nudge the hovered held rect.
+                    // Shift = 10px step, plain = 1px.
+                    let cursor_px = last_pointer_xy
+                        .map(|(x, y)| Px::new(x as i32, y as i32));
+                    let target_idx = cursor_px.and_then(|c| {
+                        held_rects.iter().position(|r| {
+                            let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                            let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                            cursor_in_held_rect(c, rs, re) || cursor_over_pill(c, rs, re)
+                        })
+                    });
+                    if let Some(idx) = target_idx {
+                        let step = if shift_held { 10.0 } else { 1.0 };
+                        let (dx, dy) = match keysym {
+                            0xff51 => (-step, 0.0), // Left
+                            0xff52 => (0.0, -step), // Up
+                            0xff53 => (step, 0.0),  // Right
+                            0xff54 => (0.0, step),  // Down
+                            _ => (0.0, 0.0),
+                        };
+                        if let Some(rect) = held_rects.get_mut(idx) {
+                            rect.rect_start.0 += dx;
+                            rect.rect_start.1 += dy;
+                            rect.rect_end.0 += dx;
+                            rect.rect_end.1 += dy;
+                        }
+                        if let Some((x, y)) = last_pointer_xy {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                tol_level.value(),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                shift_held,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                                context_menu.as_ref(),
+                            );
+                        }
+                    }
                 }
             }
             MainEvent::Platform(other) => log::debug!("platform event: {other:?}"),
@@ -1512,6 +1652,36 @@ fn run_daemon() -> Result<()> {
                         // Reset live tolerance to the new default so the
                         // user immediately sees their pref reflected.
                         tol_level = s.tolerance.default_level;
+                        // Re-register the toggle hotkey if the user
+                        // changed it.
+                        if let Some(new_accel) = Accelerator::parse(&s.shortcuts.toggle) {
+                            if new_accel != current_accel {
+                                if let Some(prev) = current_hotkey.take() {
+                                    if let Err(e) = platform.unregister_hotkey(prev) {
+                                        log::warn!("unregister old hotkey: {e:#}");
+                                    }
+                                }
+                                match platform.register_hotkey(new_accel, "Toggle vernier") {
+                                    Ok(id) => {
+                                        log::info!(
+                                            "toggle hotkey changed to {}",
+                                            new_accel.to_string_key(),
+                                        );
+                                        current_hotkey = Some(id);
+                                        current_accel = new_accel;
+                                    }
+                                    Err(e) => log::warn!(
+                                        "register new hotkey {}: {e:#}",
+                                        new_accel.to_string_key(),
+                                    ),
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "skipping hotkey re-register: could not parse {:?}",
+                                s.shortcuts.toggle,
+                            );
+                        }
                         replace_settings(s);
                     }
                     Err(e) => log::warn!("reload settings: {e:#}"),
@@ -3319,19 +3489,18 @@ fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
     Ok(())
 }
 
-/// Crop the held region out of the frozen capture, save it as a PNG to
-/// `~/Pictures/screenshot-<timestamp>.png`, copy to the clipboard, and
-/// fire a `notify-send` notification with an "Edit" action that opens
-/// the saved file in Satty (Omarchy's default screenshot annotator).
-/// The notification handler runs on a detached thread because
-/// `notify-send -A` blocks until the user acts on or dismisses the
-/// notification.
+/// Crop the held region out of the frozen capture and save / copy /
+/// notify per the user's screenshot prefs. The notification handler
+/// runs on a detached thread because `notify-send -A` blocks until
+/// the user acts on or dismisses the notification.
 fn take_held_screenshot(
     frame: &vernier_platform::NativeFrame,
     rect_start: Px,
     rect_end: Px,
 ) -> Result<()> {
     use vernier_platform::PixelFormat;
+    let s = current_settings();
+    let prefs = s.screenshots.clone();
     let surface_w = frame.bounds.w as f64;
     let surface_h = frame.bounds.h as f64;
     if surface_w <= 0.0 || surface_h <= 0.0 {
@@ -3339,10 +3508,15 @@ fn take_held_screenshot(
     }
     let scale_x = frame.width as f64 / surface_w;
     let scale_y = frame.height as f64 / surface_h;
-    let fx0 = (rect_start.x.min(rect_end.x) as f64 * scale_x).round() as i32;
-    let fy0 = (rect_start.y.min(rect_end.y) as f64 * scale_y).round() as i32;
-    let fx1 = (rect_start.x.max(rect_end.x) as f64 * scale_x).round() as i32;
-    let fy1 = (rect_start.y.max(rect_end.y) as f64 * scale_y).round() as i32;
+    let pad_logical = prefs.padding_px as f64;
+    let lo_x_l = rect_start.x.min(rect_end.x) as f64 - pad_logical;
+    let lo_y_l = rect_start.y.min(rect_end.y) as f64 - pad_logical;
+    let hi_x_l = rect_start.x.max(rect_end.x) as f64 + pad_logical;
+    let hi_y_l = rect_start.y.max(rect_end.y) as f64 + pad_logical;
+    let fx0 = (lo_x_l * scale_x).round() as i32;
+    let fy0 = (lo_y_l * scale_y).round() as i32;
+    let fx1 = (hi_x_l * scale_x).round() as i32;
+    let fy1 = (hi_y_l * scale_y).round() as i32;
     let cx0 = fx0.max(0).min(frame.width as i32) as u32;
     let cy0 = fy0.max(0).min(frame.height as i32) as u32;
     let cx1 = fx1.max(0).min(frame.width as i32) as u32;
@@ -3374,40 +3548,103 @@ fn take_held_screenshot(
 
     let img = image::RgbaImage::from_raw(w, h, pixels)
         .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw"))?;
-    let dir = pictures_dir();
+    // Retina downscale: physical px → logical px so the file ends up
+    // at the on-screen size rather than the raw HiDPI buffer size.
+    let img = if prefs.retina_downscale && (scale_x > 1.0 || scale_y > 1.0) {
+        let target_w = (w as f64 / scale_x).round() as u32;
+        let target_h = (h as f64 / scale_y).round() as u32;
+        if target_w > 0 && target_h > 0 {
+            image::imageops::resize(
+                &img,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            img
+        }
+    } else {
+        img
+    };
+    let final_w = img.width();
+    let final_h = img.height();
+    let dir = prefs
+        .output_dir
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(pictures_dir);
+    let dir = expand_user_path(&dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let timestamp = current_timestamp();
-    let path = dir.join(format!("screenshot-{timestamp}.png"));
+    let template = if prefs.filename_template.trim().is_empty() {
+        "screenshot-{ts}.png".to_string()
+    } else {
+        prefs.filename_template.clone()
+    };
+    let filename = template
+        .replace("{ts}", &timestamp)
+        .replace("{w}", &final_w.to_string())
+        .replace("{h}", &final_h.to_string());
+    let path = dir.join(filename);
     img.save(&path)
         .with_context(|| format!("write {}", path.display()))?;
-    log::info!("screenshot saved: {} ({}×{})", path.display(), w, h);
+    log::info!(
+        "screenshot saved: {} ({}×{}) padding={} retina_downscale={}",
+        path.display(),
+        final_w,
+        final_h,
+        prefs.padding_px,
+        prefs.retina_downscale,
+    );
 
-    // Copy to clipboard. `wl-copy -t image/png < FILE` matches what
-    // omarchy-cmd-screenshot does.
-    if let Ok(file) = std::fs::File::open(&path) {
-        let _ = std::process::Command::new("wl-copy")
-            .args(["-t", "image/png"])
-            .stdin(file)
-            .spawn();
+    if prefs.copy_to_clipboard {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let _ = std::process::Command::new("wl-copy")
+                .args(["-t", "image/png"])
+                .stdin(file)
+                .spawn();
+        }
     }
 
-    // Notification with an "Edit" action. notify-send -A blocks until
-    // the user acts; we run it on a detached thread and shell out to
-    // satty if the action fires.
+    if prefs.capture_sound {
+        // Best-effort: rely on the user's `canberra-gtk-play` /
+        // `paplay` setup for Omarchy's stock shutter sound.
+        std::thread::spawn(|| {
+            for cmd in ["canberra-gtk-play", "paplay"] {
+                let mut c = std::process::Command::new(cmd);
+                if cmd == "canberra-gtk-play" {
+                    c.args(["-i", "screen-capture"]);
+                } else {
+                    c.arg("/usr/share/sounds/freedesktop/stereo/screen-capture.oga");
+                }
+                if c.spawn().is_ok() {
+                    break;
+                }
+            }
+        });
+    }
+
     let path_str = path.to_string_lossy().into_owned();
+    let satty_action = prefs.satty_edit_action;
     std::thread::spawn(move || {
-        let result = std::process::Command::new("notify-send")
-            .args([
-                "-A",
-                "default=Edit",
-                "-i",
-                &path_str,
-                "-t",
-                "10000",
-                "Screenshot saved",
-                "Click to edit with Satty",
-            ])
-            .output();
+        let mut args: Vec<&str> = vec![
+            "-i",
+            &path_str,
+            "-t",
+            "10000",
+            "Screenshot saved",
+        ];
+        if satty_action {
+            args.insert(0, "default=Edit");
+            args.insert(0, "-A");
+            args.push("Click to edit with Satty");
+        } else {
+            args.push(&path_str);
+        }
+        let result = std::process::Command::new("notify-send").args(&args).output();
+        if !satty_action {
+            return;
+        }
         if let Ok(out) = result {
             let action = String::from_utf8_lossy(&out.stdout);
             if action.trim() == "default" {
@@ -3429,6 +3666,38 @@ fn take_held_screenshot(
     });
 
     Ok(())
+}
+
+/// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
+/// path; the screenshot capture has its own image-mode call.
+fn write_clipboard_text(text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn wl-copy")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .context("write to wl-copy stdin")?;
+    }
+    child.wait().context("wait wl-copy")?;
+    Ok(())
+}
+
+/// Expand a leading `~` or `~/...` in a path against `$HOME`.
+/// Settings persist whatever the user typed; this is the convenient
+/// runtime equivalent.
+fn expand_user_path(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        return PathBuf::from(home).join(rest);
+    }
+    if s == "~" {
+        return PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    }
+    p.to_path_buf()
 }
 
 /// Where the last-session snapshot lives (held rects + guides +
