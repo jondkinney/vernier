@@ -319,6 +319,13 @@ fn run_daemon() -> Result<()> {
     // Live resize op against a held rect — set on press over an
     // edge/corner, cleared on release.
     let mut resizing: Option<ResizeOp> = None;
+    // Debounce for tray-icon Activate. waybar (and some other SNI
+    // hosts) fires Activate twice per click — once on press and
+    // once on release, both with the same coordinates. Without
+    // this guard, every click on the tray icon spawns two prefs
+    // windows.
+    let mut last_tray_click: Option<Instant> = None;
+    const TRAY_CLICK_DEDUPE: Duration = Duration::from_millis(500);
     // Right-click context menu state. `Some` while open; the renderer
     // reads it to draw the menu, the pointer/keyboard handlers route
     // input to it.
@@ -353,6 +360,15 @@ fn run_daemon() -> Result<()> {
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
+                let now = Instant::now();
+                if last_tray_click
+                    .map(|t| now.duration_since(t) < TRAY_CLICK_DEDUPE)
+                    .unwrap_or(false)
+                {
+                    log::debug!("tray click within dedupe window — ignoring duplicate");
+                    continue;
+                }
+                last_tray_click = Some(now);
                 log::info!("tray icon clicked — opening prefs");
                 spawn_prefs_window();
             }
