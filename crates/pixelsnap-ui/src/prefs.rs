@@ -747,15 +747,65 @@ fn shortcut_row(
     ui.add_space(12.0);
 }
 
-/// Open `path` in the user's default editor / file handler.
-/// Tries `$VISUAL` / `$EDITOR` if set (spawned in a terminal we
-/// can find), else falls back to `xdg-open` which delegates to
-/// whatever GUI handler the desktop has registered for `.conf`.
+/// Open `path` in whichever app the user's desktop has registered
+/// as the default handler for `text/plain`. `xdg-open` would fall
+/// back to the `.conf` handler, which often isn't a text editor.
+/// Resolves the MIME default via `xdg-mime`, parses the matching
+/// `.desktop` file, and either:
+///   - launches via the user's preferred terminal (when `Terminal=true`,
+///     so terminal editors like nvim/vim/helix work), or
+///   - launches via `gtk-launch` for GUI editors.
+/// Falls back to `xdg-open` if any step fails.
 fn open_in_editor(path: &std::path::Path) {
     use std::process::{Command, Stdio};
     let path_str = path.to_string_lossy().into_owned();
-    // Prefer xdg-open — most Linux desktops have a sensible
-    // default for plain-text/.conf files (typically a GUI editor).
+
+    let desktop_id = Command::new("xdg-mime")
+        .args(["query", "default", "text/plain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(desktop_id) = desktop_id {
+        if let Some((exec, terminal)) = read_desktop_exec(&desktop_id) {
+            let argv = parse_exec_argv(&exec, &path_str);
+            if terminal {
+                if launch_in_terminal(&argv) {
+                    log::info!("opened {} via terminal handler {}", path_str, desktop_id);
+                    return;
+                }
+            } else if !argv.is_empty() {
+                if Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    log::info!("opened {} via {} ({})", path_str, argv[0], desktop_id);
+                    return;
+                }
+            }
+        }
+        // Last attempt before xdg-open: gtk-launch the .desktop id.
+        let app_name = desktop_id.strip_suffix(".desktop").unwrap_or(&desktop_id);
+        if Command::new("gtk-launch")
+            .args([app_name, &path_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            log::info!("opened {} via gtk-launch {}", path_str, app_name);
+            return;
+        }
+    }
+
     if Command::new("xdg-open")
         .arg(&path_str)
         .stdin(Stdio::null())
@@ -767,11 +817,148 @@ fn open_in_editor(path: &std::path::Path) {
         log::info!("opened {} via xdg-open", path_str);
         return;
     }
-    // Last-ditch: spit it to stderr so the user can grab it.
-    log::warn!(
-        "couldn't open editor for {}; xdg-open failed",
-        path_str
-    );
+
+    log::warn!("couldn't open editor for {}", path_str);
+}
+
+/// Walk the standard XDG application dirs looking for `id` and
+/// return its `(Exec, Terminal)` lines. Returns `None` if the
+/// file isn't found or doesn't have an `Exec` line.
+fn read_desktop_exec(id: &str) -> Option<(String, bool)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(p) = xdg_data_home {
+        roots.push(p);
+    }
+    if let Some(extra) = std::env::var_os("XDG_DATA_DIRS") {
+        for entry in std::env::split_paths(&extra) {
+            roots.push(entry);
+        }
+    } else {
+        roots.push(PathBuf::from("/usr/local/share"));
+        roots.push(PathBuf::from("/usr/share"));
+    }
+    for root in roots {
+        let candidate = root.join("applications").join(id);
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            let mut exec: Option<String> = None;
+            let mut terminal = false;
+            let mut in_entry = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
+                    continue;
+                }
+                if !in_entry {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("Exec=") {
+                    exec = Some(rest.to_string());
+                } else if let Some(rest) = line.strip_prefix("Terminal=") {
+                    terminal = matches!(rest.trim().to_ascii_lowercase().as_str(), "true" | "1");
+                }
+            }
+            if let Some(e) = exec {
+                return Some((e, terminal));
+            }
+        }
+    }
+    None
+}
+
+/// Translate a `.desktop` `Exec=` line into a runnable argv,
+/// substituting `%f` / `%F` / `%u` / `%U` with `file_path` and
+/// dropping the field codes the spec says we don't need
+/// (`%i %c %k`). Quoting is handled with a tiny shell-style
+/// splitter — desktop files don't allow shell substitution so
+/// nothing fancier is needed.
+fn parse_exec_argv(exec: &str, file_path: &str) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = exec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' if in_quotes => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ' ' if !in_quotes => {
+                if !current.is_empty() {
+                    argv.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        argv.push(current);
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    for tok in argv {
+        match tok.as_str() {
+            "%f" | "%F" | "%u" | "%U" => out.push(file_path.to_string()),
+            "%i" | "%c" | "%k" => {} // drop spec metadata
+            _ => out.push(tok),
+        }
+    }
+    out
+}
+
+/// Run a parsed argv inside the user's preferred terminal. Tries
+/// `$TERMINAL`, then `xdg-terminal-exec`, then a few well-known
+/// emulators. Returns `true` on first successful spawn.
+fn launch_in_terminal(argv: &[String]) -> bool {
+    use std::process::{Command, Stdio};
+    if argv.is_empty() {
+        return false;
+    }
+    let try_terminal = |bin: &str, args_pre: &[&str]| -> bool {
+        let mut cmd = Command::new(bin);
+        for a in args_pre {
+            cmd.arg(a);
+        }
+        for a in argv {
+            cmd.arg(a);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    };
+    if let Some(t) = std::env::var_os("TERMINAL") {
+        let bin = t.to_string_lossy().into_owned();
+        if try_terminal(&bin, &[]) {
+            return true;
+        }
+    }
+    // xdg-terminal-exec (Omarchy default) — picks the user's
+    // chosen terminal and runs argv inside it.
+    if try_terminal("xdg-terminal-exec", &[]) {
+        return true;
+    }
+    // Common terminal emulators with a `-e` style "run this".
+    for (bin, prefix) in [
+        ("ghostty", &["-e"][..]),
+        ("alacritty", &["-e"]),
+        ("foot", &["-e"]),
+        ("kitty", &[][..]), // kitty takes the command directly
+        ("gnome-terminal", &["--", ]),
+        ("konsole", &["-e"]),
+        ("xterm", &["-e"]),
+    ] {
+        if try_terminal(bin, prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Render an egui key + modifier combo into the same
