@@ -104,11 +104,13 @@ impl ksni::Tray for macOSTray {
             icon_pixmap: Vec::new(),
         }
     }
-    fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked);
+    fn activate(&mut self, x: i32, y: i32) {
+        log::info!("tray Activate at ({x}, {y})");
+        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked { x, y });
     }
-    fn secondary_activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked);
+    fn secondary_activate(&mut self, x: i32, y: i32) {
+        log::info!("tray SecondaryActivate at ({x}, {y})");
+        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked { x, y });
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         self.items

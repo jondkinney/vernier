@@ -608,7 +608,12 @@ pub enum TrayMenuItem {
 pub enum PlatformEvent {
     HotkeyPressed(HotkeyId),
     TrayMenuActivated { id: String },
-    TrayIconLeftClicked,
+    /// Tray icon was activated by the SNI host (left click on
+    /// waybar). `x`/`y` are the host-supplied screen coordinates if
+    /// available — many hosts pass `(0, 0)` on Wayland because
+    /// `x_root` isn't meaningful, in which case the daemon falls
+    /// back to querying the cursor position.
+    TrayIconLeftClicked { x: i32, y: i32 },
     OverlayClosed(MonitorId),
     MonitorsChanged,
     /// Pointer entered the overlay surface for `monitor`.

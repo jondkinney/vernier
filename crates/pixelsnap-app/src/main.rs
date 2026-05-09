@@ -60,8 +60,15 @@ enum Cmd {
     /// in a floating egui window. Spawned by the daemon on tray
     /// icon left-click as a fallback when the host's xdg_popup
     /// menu doesn't render. Picks the matching IPC command on
-    /// click and exits.
-    TrayMenu,
+    /// click and exits. `--x` / `--y` tell it where the click
+    /// happened (logical px, screen-global) so it can anchor
+    /// itself near the tray icon via `hyprctl dispatch`.
+    TrayMenu {
+        #[arg(long, default_value_t = 0)]
+        x: i32,
+        #[arg(long, default_value_t = 0)]
+        y: i32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -84,7 +91,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
-        Some(Cmd::TrayMenu) => run_tray_menu_window(),
+        Some(Cmd::TrayMenu { x, y }) => run_tray_menu_window(x, y),
         None => {
             // If a daemon is already running, treat the bare invocation
             // as "open prefs" — matches the launcher / desktop-entry
@@ -118,10 +125,22 @@ fn existing_daemon_responsive() -> bool {
 }
 
 /// Open the floating tray-style menu (subcommand `tray-menu`).
-/// Each selection writes the matching IPC command back to the
-/// running daemon and the window closes.
-fn run_tray_menu_window() -> Result<()> {
+/// `anchor_x`/`anchor_y` are the screen-logical coordinates where
+/// the click happened; once the window exists we use
+/// `hyprctl dispatch movewindowpixel` to slide it next to the tray
+/// icon (Wayland clients can't position themselves; the compositor
+/// has to do it for us). Each selection writes the matching IPC
+/// command back to the daemon and the window closes.
+fn run_tray_menu_window(anchor_x: i32, anchor_y: i32) -> Result<()> {
     use vernier_ui::TrayMenuChoice;
+    if anchor_x != 0 || anchor_y != 0 {
+        std::thread::spawn(move || {
+            // Tiny delay so the egui window has registered with
+            // Hyprland before we try to address it by class.
+            std::thread::sleep(Duration::from_millis(80));
+            anchor_tray_menu_window(anchor_x, anchor_y);
+        });
+    }
     let on_choice: Box<dyn FnMut(TrayMenuChoice) + Send> = Box::new(|c| {
         let cmd = match c {
             TrayMenuChoice::ToggleOverlay => "toggle",
@@ -133,6 +152,72 @@ fn run_tray_menu_window() -> Result<()> {
         }
     });
     vernier_ui::run_tray_menu(on_choice)
+}
+
+/// Position the floating tray-menu next to the click point. We
+/// shift the menu's right edge ~10 px right of the cursor and the
+/// top edge ~6 px below, matching how desktop tray menus typically
+/// open down-and-left from the click. Hyprland's compositor-side
+/// dispatcher is the only way to position a Wayland top-level.
+fn anchor_tray_menu_window(anchor_x: i32, anchor_y: i32) {
+    // Menu inner_size is 260×130 logical px (set in
+    // vernier-ui::tray_menu). Anchor the menu so its top-right
+    // sits just below + slightly left of the click.
+    let menu_w = 260;
+    let target_x = (anchor_x - menu_w + 12).max(8);
+    let target_y = (anchor_y + 6).max(8);
+    let class_filter = "class:vernier-tray-menu";
+    let arg = format!("exact {target_x} {target_y},{class_filter}");
+    if let Err(e) = std::process::Command::new("hyprctl")
+        .args(["dispatch", "movewindowpixel", &arg])
+        .output()
+    {
+        log::warn!("hyprctl movewindowpixel: {e:#}");
+    }
+}
+
+/// Register runtime window rules so the tray-menu popup lands as
+/// a floating, borderless, unfocused window. Idempotent — Hyprland
+/// dedupes identical `hyprctl keyword` rules per session. Failures
+/// degrade to "menu opens tiled, looks weird" rather than crash.
+fn register_hyprland_window_rules() {
+    const RULES: &[&str] = &[
+        "windowrule = float, class:^(vernier-tray-menu)$",
+        "windowrule = noborder, class:^(vernier-tray-menu)$",
+        "windowrule = nofullscreenrequest, class:^(vernier-tray-menu)$",
+        "windowrule = pin, class:^(vernier-tray-menu)$",
+        "windowrule = noanim, class:^(vernier-tray-menu)$",
+    ];
+    for rule in RULES {
+        // `hyprctl keyword` accepts a single keyword=value pair.
+        // We split on the first ` = ` so values containing spaces
+        // (regex anchors) survive.
+        let (key, val) = match rule.split_once(" = ") {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Err(e) = std::process::Command::new("hyprctl")
+            .args(["keyword", key, val])
+            .output()
+        {
+            log::warn!("hyprctl keyword {key}: {e:#}");
+        }
+    }
+}
+
+/// Read `hyprctl cursorpos`. Returns `(x, y)` in logical pixels
+/// (Hyprland's compositor-space units), `None` if the binary
+/// fails to spawn or the output can't be parsed.
+fn hyprland_cursor_pos() -> Option<(i32, i32)> {
+    let out = std::process::Command::new("hyprctl")
+        .arg("cursorpos")
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut parts = text.trim().split(',').map(|s| s.trim().parse::<i32>().ok());
+    let x = parts.next()??;
+    let y = parts.next()??;
+    Some((x, y))
 }
 
 /// Open the egui prefs window. After each successful save the
@@ -183,6 +268,7 @@ fn run_daemon() -> Result<()> {
             None
         }
     };
+    register_hyprland_window_rules();
     apply_autostart(&initial_settings.general).unwrap_or_else(|e| {
         log::warn!("autostart: {e:#}");
     });
@@ -370,9 +456,16 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::HotkeyPressed(_)) => {
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
-            MainEvent::Platform(PlatformEvent::TrayIconLeftClicked) => {
-                log::info!("tray icon left-clicked — spawning tray-menu window");
-                spawn_tray_menu_window();
+            MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { x, y }) => {
+                let (px, py) = if x != 0 || y != 0 {
+                    (x, y)
+                } else {
+                    hyprland_cursor_pos().unwrap_or((x, y))
+                };
+                log::info!(
+                    "tray icon clicked (host=({x},{y}), spawn at ({px},{py}))",
+                );
+                spawn_tray_menu_window(px, py);
             }
             MainEvent::Platform(PlatformEvent::PointerEnter { x, y, .. })
             | MainEvent::Platform(PlatformEvent::PointerMove {
@@ -1983,16 +2076,24 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `vernier tray-menu` — a small floating egui window with
-/// the same actions the SNI dbusmenu publishes. Used as a fallback
-/// for tray hosts whose xdg_popup menu rendering is broken.
-fn spawn_tray_menu_window() {
+/// Spawn `vernier tray-menu --x X --y Y` — a small floating egui
+/// window with the same actions the SNI dbusmenu publishes. Used
+/// as a fallback for tray hosts whose xdg_popup menu rendering is
+/// broken. The subprocess uses `--x`/`--y` to position itself via
+/// `hyprctl dispatch` after the window appears.
+fn spawn_tray_menu_window(anchor_x: i32, anchor_y: i32) {
     let exe = std::env::current_exe().ok();
     let mut cmd = match exe {
         Some(p) => std::process::Command::new(p),
         None => std::process::Command::new("vernier"),
     };
-    cmd.arg("tray-menu");
+    cmd.args([
+        "tray-menu",
+        "--x",
+        &anchor_x.to_string(),
+        "--y",
+        &anchor_y.to_string(),
+    ]);
     match cmd.spawn() {
         Ok(child) => log::info!("tray-menu spawned (pid {})", child.id()),
         Err(e) => log::warn!("spawn tray-menu: {e:#}"),

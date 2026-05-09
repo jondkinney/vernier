@@ -19,12 +19,24 @@ pub enum TrayMenuChoice {
 struct TrayMenuApp {
     on_choice: Box<dyn FnMut(TrayMenuChoice) + Send>,
     armed_close: bool,
+    /// Skip focus-loss auto-close until the window has held focus
+    /// at least once — otherwise the menu dismisses itself on the
+    /// first frame because focus may not have arrived yet.
+    saw_focus: bool,
 }
 
 impl App for TrayMenuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         // Esc closes immediately.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.armed_close = true;
+        }
+        // Focus-out closes (matches the "click outside dismisses"
+        // convention every desktop tray menu uses).
+        let focused = ctx.input(|i| i.viewport().focused == Some(true));
+        if focused {
+            self.saw_focus = true;
+        } else if self.saw_focus {
             self.armed_close = true;
         }
 
@@ -105,11 +117,15 @@ fn menu_row(ui: &mut egui::Ui, label: &str, shortcut: &str) -> egui::Response {
 }
 
 /// Open the tray-menu popup. `on_choice` is invoked synchronously
-/// on the click that selects a row, before the window closes.
+/// on the click that selects a row, before the window closes. The
+/// caller positions the resulting window via `hyprctl dispatch
+/// movewindowpixel class:vernier-tray-menu`; the app_id we set
+/// here is what Hyprland matches on.
 pub fn run_tray_menu(on_choice: Box<dyn FnMut(TrayMenuChoice) + Send>) -> Result<()> {
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macOS")
+            .with_app_id("vernier-tray-menu")
             .with_inner_size([260.0, 130.0])
             .with_min_inner_size([240.0, 120.0])
             .with_decorations(false)
@@ -125,6 +141,7 @@ pub fn run_tray_menu(on_choice: Box<dyn FnMut(TrayMenuChoice) + Send>) -> Result
             Ok(Box::new(TrayMenuApp {
                 on_choice,
                 armed_close: false,
+                saw_focus: false,
             }))
         }),
     )
