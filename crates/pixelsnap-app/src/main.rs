@@ -309,46 +309,61 @@ fn run_daemon() -> Result<()> {
         None
     };
 
-    let initial_accel = Accelerator::parse(&initial_settings.shortcuts.toggle)
-        .unwrap_or_else(|| {
-            log::warn!(
-                "could not parse settings.shortcuts.toggle = {:?}; using default {:?}",
-                initial_settings.shortcuts.toggle,
-                Accelerator::default().to_string_key(),
-            );
-            Accelerator::default()
-        });
-    // On Hyprland, registering through xdg-desktop-portal often
-    // doesn't actually intercept the keypress (the portal accepts
-    // the binding silently but never fires the activation). The
-    // user's hyprland.conf binding is what actually triggers the
-    // action. Bypass the portal: dispatch a Hyprland keyword bind
-    // at runtime so the configured shortcut intercepts directly.
-    // Off Hyprland we keep the portal route as a fallback.
-    let on_hyprland = is_hyprland_session();
-    let mut current_hotkey: Option<HotkeyId> = None;
-    if on_hyprland {
-        if !register_hyprland_toggle(&initial_accel) {
-            log::warn!("hyprctl bind for toggle failed");
-        }
+    // Toggle hotkey is fully driven by `settings.shortcuts.toggle`.
+    // An empty / unparseable string registers nothing — no
+    // hardcoded fallback. On Hyprland, any static `bind = …, exec,
+    // vernier toggle` in the user's hyprland.conf still fires;
+    // we surface a warning so the user knows to clean it up.
+    let initial_accel_opt = if initial_settings.shortcuts.toggle.trim().is_empty() {
+        log::info!("settings.shortcuts.toggle is empty — no toggle hotkey will be registered");
+        None
     } else {
-        current_hotkey = match platform.register_hotkey(initial_accel, "Toggle vernier") {
-            Ok(id) => {
-                log::info!(
-                    "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
-                );
-                Some(id)
-            }
-            Err(e) => {
+        match Accelerator::parse(&initial_settings.shortcuts.toggle) {
+            Some(a) => Some(a),
+            None => {
                 log::warn!(
-                    "hotkey registration failed: {e}; falling back to CLI/IPC. \
-                     Bind a key in Hyprland: bind = ALT SHIFT, P, exec, vernier toggle"
+                    "could not parse settings.shortcuts.toggle = {:?}; no toggle hotkey will be registered",
+                    initial_settings.shortcuts.toggle,
                 );
                 None
             }
-        };
+        }
+    };
+    let on_hyprland = is_hyprland_session();
+    if on_hyprland {
+        if let Some(path) = static_vernier_bind_in_hypr_config() {
+            log::warn!(
+                "static `vernier toggle` binding detected in {} — \
+                 remove it so the prefs-managed shortcut is the only one",
+                path.display(),
+            );
+        }
     }
-    let mut current_accel = initial_accel;
+    let mut current_hotkey: Option<HotkeyId> = None;
+    if let Some(accel) = initial_accel_opt {
+        if on_hyprland {
+            if !register_hyprland_toggle(&accel) {
+                log::warn!("hyprctl bind for toggle failed");
+            }
+        } else {
+            current_hotkey = match platform.register_hotkey(accel, "Toggle vernier") {
+                Ok(id) => {
+                    log::info!(
+                        "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
+                    );
+                    Some(id)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "hotkey registration failed: {e}; falling back to CLI/IPC. \
+                         Bind a key in Hyprland: bind = ALT SHIFT, P, exec, vernier toggle"
+                    );
+                    None
+                }
+            };
+        }
+    }
+    let mut current_accel: Option<Accelerator> = initial_accel_opt;
 
     let (combined_tx, combined_rx) = std::sync::mpsc::channel::<MainEvent>();
 
@@ -1874,50 +1889,58 @@ fn run_daemon() -> Result<()> {
                         tol_level = s.tolerance.default_level;
                         shortcut_accels = parse_shortcut_accels(&s);
                         // Re-register the toggle hotkey if the user
-                        // changed it.
-                        if let Some(new_accel) = Accelerator::parse(&s.shortcuts.toggle) {
-                            if new_accel != current_accel {
+                        // changed it. An empty / unparseable
+                        // setting unregisters without re-binding.
+                        let new_accel_opt = if s.shortcuts.toggle.trim().is_empty() {
+                            None
+                        } else {
+                            Accelerator::parse(&s.shortcuts.toggle)
+                        };
+                        if new_accel_opt != current_accel {
+                            // Tear down the previous bind no matter
+                            // what the new one is.
+                            if let Some(old) = current_accel {
                                 if on_hyprland {
-                                    let _ = unregister_hyprland_toggle(&current_accel);
-                                    if register_hyprland_toggle(&new_accel) {
-                                        log::info!(
-                                            "toggle hotkey changed to {}",
-                                            new_accel.to_string_key(),
-                                        );
-                                        current_accel = new_accel;
-                                    } else {
-                                        log::warn!(
-                                            "hyprctl bind for new toggle {} failed",
-                                            new_accel.to_string_key(),
-                                        );
-                                    }
-                                } else {
-                                    if let Some(prev) = current_hotkey.take() {
-                                        if let Err(e) = platform.unregister_hotkey(prev) {
-                                            log::warn!("unregister old hotkey: {e:#}");
-                                        }
-                                    }
-                                    match platform.register_hotkey(new_accel, "Toggle vernier") {
-                                        Ok(id) => {
-                                            log::info!(
-                                                "toggle hotkey changed to {}",
-                                                new_accel.to_string_key(),
-                                            );
-                                            current_hotkey = Some(id);
-                                            current_accel = new_accel;
-                                        }
-                                        Err(e) => log::warn!(
-                                            "register new hotkey {}: {e:#}",
-                                            new_accel.to_string_key(),
-                                        ),
+                                    let _ = unregister_hyprland_toggle(&old);
+                                } else if let Some(prev) = current_hotkey.take() {
+                                    if let Err(e) = platform.unregister_hotkey(prev) {
+                                        log::warn!("unregister old hotkey: {e:#}");
                                     }
                                 }
                             }
-                        } else {
-                            log::warn!(
-                                "skipping hotkey re-register: could not parse {:?}",
-                                s.shortcuts.toggle,
-                            );
+                            // Register the new bind only if there is one.
+                            if let Some(accel) = new_accel_opt {
+                                if on_hyprland {
+                                    if register_hyprland_toggle(&accel) {
+                                        log::info!(
+                                            "toggle hotkey changed to {}",
+                                            accel.to_string_key(),
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "hyprctl bind for new toggle {} failed",
+                                            accel.to_string_key(),
+                                        );
+                                    }
+                                } else {
+                                    match platform.register_hotkey(accel, "Toggle vernier") {
+                                        Ok(id) => {
+                                            log::info!(
+                                                "toggle hotkey changed to {}",
+                                                accel.to_string_key(),
+                                            );
+                                            current_hotkey = Some(id);
+                                        }
+                                        Err(e) => log::warn!(
+                                            "register new hotkey {}: {e:#}",
+                                            accel.to_string_key(),
+                                        ),
+                                    }
+                                }
+                            } else {
+                                log::info!("toggle hotkey cleared (no shortcut configured)");
+                            }
+                            current_accel = new_accel_opt;
                         }
                         replace_settings(s);
                     }
@@ -2160,6 +2183,61 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
 /// the compositor on each spawned client).
 fn is_hyprland_session() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
+
+/// Recursively search the user's Hyprland config tree
+/// (`$XDG_CONFIG_HOME/hypr` with `~/.config/hypr` fallback) for a
+/// `bind*` line that runs `vernier toggle`. Returns the path of
+/// the first match. Used to warn the user that a static line is
+/// shadowing the prefs-managed shortcut.
+fn static_vernier_bind_in_hypr_config() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|d| d.join("hypr"))?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ty = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if ty.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s == "conf")
+                    .unwrap_or(false)
+            {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    for line in text.lines() {
+                        let trimmed = line.trim_start();
+                        if !trimmed.starts_with("bind") || trimmed.starts_with('#') {
+                            continue;
+                        }
+                        if trimmed.contains("vernier toggle")
+                            || trimmed.contains("vernier")
+                        {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Convert an `Accelerator` to the `(MODS, KEY)` pair Hyprland's
