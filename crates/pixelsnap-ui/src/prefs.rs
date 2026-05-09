@@ -83,6 +83,11 @@ struct PrefsApp {
     /// the matching Shortcuts row — the next key press (with
     /// modifiers) is recorded as that shortcut's accelerator.
     capturing_shortcut: Option<ShortcutId>,
+    /// Path of a config file that has a static `bind = …, exec,
+    /// vernier toggle` line shadowing the prefs-managed
+    /// shortcut. Surfaced as a banner on the Shortcuts pane so
+    /// the user can clean it up.
+    static_bind_warning: Option<PathBuf>,
 }
 
 impl PrefsApp {
@@ -91,6 +96,7 @@ impl PrefsApp {
         on_saved: Box<dyn FnMut() + Send>,
         on_quit: Box<dyn FnMut() + Send>,
         on_restart: Box<dyn FnMut() + Send>,
+        static_bind_warning: Option<PathBuf>,
     ) -> Self {
         apply_style(&cc.egui_ctx);
         let logo = load_logo_texture(&cc.egui_ctx);
@@ -106,6 +112,7 @@ impl PrefsApp {
             logo,
             folder_pick: None,
             capturing_shortcut: None,
+            static_bind_warning,
         }
     }
 
@@ -302,6 +309,7 @@ impl App for PrefsApp {
                             ui,
                             &mut self.edited.shortcuts,
                             &mut self.capturing_shortcut,
+                            self.static_bind_warning.as_deref(),
                             self.on_restart.as_mut(),
                         ),
                         Section::About => {
@@ -599,8 +607,36 @@ fn shortcuts_section(
     ui: &mut egui::Ui,
     s: &mut ShortcutSettings,
     capturing: &mut Option<ShortcutId>,
+    static_bind_warning: Option<&std::path::Path>,
     on_restart: &mut dyn FnMut(),
 ) -> bool {
+    if let Some(path) = static_bind_warning {
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(60, 48, 16))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 140, 50)))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("⚠ Static bind detected")
+                        .color(egui::Color32::from_rgb(255, 200, 90))
+                        .size(13.5)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "A line in {} runs `vernier toggle`. It fires regardless of \
+                         what's set here — remove that line if you want only the \
+                         shortcut configured below.",
+                        path.display()
+                    ))
+                    .color(egui::Color32::from_gray(220))
+                    .size(12.5),
+                );
+            });
+        ui.add_space(12.0);
+    }
     ui.label(caption(
         "Keyboard shortcuts. Restart the daemon for changes to take effect.",
     ));
@@ -863,6 +899,7 @@ pub fn run_prefs(
     on_quit: Box<dyn FnMut() + Send>,
     on_restart: Box<dyn FnMut() + Send>,
     geometry: PrefsGeometry,
+    static_bind_warning: Option<PathBuf>,
 ) -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("macOS Preferences")
@@ -905,7 +942,15 @@ pub fn run_prefs(
     eframe::run_native(
         "macOS Preferences",
         options,
-        Box::new(move |cc| Ok(Box::new(PrefsApp::new(cc, on_saved, on_quit, on_restart)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PrefsApp::new(
+                cc,
+                on_saved,
+                on_quit,
+                on_restart,
+                static_bind_warning,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }

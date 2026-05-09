@@ -141,6 +141,7 @@ struct PrefsGeometry {
 /// hyprctl, killing+respawning the daemon, and respawning a fresh
 /// `vernier prefs --x --y --w --h`.
 fn run_prefs_window(geometry: PrefsGeometry) -> Result<()> {
+    let static_bind = static_vernier_bind_in_hypr_config();
     let on_saved: Box<dyn FnMut() + Send> = Box::new(|| {
         // Best-effort: if no daemon is running, the prefs window
         // still works — settings just take effect on next launch.
@@ -189,7 +190,13 @@ fn run_prefs_window(geometry: PrefsGeometry) -> Result<()> {
             Err(e) => log::warn!("respawn prefs: {e:#}"),
         }
     });
-    vernier_ui::run_prefs(on_saved, on_quit, on_restart, geometry_into_ui(geometry))
+    vernier_ui::run_prefs(
+        on_saved,
+        on_quit,
+        on_restart,
+        geometry_into_ui(geometry),
+        static_bind,
+    )
 }
 
 fn geometry_into_ui(g: PrefsGeometry) -> vernier_ui::PrefsGeometry {
