@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vernier_core::{
-    classify_aspect, detect_edges, shrink_to_content, AspectMode, EdgeQuad, FrameView,
-    InteractionMode, Measurement, Px, SnapPoint, Tolerance,
+    classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg, AspectMode,
+    EdgeQuad, FrameView, InteractionMode, Measurement, Px, SnapPoint, Tolerance,
 };
 use vernier_platform::{
     Accelerator, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudContextMenu,
@@ -621,22 +621,29 @@ fn run_daemon() -> Result<()> {
                     if !pressed && resizing.is_some() {
                         log::info!("resize released");
                         let op = resizing.take().unwrap();
-                        // Snap-shrink the rect to the nearest content
-                        // boundary inside its current bounds, matching
-                        // the draw-release behavior. Super skips the
-                        // snap so the user can park edges arbitrarily.
+                        // Snap only the side(s) the handle dragged
+                        // back to the nearest content boundary.
+                        // snap_shrink_resize samples bg from outside
+                        // the un-moved corner so the algorithm stays
+                        // stable across repeated resizes (the rect's
+                        // own top-left can land inside content after
+                        // a few iterations and would otherwise pin
+                        // the wrong reference color).
                         if !super_held {
                             if let Some(rect) = held_rects.get_mut(op.rect_idx) {
-                                let raw_start = rect.rect_start;
-                                let raw_end = rect.rect_end;
-                                let (snapped_start, snapped_end) = snap_shrink_logical_rect(
+                                let lo_x = rect.rect_start.0.min(rect.rect_end.0);
+                                let hi_x = rect.rect_start.0.max(rect.rect_end.0);
+                                let lo_y = rect.rect_start.1.min(rect.rect_end.1);
+                                let hi_y = rect.rect_start.1.max(rect.rect_end.1);
+                                let (snapped_lo, snapped_hi) = snap_shrink_resize(
                                     frozen_frame.as_ref(),
-                                    raw_start,
-                                    raw_end,
+                                    (lo_x, lo_y),
+                                    (hi_x, hi_y),
+                                    op.handle,
                                     tol_level.value(),
                                 );
-                                rect.rect_start = snapped_start;
-                                rect.rect_end = snapped_end;
+                                rect.rect_start = snapped_lo;
+                                rect.rect_end = snapped_hi;
                             }
                         }
                         last_hud_redraw = Instant::now();
@@ -3025,6 +3032,85 @@ fn snap_shrink_logical_rect(
         (sx0 as f64 * inv_x, sy0 as f64 * inv_y),
         (sx1 as f64 * inv_x, sy1 as f64 * inv_y),
     )
+}
+
+/// Snap-shrink a held rect after a resize-release. Only the side(s)
+/// the handle was dragging snap; the opposite side(s) stay where they
+/// are. The bg reference for the shrink algorithm is sampled JUST
+/// OUTSIDE the un-moved corner / edge — sampling the rect's own
+/// top-left (the default) breaks down once the user drags the rect
+/// so its top-left lands inside content.
+fn snap_shrink_resize(
+    frozen_frame: Option<&vernier_platform::NativeFrame>,
+    rect_lo: (f64, f64),
+    rect_hi: (f64, f64),
+    handle: ResizeHandle,
+    tolerance: u32,
+) -> ((f64, f64), (f64, f64)) {
+    let Some(frame) = frozen_frame else {
+        return (rect_lo, rect_hi);
+    };
+    let surface_w = frame.bounds.w as f64;
+    let surface_h = frame.bounds.h as f64;
+    if surface_w <= 0.0 || surface_h <= 0.0 {
+        return (rect_lo, rect_hi);
+    }
+    let scale_x = frame.width as f64 / surface_w;
+    let scale_y = frame.height as f64 / surface_h;
+    let view = FrameView {
+        pixels: &frame.pixels,
+        width: frame.width,
+        height: frame.height,
+        stride: frame.stride,
+    };
+    let fx0 = (rect_lo.0 * scale_x).round() as i32;
+    let fy0 = (rect_lo.1 * scale_y).round() as i32;
+    let fx1 = (rect_hi.0 * scale_x).round() as i32;
+    let fy1 = (rect_hi.1 * scale_y).round() as i32;
+    let pad_x = (2.0 * scale_x).round() as i32;
+    let pad_y = (2.0 * scale_y).round() as i32;
+    let mid_fx = (fx0 + fx1) / 2;
+    let mid_fy = (fy0 + fy1) / 2;
+    use ResizeHandle::*;
+    let (bg_x, bg_y) = match handle {
+        TopLeft => (fx1 + pad_x, fy1 + pad_y),
+        TopRight => (fx0 - pad_x, fy1 + pad_y),
+        BottomLeft => (fx1 + pad_x, fy0 - pad_y),
+        BottomRight => (fx0 - pad_x, fy0 - pad_y),
+        Top => (mid_fx, fy1 + pad_y),
+        Bottom => (mid_fx, fy0 - pad_y),
+        Left => (fx1 + pad_x, mid_fy),
+        Right => (fx0 - pad_x, mid_fy),
+    };
+    let (sx0, sy0, sx1, sy1) = shrink_to_content_with_bg(
+        &view,
+        fx0,
+        fy0,
+        fx1,
+        fy1,
+        bg_x,
+        bg_y,
+        Tolerance(tolerance),
+    );
+    let inv_x = 1.0 / scale_x;
+    let inv_y = 1.0 / scale_y;
+    let snapped_lo_x = match handle {
+        Left | TopLeft | BottomLeft => sx0 as f64 * inv_x,
+        _ => rect_lo.0,
+    };
+    let snapped_hi_x = match handle {
+        Right | TopRight | BottomRight => sx1 as f64 * inv_x,
+        _ => rect_hi.0,
+    };
+    let snapped_lo_y = match handle {
+        Top | TopLeft | TopRight => sy0 as f64 * inv_y,
+        _ => rect_lo.1,
+    };
+    let snapped_hi_y = match handle {
+        Bottom | BottomLeft | BottomRight => sy1 as f64 * inv_y,
+        _ => rect_hi.1,
+    };
+    ((snapped_lo_x, snapped_lo_y), (snapped_hi_x, snapped_hi_y))
 }
 
 fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {

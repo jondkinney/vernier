@@ -155,6 +155,27 @@ pub fn shrink_to_content(
     y1: i32,
     tolerance: Tolerance,
 ) -> (i32, i32, i32, i32) {
+    // Default bg sample = top-left of the input rect, matching the
+    // original draw-from-cursor-out behavior.
+    let bg_x = x0.min(x1).max(0).min(frame.width as i32 - 1);
+    let bg_y = y0.min(y1).max(0).min(frame.height as i32 - 1);
+    shrink_to_content_with_bg(frame, x0, y0, x1, y1, bg_x, bg_y, tolerance)
+}
+
+/// Same as [`shrink_to_content`] but lets the caller pick the bg
+/// reference pixel explicitly. Useful for resize, where the rect's
+/// own top-left can land inside content and the default sample would
+/// collapse the algorithm.
+pub fn shrink_to_content_with_bg(
+    frame: &FrameView,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bg_x: i32,
+    bg_y: i32,
+    tolerance: Tolerance,
+) -> (i32, i32, i32, i32) {
     let (rx0, rx1) = (x0.min(x1), x0.max(x1));
     let (ry0, ry1) = (y0.min(y1), y0.max(y1));
     let fw = frame.width as i32;
@@ -166,7 +187,9 @@ pub fn shrink_to_content(
     if cx1 <= cx0 || cy1 <= cy0 {
         return (x0, y0, x1, y1);
     }
-    let bg = match frame.pixel(cx0 as u32, cy0 as u32) {
+    let bx = bg_x.max(0).min(fw - 1);
+    let by = bg_y.max(0).min(fh - 1);
+    let bg = match frame.pixel(bx as u32, by as u32) {
         Some(p) => p,
         None => return (x0, y0, x1, y1),
     };
