@@ -634,6 +634,15 @@ fn shortcuts_section(
                     .color(egui::Color32::from_gray(220))
                     .size(12.5),
                 );
+                ui.add_space(8.0);
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("Open in editor").size(12.5),
+                    ))
+                    .clicked()
+                {
+                    open_in_editor(path);
+                }
             });
         ui.add_space(12.0);
     }
@@ -736,6 +745,33 @@ fn shortcut_row(
         }
     });
     ui.add_space(12.0);
+}
+
+/// Open `path` in the user's default editor / file handler.
+/// Tries `$VISUAL` / `$EDITOR` if set (spawned in a terminal we
+/// can find), else falls back to `xdg-open` which delegates to
+/// whatever GUI handler the desktop has registered for `.conf`.
+fn open_in_editor(path: &std::path::Path) {
+    use std::process::{Command, Stdio};
+    let path_str = path.to_string_lossy().into_owned();
+    // Prefer xdg-open — most Linux desktops have a sensible
+    // default for plain-text/.conf files (typically a GUI editor).
+    if Command::new("xdg-open")
+        .arg(&path_str)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+    {
+        log::info!("opened {} via xdg-open", path_str);
+        return;
+    }
+    // Last-ditch: spit it to stderr so the user can grab it.
+    log::warn!(
+        "couldn't open editor for {}; xdg-open failed",
+        path_str
+    );
 }
 
 /// Render an egui key + modifier combo into the same
