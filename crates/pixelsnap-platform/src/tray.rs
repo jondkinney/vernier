@@ -119,11 +119,16 @@ fn run_gtk_tray(
 
     let menu = build_menu(&initial)?;
     let icon = tray_icon::TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
         .with_tooltip(&initial.tooltip)
         .with_icon(make_app_icon())
         .build()
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("tray build: {e}")))?;
+    // Set the menu AFTER the icon is built — on the
+    // libayatana-appindicator backend `with_menu` doesn't always
+    // round-trip through the dbusmenu, so SNI hosts (waybar) see an
+    // empty menu on right-click. Pushing it via set_menu on the
+    // built icon makes the menu show up.
+    icon.set_menu(Some(Box::new(menu)));
 
     let _ = ready_tx.send(Ok(()));
 

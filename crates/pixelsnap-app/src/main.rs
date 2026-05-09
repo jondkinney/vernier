@@ -78,8 +78,36 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
-        None => run_daemon(),
+        None => {
+            // If a daemon is already running, treat the bare invocation
+            // as "open prefs" — matches the launcher / desktop-entry
+            // expectation that double-launching surfaces the
+            // preferences window rather than failing on a busy IPC
+            // socket. If no daemon is up, fall through to start one.
+            if existing_daemon_responsive() {
+                log::info!("daemon already running; opening prefs window");
+                let _ = run_client_command("open-prefs");
+                Ok(())
+            } else {
+                run_daemon()
+            }
+        }
     }
+}
+
+/// Probe the IPC socket. Returns true if connecting succeeds —
+/// proving a daemon owns the socket. A stale socket file from a
+/// crashed daemon refuses connections, which we treat as "not
+/// running" so the next launch can replace it.
+fn existing_daemon_responsive() -> bool {
+    let path = match ipc_socket_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if !path.exists() {
+        return false;
+    }
+    std::os::unix::net::UnixStream::connect(&path).is_ok()
 }
 
 /// Open the egui prefs window. After each successful save the
@@ -125,6 +153,9 @@ fn run_daemon() -> Result<()> {
     };
     apply_autostart(&initial_settings.general).unwrap_or_else(|e| {
         log::warn!("autostart: {e:#}");
+    });
+    ensure_application_desktop_file().unwrap_or_else(|e| {
+        log::warn!("desktop entry: {e:#}");
     });
     replace_settings(initial_settings.clone());
 
@@ -1812,6 +1843,42 @@ fn populate_hud_appearance(hud: &mut Hud) {
         },
         scale_factor: primary_scale_factor(),
     };
+}
+
+/// Write the application desktop entry (`vernier.desktop`) to
+/// `$XDG_DATA_HOME/applications` so app launchers (walker, rofi,
+/// the GNOME activity overview, …) find it. Idempotent — overwritten
+/// each daemon start so changes to the binary path show up. Exec
+/// runs `vernier prefs` so launching from a UI surfaces the
+/// preferences window rather than starting a second daemon.
+fn ensure_application_desktop_file() -> Result<()> {
+    let dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .context("no XDG_DATA_HOME or HOME")?
+        .join("applications");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("vernier.desktop");
+    let exe = std::env::current_exe()
+        .context("current_exe")?
+        .display()
+        .to_string();
+    let body = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=macOS\n\
+         GenericName=Measurement Overlay\n\
+         Comment=Cross-platform measurement overlay (macOS clone)\n\
+         Exec={exe} prefs\n\
+         Terminal=false\n\
+         Categories=Utility;Graphics;\n\
+         Keywords=measure;ruler;pixel;design;screenshot;\n\
+         StartupNotify=false\n"
+    );
+    std::fs::write(&path, body)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 /// Write or remove `~/.config/autostart/vernier.desktop` depending
