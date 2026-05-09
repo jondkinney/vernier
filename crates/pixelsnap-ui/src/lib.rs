@@ -4,5 +4,7 @@
 //! preferences pane.
 
 pub mod prefs;
+pub mod tray_menu;
 
 pub use prefs::run_prefs;
+pub use tray_menu::{run_tray_menu, TrayMenuChoice};

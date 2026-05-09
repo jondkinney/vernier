@@ -56,6 +56,12 @@ enum Cmd {
     /// Tell the running daemon to re-read its settings file. Sent
     /// automatically by the prefs window after each save.
     ReloadSettings,
+    /// Show a small tray-style menu (Toggle / Preferences / Quit)
+    /// in a floating egui window. Spawned by the daemon on tray
+    /// icon left-click as a fallback when the host's xdg_popup
+    /// menu doesn't render. Picks the matching IPC command on
+    /// click and exits.
+    TrayMenu,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +84,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
+        Some(Cmd::TrayMenu) => run_tray_menu_window(),
         None => {
             // If a daemon is already running, treat the bare invocation
             // as "open prefs" — matches the launcher / desktop-entry
@@ -108,6 +115,24 @@ fn existing_daemon_responsive() -> bool {
         return false;
     }
     std::os::unix::net::UnixStream::connect(&path).is_ok()
+}
+
+/// Open the floating tray-style menu (subcommand `tray-menu`).
+/// Each selection writes the matching IPC command back to the
+/// running daemon and the window closes.
+fn run_tray_menu_window() -> Result<()> {
+    use vernier_ui::TrayMenuChoice;
+    let on_choice: Box<dyn FnMut(TrayMenuChoice) + Send> = Box::new(|c| {
+        let cmd = match c {
+            TrayMenuChoice::ToggleOverlay => "toggle",
+            TrayMenuChoice::OpenPrefs => "open-prefs",
+            TrayMenuChoice::Quit => "quit",
+        };
+        if let Err(e) = run_client_command(cmd) {
+            log::warn!("tray-menu dispatch {cmd}: {e:#}");
+        }
+    });
+    vernier_ui::run_tray_menu(on_choice)
 }
 
 /// Open the egui prefs window. After each successful save the
@@ -346,7 +371,8 @@ fn run_daemon() -> Result<()> {
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked) => {
-                log::info!("tray icon left-clicked");
+                log::info!("tray icon left-clicked — spawning tray-menu window");
+                spawn_tray_menu_window();
             }
             MainEvent::Platform(PlatformEvent::PointerEnter { x, y, .. })
             | MainEvent::Platform(PlatformEvent::PointerMove {
@@ -1955,6 +1981,22 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
             .with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Spawn `vernier tray-menu` — a small floating egui window with
+/// the same actions the SNI dbusmenu publishes. Used as a fallback
+/// for tray hosts whose xdg_popup menu rendering is broken.
+fn spawn_tray_menu_window() {
+    let exe = std::env::current_exe().ok();
+    let mut cmd = match exe {
+        Some(p) => std::process::Command::new(p),
+        None => std::process::Command::new("vernier"),
+    };
+    cmd.arg("tray-menu");
+    match cmd.spawn() {
+        Ok(child) => log::info!("tray-menu spawned (pid {})", child.id()),
+        Err(e) => log::warn!("spawn tray-menu: {e:#}"),
+    }
 }
 
 /// Spawn `vernier prefs` so the tray "Preferences…" entry can
