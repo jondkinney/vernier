@@ -1489,6 +1489,7 @@ fn render_hud_strokes(
                 buf_h as f32,
                 scale,
                 fg,
+                &hud.measurement_format,
                 &stroke,
                 &paint,
                 rect.camera_armed,
@@ -1513,6 +1514,7 @@ fn render_hud_strokes(
             buf_h as f32,
             scale,
             fg,
+            &hud.measurement_format,
             &stroke,
             &paint,
             false,
@@ -1535,6 +1537,7 @@ fn render_hud_strokes(
             buf_h as f32,
             scale,
             fg,
+            &hud.measurement_format,
             &stroke,
             &paint,
             *camera_armed,
@@ -1547,6 +1550,7 @@ fn render_hud_strokes(
             &mut pills,
             &hud.stuck_measurements,
             fg,
+            &hud.measurement_format,
             buf_w as f32,
             buf_h as f32,
             scale as f32,
@@ -1567,6 +1571,8 @@ fn render_hud_strokes(
             &hud.guides,
             cursor,
             hud.align_mode,
+            hud.guide_color,
+            &hud.measurement_format,
             buf_w as f32,
             buf_h as f32,
             scale as f32,
@@ -1838,6 +1844,7 @@ fn draw_stuck_measurements(
     pills: &mut Vec<PillLayout>,
     measurements: &[crate::StuckMeasurement],
     fg: Color,
+    fmt: &crate::HudMeasurementFormat,
     buf_w: f32,
     buf_h: f32,
     scale_f: f32,
@@ -1857,7 +1864,7 @@ fn draw_stuck_measurements(
 
     for m in measurements {
         let length = (m.end - m.start).abs();
-        let value_text = format!("{}", length);
+        let value_text = format_value(length as f64, fmt);
         // Pill bg is ALWAYS sized for the value text so the size
         // doesn't change when hovering. The displayed glyph may be
         // larger (× at 1.5×) and overflow the bg slightly — that's
@@ -1983,6 +1990,8 @@ fn draw_guides(
     guides: &[crate::Guide],
     cursor: Option<(f64, f64)>,
     align_mode: bool,
+    guide_color: crate::Color,
+    fmt: &crate::HudMeasurementFormat,
     buf_w: f32,
     buf_h: f32,
     scale_f: f32,
@@ -1990,7 +1999,7 @@ fn draw_guides(
     use tiny_skia::*;
     use crate::GuideAxis;
     let mut paint = Paint::default();
-    paint.set_color_rgba8(0x42, 0x9C, 0xFF, 0xF5);
+    paint.set_color_rgba8(guide_color.r, guide_color.g, guide_color.b, guide_color.a);
     paint.anti_alias = false;
     let stroke = Stroke {
         width: 1.0,
@@ -2042,7 +2051,7 @@ fn draw_guides(
         if dist == 0 {
             continue;
         }
-        let value = format!("{}", dist);
+        let value = format_value(dist as f64, fmt);
         let (pill_w, pill_h, _, _) =
             pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Horizontal pair (gap is vertical) → label anchored at the
@@ -2078,7 +2087,7 @@ fn draw_guides(
         if dist == 0 {
             continue;
         }
-        let value = format!("{}", dist);
+        let value = format_value(dist as f64, fmt);
         let (pill_w, pill_h, _, _) =
             pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Vertical pair (gap is horizontal) → label anchored at the
@@ -2350,6 +2359,7 @@ fn draw_area_rect(
     buf_h: f32,
     scale: u32,
     fg: Color,
+    fmt: &crate::HudMeasurementFormat,
     stroke: &tiny_skia::Stroke,
     line_paint: &tiny_skia::Paint,
     camera_armed: bool,
@@ -2382,14 +2392,21 @@ fn draw_area_rect(
             pixmap.stroke_path(&path, line_paint, stroke, Transform::identity(), None);
         }
     }
-    let w_logical = (rw / scale_f).round() as u32;
-    let h_logical = (rh / scale_f).round() as u32;
+    let w_logical_f = (rw / scale_f) as f64;
+    let h_logical_f = (rh / scale_f) as f64;
+    let w_logical = w_logical_f.round() as u32;
+    let h_logical = h_logical_f.round() as u32;
 
     // W × H pill, centered inside the rectangle. When the cursor is
     // over it (camera_armed=true), swap the text for a camera icon
     // while keeping the same pill bounds so the visible chip doesn't
     // jump as you hover in/out.
-    let dim_text = format!("{} \u{00D7} {}", w_logical, h_logical);
+    let dim_text = format!(
+        "{} \u{00D7} {}{}",
+        format_number(w_logical_f, fmt),
+        format_number(h_logical_f, fmt),
+        fmt.unit_suffix
+    );
     // Drawing-mode pills sit below the rect so the user can see what
     // they're highlighting. Held rects keep the centered position
     // (after snap-shrink they're tight to content, less obscuring).
@@ -2854,6 +2871,29 @@ fn draw_toast(
         baseline_y: (pill_y + pad_y + ascent).round(),
         px_size,
     });
+}
+
+/// Render a logical-pixel measurement value with the user's
+/// configured rounding mode. No unit suffix is appended — callers
+/// add it for single-value pills and omit it for W×H pills.
+fn format_number(value_logical: f64, fmt: &crate::HudMeasurementFormat) -> String {
+    use crate::HudRounding::*;
+    match fmt.rounding {
+        Points => {
+            let r = (value_logical * 10.0).round() / 10.0;
+            if (r - r.round()).abs() < f64::EPSILON {
+                format!("{}", r as i64)
+            } else {
+                format!("{r:.1}")
+            }
+        }
+        PointsRounded => format!("{}", value_logical.round() as i64),
+        ScreenPixels => format!("{}", (value_logical * fmt.scale_factor).round() as i64),
+    }
+}
+
+fn format_value(value_logical: f64, fmt: &crate::HudMeasurementFormat) -> String {
+    format!("{}{}", format_number(value_logical, fmt), fmt.unit_suffix)
 }
 
 /// Right-click context menu — floating list of actions anchored at

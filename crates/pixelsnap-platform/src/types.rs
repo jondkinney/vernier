@@ -149,6 +149,44 @@ pub struct Hud {
     /// Right-click context menu, drawn on top of every other HUD
     /// layer. `None` while the menu is closed.
     pub context_menu: Option<HudContextMenu>,
+    /// Color of the persistent reference guide lines. Sourced from
+    /// the user's appearance prefs.
+    pub guide_color: Color,
+    /// How distance / dimension values render in pills (units +
+    /// rounding mode). Defaults to integer logical pixels with a
+    /// "px" suffix.
+    pub measurement_format: HudMeasurementFormat,
+}
+
+/// Knobs the renderer reads to format measurement labels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HudMeasurementFormat {
+    pub unit_suffix: String,
+    pub rounding: HudRounding,
+    /// Display scale factor of the active monitor; multiplied in
+    /// when [`HudRounding::ScreenPixels`] is selected.
+    pub scale_factor: f64,
+}
+
+impl Default for HudMeasurementFormat {
+    fn default() -> Self {
+        Self {
+            unit_suffix: "px".to_string(),
+            rounding: HudRounding::PointsRounded,
+            scale_factor: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudRounding {
+    /// Logical (point) pixels, fractional values allowed to one
+    /// decimal place.
+    Points,
+    /// Logical pixels rounded to the nearest integer.
+    PointsRounded,
+    /// Physical pixels (logical × `scale_factor`), rounded.
+    ScreenPixels,
 }
 
 /// A floating right-click menu rendered by the overlay. The list of
@@ -286,6 +324,8 @@ impl Hud {
             cursor_kind: CursorKind::Move,
             align_mode: false,
             context_menu: None,
+            guide_color: Color::rgba(0x42, 0x9C, 0xFF, 0xF5),
+            measurement_format: HudMeasurementFormat::default(),
         }
     }
 }
@@ -433,6 +473,12 @@ impl TrayMenu {
                 TrayMenuItem::Action {
                     id: "toggle_overlay".into(),
                     label: "Toggle overlay".into(),
+                    enabled: true,
+                    accelerator: None,
+                },
+                TrayMenuItem::Action {
+                    id: "open_prefs".into(),
+                    label: "Preferences…".into(),
                     enabled: true,
                     accelerator: None,
                 },
