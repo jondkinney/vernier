@@ -55,17 +55,25 @@ struct PrefsApp {
     /// and reverts.
     saved: Settings,
     on_saved: Box<dyn FnMut() + Send>,
+    /// Invoked when the user clicks "Quit vernier" — the caller
+    /// is responsible for telling the running daemon to exit.
+    on_quit: Box<dyn FnMut() + Send>,
     last_status: Option<String>,
 }
 
 impl PrefsApp {
-    fn new(_cc: &CreationContext<'_>, on_saved: Box<dyn FnMut() + Send>) -> Self {
+    fn new(
+        _cc: &CreationContext<'_>,
+        on_saved: Box<dyn FnMut() + Send>,
+        on_quit: Box<dyn FnMut() + Send>,
+    ) -> Self {
         let initial = Settings::load().unwrap_or_default();
         Self {
             section: Section::General,
             edited: initial.clone(),
             saved: initial,
             on_saved,
+            on_quit,
             last_status: None,
         }
     }
@@ -115,9 +123,16 @@ impl App for PrefsApp {
                 }
             });
 
+        let mut quit_requested = false;
         egui::TopBottomPanel::bottom("prefs_actions").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                let quit_label = egui::RichText::new("Quit vernier")
+                    .color(egui::Color32::from_rgb(220, 90, 90));
+                if ui.add(egui::Button::new(quit_label)).clicked() {
+                    quit_requested = true;
+                }
+                ui.add_space(8.0);
                 if let Some(msg) = &self.last_status {
                     ui.label(msg);
                 }
@@ -141,6 +156,10 @@ impl App for PrefsApp {
             });
             ui.add_space(4.0);
         });
+        if quit_requested {
+            (self.on_quit)();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(self.section.label());
@@ -362,10 +381,14 @@ fn color_picker(ui: &mut egui::Ui, c: &mut ColorRgba) {
 }
 
 /// Open the prefs window. Returns when the user closes it.
-/// `on_saved` is invoked synchronously after each successful save —
-/// the daemon-facing IPC ping lives in the caller so the UI crate
-/// stays platform-agnostic.
-pub fn run_prefs(on_saved: Box<dyn FnMut() + Send>) -> Result<()> {
+/// `on_saved` runs synchronously after each successful save (the
+/// caller plugs in an IPC reload ping). `on_quit` runs when the
+/// user clicks the "Quit vernier" button so the caller can send
+/// the daemon-shutdown IPC.
+pub fn run_prefs(
+    on_saved: Box<dyn FnMut() + Send>,
+    on_quit: Box<dyn FnMut() + Send>,
+) -> Result<()> {
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("macOS Preferences")
@@ -376,7 +399,7 @@ pub fn run_prefs(on_saved: Box<dyn FnMut() + Send>) -> Result<()> {
     eframe::run_native(
         "macOS Preferences",
         options,
-        Box::new(move |cc| Ok(Box::new(PrefsApp::new(cc, on_saved)))),
+        Box::new(move |cc| Ok(Box::new(PrefsApp::new(cc, on_saved, on_quit)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
