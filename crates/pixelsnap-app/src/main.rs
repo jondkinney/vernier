@@ -320,6 +320,13 @@ fn run_daemon() -> Result<()> {
     // (skip the snap-to-detected-edge default).
     let mut shift_held: bool = false;
     let mut super_held: bool = false;
+    let mut ctrl_held: bool = false;
+    let mut alt_held: bool = false;
+    // Cached parsed accelerators for the user's configured
+    // shortcuts. Refreshed on startup + on each `reload-settings`
+    // so a bare keypress can match against the live config rather
+    // than against a hardcoded Esc / Shift+R / Enter table.
+    let mut shortcut_accels = parse_shortcut_accels(&initial_settings);
     // Index into `guides` of the guide currently being dragged via
     // pointer down on the line — None when not dragging.
     let mut dragging_guide: Option<usize> = None;
@@ -1127,6 +1134,16 @@ fn run_daemon() -> Result<()> {
                 // current when the next non-modifier action fires.
                 let is_shift = keysym == 0xffe1 || keysym == 0xffe2;
                 let is_super = keysym == 0xffeb || keysym == 0xffec;
+                let is_ctrl = keysym == 0xffe3 || keysym == 0xffe4;
+                let is_alt = keysym == 0xffe9 || keysym == 0xffea;
+                if is_ctrl {
+                    ctrl_held = pressed;
+                    continue;
+                }
+                if is_alt {
+                    alt_held = pressed;
+                    continue;
+                }
                 if is_shift {
                     shift_held = pressed;
                     if !matches!(mode, InteractionMode::Idle) {
@@ -1161,6 +1178,8 @@ fn run_daemon() -> Result<()> {
                     super_held = pressed;
                     continue;
                 }
+                let pressed_accel =
+                    xkb_to_accelerator(keysym, shift_held, ctrl_held, alt_held, super_held);
                 if !pressed || matches!(mode, InteractionMode::Idle) {
                     // Idle daemon ignores non-modifier keyboard;
                     // the layer surface doesn't even hold focus then.
@@ -1196,11 +1215,14 @@ fn run_daemon() -> Result<()> {
                             );
                         }
                     }
-                } else if keysym == 0xff1b {
-                    // XKB_KEY_Escape = 0xff1b. Two quick presses
-                    // exit; a single press just hints. Lets the
-                    // user "back out" of pending placements / drags
-                    // without losing the whole session.
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.background
+                {
+                    // Configured background-mode shortcut (default
+                    // Esc). Two quick presses exit; a single press
+                    // just hints. Lets the user "back out" of
+                    // pending placements / drags without losing the
+                    // whole session.
                     let now = Instant::now();
                     let is_double = last_esc_at
                         .map(|t| now.duration_since(t) <= ESC_DOUBLE_WINDOW)
@@ -1505,10 +1527,13 @@ fn run_daemon() -> Result<()> {
                         }
                         Err(e) => log::warn!("refresh capture failed: {e}"),
                     }
-                } else if keysym == 0x0052 {
-                    // Capital R — restore the last saved session
-                    // (held rects, guides, stuck measurements). Saved
-                    // automatically on Esc-exit.
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.restore
+                {
+                    // Configured restore-session shortcut (default
+                    // Shift+R). Restores held rects / guides /
+                    // stuck measurements saved automatically on
+                    // Esc-exit.
                     let toast_text = match load_session() {
                         Some((r, g, s)) => {
                             log::info!(
@@ -1559,10 +1584,13 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym == 0xff0d || keysym == 0xff8d {
-                    // Enter / KP_Enter — copy the dimensions of the
-                    // hovered held rect (or the only rect if just
-                    // one exists) using the configured CopyFormat.
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.capture
+                {
+                    // Configured capture shortcut (default Enter) —
+                    // copy the dimensions of the hovered held rect
+                    // (or the only rect if just one exists) using
+                    // the configured CopyFormat.
                     let cursor_px = last_pointer_xy
                         .map(|(x, y)| Px::new(x as i32, y as i32));
                     let target = cursor_px
@@ -1737,6 +1765,7 @@ fn run_daemon() -> Result<()> {
                         // Reset live tolerance to the new default so the
                         // user immediately sees their pref reflected.
                         tol_level = s.tolerance.default_level;
+                        shortcut_accels = parse_shortcut_accels(&s);
                         // Re-register the toggle hotkey if the user
                         // changed it.
                         if let Some(new_accel) = Accelerator::parse(&s.shortcuts.toggle) {
@@ -2002,6 +2031,72 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
             .with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedShortcuts {
+    background: Option<Accelerator>,
+    restore: Option<Accelerator>,
+    capture: Option<Accelerator>,
+}
+
+fn parse_shortcut_accels(s: &Settings) -> ParsedShortcuts {
+    ParsedShortcuts {
+        background: Accelerator::parse(&s.shortcuts.background_mode),
+        restore: Accelerator::parse(&s.shortcuts.restore_session),
+        capture: Accelerator::parse(&s.shortcuts.capture),
+    }
+}
+
+/// Translate the XKB keysym + currently-held modifier state into a
+/// platform `Accelerator` so the daemon's keyboard handler can
+/// match against `settings.shortcuts.*`. Returns `None` for keys
+/// the user can't reasonably bind (lone modifiers, dead keys, …).
+fn xkb_to_accelerator(
+    keysym: u32,
+    shift_held: bool,
+    ctrl_held: bool,
+    alt_held: bool,
+    super_held: bool,
+) -> Option<Accelerator> {
+    use vernier_platform::{Key, Modifiers};
+    let key = match keysym {
+        0xff1b => Key::Escape,
+        0xff0d | 0xff8d => Key::Enter,
+        0xff09 => Key::Tab,
+        0xff08 => Key::Backspace,
+        0xffff => Key::Delete,
+        0x0020 => Key::Space,
+        0xff51 => Key::Left,
+        0xff52 => Key::Up,
+        0xff53 => Key::Right,
+        0xff54 => Key::Down,
+        // Function keys F1..F12 = 0xffbe..0xffc9
+        0xffbe..=0xffc9 => Key::F((keysym - 0xffbe + 1) as u8),
+        // Letters: lowercase a-z = 0x0061..0x007a, uppercase A-Z =
+        // 0x0041..0x005a. Normalize to lowercase Char — the
+        // SHIFT modifier is carried separately so "shift+f" and
+        // "F" both round-trip to Key::Char('f') + shift.
+        0x0061..=0x007a => Key::Char(char::from_u32(keysym)?),
+        0x0041..=0x005a => Key::Char(char::from_u32(keysym + 0x20)?),
+        // Digits 0-9 (no modifier).
+        0x0030..=0x0039 => Key::Char(char::from_u32(keysym)?),
+        _ => return None,
+    };
+    let mut modifiers = Modifiers::NONE;
+    if shift_held {
+        modifiers |= Modifiers::SHIFT;
+    }
+    if ctrl_held {
+        modifiers |= Modifiers::CTRL;
+    }
+    if alt_held {
+        modifiers |= Modifiers::ALT;
+    }
+    if super_held {
+        modifiers |= Modifiers::META;
+    }
+    Some(Accelerator { modifiers, key })
 }
 
 /// Spawn `vernier prefs` and return the `Child` handle so the
