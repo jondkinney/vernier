@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vernier_core::{
     classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg, AspectMode,
-    EdgeQuad, FrameView, InteractionMode, Measurement, Px, SnapPoint, Tolerance,
+    EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
+    Tolerance, Units,
 };
 use vernier_platform::{
-    Accelerator, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudContextMenu,
-    HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind, HudToast, MonitorId, NativeFrame,
-    Platform, PlatformEvent, StuckMeasurement, TrayMenu,
+    Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, Hud, HudAxis,
+    HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
+    HudMeasurementFormat, HudRounding, HudToast, MonitorId, NativeFrame, Platform, PlatformEvent,
+    StuckMeasurement, TrayMenu,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
@@ -45,6 +47,15 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         tolerance: u32,
     },
+    /// Open the preferences window. Reads the current settings from
+    /// `~/.config/vernier/settings.toml`, lets the user edit them
+    /// across the General / Screenshots / Tolerance / Appearance /
+    /// Integrations / Shortcuts / About sections, and pings the
+    /// running daemon to reload after each save.
+    Prefs,
+    /// Tell the running daemon to re-read its settings file. Sent
+    /// automatically by the prefs window after each save.
+    ReloadSettings,
 }
 
 fn main() -> Result<()> {
@@ -65,8 +76,24 @@ fn main() -> Result<()> {
         Some(Cmd::DetectEdges { x, y, tolerance }) => {
             run_client_command(&format!("detect-edges {x} {y} {tolerance}"))
         }
+        Some(Cmd::Prefs) => run_prefs_window(),
+        Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
         None => run_daemon(),
     }
+}
+
+/// Open the egui prefs window. After each successful save the
+/// in-process callback pings the running daemon over IPC so it
+/// reloads `settings.toml` without restart.
+fn run_prefs_window() -> Result<()> {
+    let on_saved: Box<dyn FnMut() + Send> = Box::new(|| {
+        // Best-effort: if no daemon is running, the prefs window
+        // still works — settings just take effect on next launch.
+        if let Err(e) = run_client_command("reload-settings") {
+            log::debug!("daemon reload ping failed (ok if not running): {e:#}");
+        }
+    });
+    vernier_ui::run_prefs(on_saved)
 }
 
 fn run_client_command(cmd: &str) -> Result<()> {
@@ -89,6 +116,18 @@ fn run_client_command(cmd: &str) -> Result<()> {
 fn run_daemon() -> Result<()> {
     log::info!("vernier {} — daemon", env!("CARGO_PKG_VERSION"));
 
+    let initial_settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("settings.toml: {e:#}; using defaults");
+            Settings::default()
+        }
+    };
+    apply_autostart(&initial_settings.general).unwrap_or_else(|e| {
+        log::warn!("autostart: {e:#}");
+    });
+    replace_settings(initial_settings.clone());
+
     let (platform, platform_events) = vernier_platform::init()?;
     let monitors = platform.monitors()?;
     log::info!("monitors detected: {}", monitors.len());
@@ -104,6 +143,7 @@ fn run_daemon() -> Result<()> {
         .find(|m| m.is_primary)
         .or_else(|| monitors.first())
         .context("no monitors available")?;
+    set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
     let _tray = platform.create_tray(TrayMenu::minimal("vernier"))?;
 
@@ -167,7 +207,7 @@ fn run_daemon() -> Result<()> {
     // / High) cycled with +/-. Each level maps to a sum-of-channel
     // delta that the edge-detection scan uses to ignore minor color
     // variation.
-    let mut tol_level = TolLevel::DEFAULT;
+    let mut tol_level = initial_settings.tolerance.default_level;
     let mut last_pointer_xy: Option<(f64, f64)> = None;
     // Active toast (centered or bottom-center). While `toast_until` is
     // in the future we keep showing the toast on every redraw and
@@ -241,6 +281,9 @@ fn run_daemon() -> Result<()> {
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "toggle_overlay" => {
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
+            }
+            MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
+                spawn_prefs_window();
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) => {
                 log::info!("unhandled tray menu id: {id}");
@@ -514,11 +557,13 @@ fn run_daemon() -> Result<()> {
                                 }
                             }
                             MenuAction::OpenScreenshotTool => {
-                                log::info!("opening omarchy-cmd-screenshot");
-                                if let Err(e) =
-                                    std::process::Command::new("omarchy-cmd-screenshot").spawn()
-                                {
-                                    log::warn!("spawn screenshot tool: {e}");
+                                let cmd = current_settings()
+                                    .integrations
+                                    .external_screenshot_command
+                                    .clone();
+                                log::info!("opening external screenshot tool: {cmd}");
+                                if let Err(e) = std::process::Command::new(&cmd).spawn() {
+                                    log::warn!("spawn screenshot tool {cmd:?}: {e}");
                                 }
                                 // Step out of measure mode so the
                                 // screenshot tool gets a clean desktop.
@@ -1457,6 +1502,24 @@ fn run_daemon() -> Result<()> {
                 };
                 let _ = reply.send(resp);
             }
+            MainEvent::Ipc(IpcCmd::ReloadSettings) => {
+                log::info!("ipc: reload-settings");
+                match Settings::load() {
+                    Ok(s) => {
+                        if let Err(e) = apply_autostart(&s.general) {
+                            log::warn!("autostart: {e:#}");
+                        }
+                        // Reset live tolerance to the new default so the
+                        // user immediately sees their pref reflected.
+                        tol_level = s.tolerance.default_level;
+                        replace_settings(s);
+                    }
+                    Err(e) => log::warn!("reload settings: {e:#}"),
+                }
+            }
+            MainEvent::Ipc(IpcCmd::OpenPrefs) => {
+                spawn_prefs_window();
+            }
             MainEvent::ToastElapsed { exit_measurement } => {
                 // A timer thread fires when its toast duration elapses.
                 // If a fresher toast is still active (user hit +/-
@@ -1515,12 +1578,117 @@ fn run_daemon() -> Result<()> {
 
 /// Foreground color for HUD strokes and pills. Coral red by default;
 /// black when the user has toggled the alternate palette with `x`.
+/// Process-wide settings cache. The daemon initialises it on
+/// startup, the IPC `reload-settings` handler swaps in a fresh load
+/// after the prefs UI saves, and rendering helpers read through it
+/// to avoid threading `&Settings` through every call site.
+fn settings_lock() -> &'static std::sync::Mutex<Settings> {
+    use std::sync::{Mutex, OnceLock};
+    static CELL: OnceLock<Mutex<Settings>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(Settings::load().unwrap_or_default()))
+}
+
+fn current_settings() -> Settings {
+    settings_lock().lock().unwrap().clone()
+}
+
+fn replace_settings(s: Settings) {
+    *settings_lock().lock().unwrap() = s;
+}
+
 fn hud_foreground(alt: bool) -> vernier_platform::Color {
     use vernier_platform::Color;
-    if alt {
-        Color::rgba(0x10, 0x10, 0x10, 0xF5)
+    let s = current_settings();
+    let c = if alt {
+        s.appearance.alternative_color
     } else {
-        Color::rgba(0xFF, 0x5C, 0x5C, 0xF5)
+        s.appearance.primary_color
+    };
+    Color::rgba(c.r, c.g, c.b, c.a)
+}
+
+
+fn scale_factor_lock() -> &'static std::sync::Mutex<f64> {
+    use std::sync::{Mutex, OnceLock};
+    static CELL: OnceLock<Mutex<f64>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(1.0))
+}
+
+fn primary_scale_factor() -> f64 {
+    *scale_factor_lock().lock().unwrap()
+}
+
+fn set_primary_scale_factor(s: f64) {
+    *scale_factor_lock().lock().unwrap() = s;
+}
+
+/// Pull the currently-configured guide color + measurement format
+/// from settings and write them into a freshly-built `Hud`. Called
+/// at every refresh_hud branch so the live HUD reflects prefs
+/// changes the moment the daemon's IPC reload finishes.
+fn populate_hud_appearance(hud: &mut Hud) {
+    let s = current_settings();
+    let g = s.appearance.guide_color;
+    hud.guide_color = PlatColor::rgba(g.r, g.g, g.b, g.a);
+    hud.measurement_format = HudMeasurementFormat {
+        unit_suffix: match s.appearance.units {
+            Units::Px => "px".to_string(),
+            Units::Pt => "pt".to_string(),
+        },
+        rounding: match s.appearance.rounding_mode {
+            RoundingMode::Points => HudRounding::Points,
+            RoundingMode::PointsRounded => HudRounding::PointsRounded,
+            RoundingMode::ScreenPixels => HudRounding::ScreenPixels,
+        },
+        scale_factor: primary_scale_factor(),
+    };
+}
+
+/// Write or remove `~/.config/autostart/vernier.desktop` depending
+/// on the user's `general.launch_at_login` preference. Idempotent.
+fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .context("no XDG_CONFIG_HOME or HOME")?
+        .join("autostart");
+    let path = dir.join("vernier.desktop");
+    if general.launch_at_login {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+        let exe = std::env::current_exe()
+            .context("current_exe")?
+            .display()
+            .to_string();
+        let body = format!(
+            "[Desktop Entry]\nType=Application\nName=macOS\n\
+             Comment=Measurement overlay\nExec={exe}\nTerminal=false\n\
+             Categories=Utility;\nX-GNOME-Autostart-enabled=true\n"
+        );
+        std::fs::write(&path, body)
+            .with_context(|| format!("write {}", path.display()))?;
+    } else if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Spawn `vernier prefs` so the tray "Preferences…" entry can
+/// open the settings UI without the daemon hosting an egui window
+/// inside its own event loop. If the current binary path can't be
+/// resolved (very unusual), fall back to looking up `vernier` on
+/// PATH.
+fn spawn_prefs_window() {
+    let exe = std::env::current_exe().ok();
+    let mut cmd = match exe {
+        Some(p) => std::process::Command::new(p),
+        None => std::process::Command::new("vernier"),
+    };
+    cmd.arg("prefs");
+    match cmd.spawn() {
+        Ok(child) => log::info!("prefs window spawned (pid {})", child.id()),
+        Err(e) => log::warn!("spawn prefs: {e:#}"),
     }
 }
 
@@ -1570,48 +1738,6 @@ enum ButtonOutcome {
     ScreenshotTaken,
 }
 
-/// Discrete tolerance levels the user cycles through with `+`/`-`.
-/// Backed by a sum-of-channel-delta value the edge-detection scan
-/// uses to ignore minor color variation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TolLevel { Zero, Low, Medium, High }
-
-impl TolLevel {
-    const DEFAULT: Self = Self::Medium;
-    fn label(self) -> &'static str {
-        match self {
-            Self::Zero => "Zero",
-            Self::Low => "Low",
-            Self::Medium => "Medium",
-            Self::High => "High",
-        }
-    }
-    fn value(self) -> u32 {
-        match self {
-            Self::Zero => 0,
-            Self::Low => 16,
-            Self::Medium => 48,
-            Self::High => 96,
-        }
-    }
-    fn higher(self) -> Self {
-        match self {
-            Self::Zero => Self::Low,
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::High,
-        }
-    }
-    fn lower(self) -> Self {
-        match self {
-            Self::Zero => Self::Zero,
-            Self::Low => Self::Zero,
-            Self::Medium => Self::Low,
-            Self::High => Self::Medium,
-        }
-    }
-}
-
 #[derive(Debug)]
 enum IpcCmd {
     Toggle,
@@ -1623,6 +1749,13 @@ enum IpcCmd {
         tolerance: u32,
         reply: SyncSender<String>,
     },
+    /// Re-read settings.toml and apply user-tunable behavior
+    /// (default tolerance, foreground colors, screenshot dir, …).
+    /// Sent by the prefs window after each save.
+    ReloadSettings,
+    /// Spawn `vernier prefs` so the tray menu can open the
+    /// settings UI without the daemon embedding it.
+    OpenPrefs,
 }
 
 fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc::Sender<MainEvent>) {
@@ -1694,6 +1827,19 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                         Err(_) => {
                             let _ = writer.write_all(b"error: daemon dropped reply\n");
                         }
+                    }
+                }
+                "reload-settings" => {
+                    if sender
+                        .send(MainEvent::Ipc(IpcCmd::ReloadSettings))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                "open-prefs" => {
+                    if sender.send(MainEvent::Ipc(IpcCmd::OpenPrefs)).is_err() {
+                        return;
                     }
                 }
                 other => log::debug!("ipc unknown command: {other:?}"),
@@ -1921,6 +2067,7 @@ fn toggle_measurement(
         overlay.set_input_capturing(true);
         let mut hud = Hud::hover((-100.0, -100.0));
         hud.foreground = fg;
+        populate_hud_appearance(&mut hud);
         hud.held_rects = held_rects.to_vec();
         hud.guides = guides.to_vec();
         hud.stuck_measurements = stuck_measurements.to_vec();
@@ -1948,6 +2095,7 @@ fn toggle_measurement(
         let mut hud = Hud::hover((-1000.0, -1000.0));
         hud.kind = HudKind::None;
         hud.foreground = fg;
+        populate_hud_appearance(&mut hud);
         hud.held_rects = held_rects.to_vec();
         hud.guides = guides.to_vec();
         hud.stuck_measurements = stuck_measurements.to_vec();
@@ -2129,6 +2277,7 @@ fn refresh_hud(
         let mut hud = Hud::hover((x, y));
         hud.kind = HudKind::None;
         hud.foreground = fg;
+        populate_hud_appearance(&mut hud);
         hud.toast = toast.cloned();
         hud.guides = composed_guides;
         hud.stuck_measurements = composed_stuck;
@@ -2155,6 +2304,7 @@ fn refresh_hud(
                 let mut hud = Hud::hover((x, y));
                 hud.kind = HudKind::None;
                 hud.foreground = fg;
+                populate_hud_appearance(&mut hud);
                 hud.toast = toast.cloned();
                 hud.guides = composed_guides;
                 hud.stuck_measurements = composed_stuck;
@@ -2178,6 +2328,7 @@ fn refresh_hud(
                 ..Hud::hover((x, y))
             };
             hud.foreground = fg;
+            populate_hud_appearance(&mut hud);
             hud.toast = toast.cloned();
             hud.guides = composed_guides.clone();
             hud.stuck_measurements = composed_stuck.clone();
@@ -2199,6 +2350,7 @@ fn refresh_hud(
         InteractionMode::Drawing { start, .. } => {
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
+            populate_hud_appearance(&mut hud);
             if has_drag_distance(start.pixel, cursor_px) {
                 let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
                 // Snap the moving end of the rect to nearby guides on
@@ -2926,6 +3078,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
+            populate_hud_appearance(&mut hud);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -2940,6 +3093,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
+            populate_hud_appearance(&mut hud);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -2984,6 +3138,7 @@ fn handle_pointer_button(
         *mode = InteractionMode::Hover { cursor: cursor_px };
         let mut hud = Hud::hover((x, y));
         hud.foreground = fg;
+        populate_hud_appearance(&mut hud);
         hud.kind = HudKind::Hover {
             cursor: (x, y),
             edges: [None; 4],
