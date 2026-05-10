@@ -3,6 +3,7 @@
 //! The rest of the codebase imports this trait and the [`init`] constructor;
 //! concrete OS modules are private and selected via cfg.
 
+pub mod figma_bridge;
 mod tray;
 mod types;
 pub use types::*;

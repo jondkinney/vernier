@@ -13,6 +13,9 @@ thiserror = { workspace = true }
 log = { workspace = true }
 tiny-skia = "0.12"
 fontdue = "0.9"
+# Figma plugin bridge: minimal sync WebSocket server on localhost.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+serde_json = "1"
 # SVG rendering for third-party app icons (e.g. Satty integration
 # card on the Screenshots prefs pane). usvg parses, resvg
 # rasterizes onto a tiny-skia pixmap.
