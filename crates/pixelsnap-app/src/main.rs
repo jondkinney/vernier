@@ -15,6 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
+/// Minimum gap between HUD redraws / wl_buffer commits.
+/// ~120Hz — enough headroom over typical display refresh that the
+/// compositor always has a fresh frame, but not so high that we
+/// flood the Wayland connection. Used by both the live cursor
+/// redraws and the nudge auto-repeat throttle.
+const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(8);
+
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
 struct Cli {
@@ -296,9 +303,26 @@ fn run_daemon() -> Result<()> {
             );
         }
     }
+    if on_hyprland {
+        // Active-window watcher backs the Figma plugin integration:
+        // we need to know when a Figma tab is focused so we apply
+        // the zoom-correction divisor only there.
+        spawn_active_window_watcher();
+    }
+    if initial_settings.integrations.figma_zoom_correction {
+        vernier_platform::figma_bridge::spawn(
+            initial_settings.integrations.figma_bridge_port,
+        );
+    }
+
     let mut current_hotkey: Option<HotkeyId> = None;
     if let Some(accel) = initial_accel_opt {
         if on_hyprland {
+            // Clear any stale runtime bind from a previous daemon
+            // run before registering — otherwise hyprctl stacks
+            // duplicates and a single key press fires `vernier
+            // toggle` multiple times, flickering measure mode.
+            let _ = unregister_hyprland_toggle(&accel);
             if !register_hyprland_toggle(&accel) {
                 log::warn!("hyprctl bind for toggle failed");
             }
@@ -377,7 +401,7 @@ fn run_daemon() -> Result<()> {
     // intentional during the brief measurement session: we want a fresh
     // frame ready whenever the compositor pulls one. Outside of
     // measurement mode we don't redraw at all.
-    const REDRAW_INTERVAL: Duration = Duration::from_millis(8);
+    const REDRAW_INTERVAL: Duration = HUD_REDRAW_INTERVAL;
     // Edge-detection tolerance — discrete levels (Zero / Low / Medium
     // / High) cycled with +/-. Each level maps to a sum-of-channel
     // delta that the edge-detection scan uses to ignore minor color
@@ -442,6 +466,30 @@ fn run_daemon() -> Result<()> {
     // configured window (`clear_and_hide_double_press_window_ms`)
     // fires the action. Otherwise the first press fires it.
     let mut last_esc_at: Option<Instant> = None;
+    // Currently-held nudge direction (if any) and a generation
+    // counter that the spawned timer thread checks before firing.
+    // Bumping the generation invalidates the timer for that
+    // direction so it stops without needing inter-thread cancel
+    // signals.
+    let mut active_nudge: Option<(NudgeDir, u64, u32)> = None; // (dir, generation, keysym)
+    let mut nudge_generation: u64 = 0;
+    // Sticky nudge target — once a rect is "selected" via a nudge
+    // press while the cursor was inside it, subsequent nudges
+    // (auto-repeat ticks AND fresh presses) keep moving the same
+    // rect even if it slides out from under the cursor. The
+    // selection releases when the mouse moves ≥ NUDGE_RELEASE_PX
+    // from `anchor`, when the rect is removed, or when measure
+    // mode exits.
+    let mut nudge_selection: Option<NudgeSelection> = None;
+    const NUDGE_RELEASE_PX: f64 = 10.0;
+    // Shared with the spawned nudge-timer threads. Each thread
+    // captures its own assigned generation; on every tick it checks
+    // that the atomic still equals it before sending a NudgeTick,
+    // so a key-release / new-direction press invalidates the
+    // previous thread without an explicit cancel signal.
+    let nudge_active_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    const NUDGE_INITIAL_DELAY_MS: u64 = 225;
+    const NUDGE_INTERVAL_MS: u64 = 4; // ~250 Hz
     // Live resize op against a held rect — set on press over an
     // edge/corner, cleared on release.
     let mut resizing: Option<ResizeOp> = None;
@@ -509,6 +557,18 @@ fn run_daemon() -> Result<()> {
                 let cursor_px = Px::new(x as i32, y as i32);
                 update_cursor_in_mode(&mut mode, cursor_px);
                 last_pointer_xy = Some((x, y));
+                // Release a sticky nudge selection once the user
+                // has actively moved the mouse — small jitter
+                // shouldn't drop it, but a real cursor move
+                // (≥ NUDGE_RELEASE_PX) means the user is choosing
+                // a new target.
+                if let Some(sel) = nudge_selection {
+                    let dx = x - sel.anchor.0;
+                    let dy = y - sel.anchor.1;
+                    if (dx * dx + dy * dy).sqrt() >= NUDGE_RELEASE_PX {
+                        nudge_selection = None;
+                    }
+                }
                 // Context menu open → only update its hover row and
                 // refresh; suppress the regular crosshair / drag /
                 // resize logic until the menu closes.
@@ -813,6 +873,7 @@ fn run_daemon() -> Result<()> {
                                             s.len(),
                                         );
                                         held_rects = r;
+                                        nudge_selection = None;
                                         guides = g;
                                         stuck_measurements = s;
                                         "Session restored".to_string()
@@ -838,6 +899,7 @@ fn run_daemon() -> Result<()> {
                                 guides.clear();
                                 stuck_measurements.clear();
                                 held_rects.clear();
+                                nudge_selection = None;
                             }
                             MenuAction::ClosemacOS => {
                                 log::info!("close requested via context menu");
@@ -1180,6 +1242,7 @@ fn run_daemon() -> Result<()> {
                         &mut guides,
                         &mut stuck_measurements,
                         &mut held_rects,
+                        &mut nudge_selection,
                         color_alternate,
                         super_held,
                     );
@@ -1253,11 +1316,11 @@ fn run_daemon() -> Result<()> {
             }
             MainEvent::Platform(PlatformEvent::PointerLeave { .. }) => {}
             MainEvent::Platform(PlatformEvent::KeyboardKey {
-                keysym, pressed, ..
+                keysym, pressed, is_repeat, ..
             }) => {
                 log::debug!(
-                    "key event: keysym=0x{:x} pressed={} mode={:?}",
-                    keysym, pressed, std::mem::discriminant(&mode)
+                    "key event: keysym=0x{:x} pressed={} repeat={}",
+                    keysym, pressed, is_repeat
                 );
                 // Track modifiers regardless of mode so they're
                 // current when the next non-modifier action fires.
@@ -1307,6 +1370,30 @@ fn run_daemon() -> Result<()> {
                 }
                 let pressed_accel =
                     xkb_to_accelerator(keysym, shift_held, ctrl_held, alt_held, super_held);
+                // Auto-repeat events (key held down): only allow
+                // through for nudge and tolerance ±. Every other
+                // shortcut is one-shot — letting repeats fire
+                // would, e.g., make a held Esc instantly trigger
+                // the clear-and-hide double-tap.
+                if is_repeat
+                    && matches_nudge(&pressed_accel, &shortcut_accels).is_none()
+                    && pressed_accel != shortcut_accels.tolerance_up
+                    && pressed_accel != shortcut_accels.tolerance_down
+                {
+                    continue;
+                }
+                // Release of the active nudge key cancels the
+                // auto-repeat timer thread by invalidating its
+                // generation.
+                if !pressed {
+                    if let Some((_, _, active_keysym)) = active_nudge {
+                        if active_keysym == keysym {
+                            nudge_active_gen
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            active_nudge = None;
+                        }
+                    }
+                }
                 if !pressed || matches!(mode, InteractionMode::Idle) {
                     // Idle daemon ignores non-modifier keyboard;
                     // the layer surface doesn't even hold focus then.
@@ -1342,6 +1429,16 @@ fn run_daemon() -> Result<()> {
                             );
                         }
                     }
+                } else if ctrl_held && keysym == 0x002c {
+                    // Ctrl+, → open the preferences window. macOS
+                    // uses Cmd+, for prefs; Super+, would be the
+                    // direct port but Omarchy already binds that
+                    // combo at the compositor level (mako's
+                    // "Dismiss last notification") so the keypress
+                    // never reaches our layer surface. Ctrl+, is
+                    // the next-closest convention and is free.
+                    log::info!("ctrl+, → opening prefs");
+                    ensure_prefs_window(&mut prefs_child);
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.clear_and_hide
                 {
@@ -1378,6 +1475,7 @@ fn run_daemon() -> Result<()> {
                         );
                         last_esc_at = None;
                         held_rects.clear();
+                        nudge_selection = None;
                         guides.clear();
                         stuck_measurements.clear();
                         pending_guide = None;
@@ -1696,6 +1794,7 @@ fn run_daemon() -> Result<()> {
                                 s.len(),
                             );
                             held_rects = r;
+                            nudge_selection = None;
                             guides = g;
                             stuck_measurements = s;
                             "Session restored".to_string()
@@ -1813,53 +1912,101 @@ fn run_daemon() -> Result<()> {
                     // the multiplier on top.
                     let dir = matches_nudge(&pressed_accel, &shortcut_accels)
                         .expect("matches_nudge guarded above");
-                    let cursor_px = last_pointer_xy
-                        .map(|(x, y)| Px::new(x as i32, y as i32));
-                    let target_idx = cursor_px.and_then(|c| {
-                        held_rects.iter().position(|r| {
-                            let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
-                            let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
-                            cursor_in_held_rect(c, rs, re) || cursor_over_pill(c, rs, re)
-                        })
-                    });
-                    if let Some(idx) = target_idx {
-                        let step = if shift_held { 10.0 } else { 1.0 };
-                        let (dx, dy) = match dir {
-                            NudgeDir::Left => (-step, 0.0),
-                            NudgeDir::Right => (step, 0.0),
-                            NudgeDir::Up => (0.0, -step),
-                            NudgeDir::Down => (0.0, step),
-                        };
-                        if let Some(rect) = held_rects.get_mut(idx) {
-                            rect.rect_start.0 += dx;
-                            rect.rect_start.1 += dy;
-                            rect.rect_end.0 += dx;
-                            rect.rect_end.1 += dy;
-                        }
-                        if let Some((x, y)) = last_pointer_xy {
-                            last_hud_redraw = Instant::now();
-                            let toast = current_toast(&active_toast, toast_until);
-                            refresh_hud(
-                                &mode,
-                                &mut overlay,
-                                frozen_frame.as_ref(),
-                                x,
-                                y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                super_held,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
-                            );
-                        }
+                    // If a selection is already pinned (cursor
+                    // hasn't moved ≥ NUDGE_RELEASE_PX since pin
+                    // time), keep operating on it. Otherwise try
+                    // to grab a fresh rect under the cursor.
+                    let idx = nudge_selection
+                        .filter(|s| s.rect_idx < held_rects.len())
+                        .map(|s| s.rect_idx)
+                        .or_else(|| {
+                            last_pointer_xy.and_then(|(x, y)| {
+                                let c = Px::new(x as i32, y as i32);
+                                held_rects.iter().position(|r| {
+                                    let rs = Px::new(
+                                        r.rect_start.0 as i32,
+                                        r.rect_start.1 as i32,
+                                    );
+                                    let re = Px::new(
+                                        r.rect_end.0 as i32,
+                                        r.rect_end.1 as i32,
+                                    );
+                                    cursor_in_held_rect(c, rs, re)
+                                        || cursor_over_pill(c, rs, re)
+                                })
+                            })
+                        });
+                    let Some(idx) = idx else { continue };
+                    // Pin / refresh the selection on every fresh
+                    // press so the anchor tracks the most recent
+                    // mouse position the user committed to.
+                    if let Some((x, y)) = last_pointer_xy {
+                        nudge_selection = Some(NudgeSelection {
+                            rect_idx: idx,
+                            anchor: (x, y),
+                        });
+                    }
+                    apply_nudge_step(
+                        dir,
+                        idx,
+                        shift_held,
+                        super_held,
+                        align_mode,
+                        color_alternate,
+                        last_pointer_xy,
+                        &mut held_rects,
+                        &mode,
+                        &mut overlay,
+                        frozen_frame.as_ref(),
+                        current_tol_value(tol_level),
+                        &active_toast,
+                        toast_until,
+                        &guides,
+                        pending_guide,
+                        &stuck_measurements,
+                        primary.bounds.w as i32,
+                        primary.bounds.h as i32,
+                        context_menu.as_ref(),
+                        &mut last_hud_redraw,
+                    );
+                    // Start (or restart) the auto-repeat timer for
+                    // this direction. Bumping the generation
+                    // invalidates any previously-spawned thread.
+                    if !is_repeat {
+                        nudge_generation = nudge_generation.wrapping_add(1);
+                        let this_gen = nudge_generation;
+                        nudge_active_gen
+                            .store(this_gen, std::sync::atomic::Ordering::Relaxed);
+                        active_nudge = Some((dir, this_gen, keysym));
+                        let tx = combined_tx.clone();
+                        let atomic = nudge_active_gen.clone();
+                        std::thread::Builder::new()
+                            .name("vernier-nudge-repeat".into())
+                            .spawn(move || {
+                                std::thread::sleep(Duration::from_millis(
+                                    NUDGE_INITIAL_DELAY_MS,
+                                ));
+                                loop {
+                                    if atomic.load(std::sync::atomic::Ordering::Relaxed)
+                                        != this_gen
+                                    {
+                                        return;
+                                    }
+                                    if tx
+                                        .send(MainEvent::NudgeTick {
+                                            dir,
+                                            generation: this_gen,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(
+                                        NUDGE_INTERVAL_MS,
+                                    ));
+                                }
+                            })
+                            .ok();
                     }
                 }
             }
@@ -1980,6 +2127,42 @@ fn run_daemon() -> Result<()> {
                             current_accel = new_accel_opt;
                         }
                         replace_settings(s);
+                        // Push a fresh HUD frame so prefs that
+                        // affect overlay rendering (show_cursor,
+                        // display_units, wh_indicators, guide
+                        // color, etc.) take effect immediately
+                        // rather than on the next pointer move.
+                        // Also re-run refresh_frame_if_live so
+                        // toggling freeze_screen ↔ live picks up
+                        // a current frame on save instead of
+                        // waiting for the next pointer event.
+                        if !matches!(mode, InteractionMode::Idle) {
+                            refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
+                            if let Some((x, y)) = last_pointer_xy {
+                                last_hud_redraw = Instant::now();
+                                let toast = current_toast(&active_toast, toast_until);
+                                refresh_hud(
+                                    &mode,
+                                    &mut overlay,
+                                    frozen_frame.as_ref(),
+                                    x,
+                                    y,
+                                    current_tol_value(tol_level),
+                                    toast,
+                                    &guides,
+                                    pending_guide,
+                                    &stuck_measurements,
+                                    &held_rects,
+                                    color_alternate,
+                                    align_mode,
+                                    super_held,
+                                    primary.bounds.w as i32,
+                                    primary.bounds.h as i32,
+                                    None,
+                                    context_menu.as_ref(),
+                                );
+                            }
+                        }
                     }
                     Err(e) => log::warn!("reload settings: {e:#}"),
                 }
@@ -2036,9 +2219,56 @@ fn run_daemon() -> Result<()> {
                     );
                 }
             }
+            MainEvent::NudgeTick { dir, generation } => {
+                // Stale ticks (a newer key was pressed or the user
+                // released the held key) bump the active generation
+                // so we ignore them here.
+                if active_nudge.map(|(_, g, _)| g) != Some(generation) {
+                    continue;
+                }
+                if matches!(mode, InteractionMode::Idle) {
+                    continue;
+                }
+                let Some(sel) = nudge_selection else { continue };
+                if sel.rect_idx >= held_rects.len() {
+                    nudge_selection = None;
+                    continue;
+                }
+                apply_nudge_step(
+                    dir,
+                    sel.rect_idx,
+                    shift_held,
+                    super_held,
+                    align_mode,
+                    color_alternate,
+                    last_pointer_xy,
+                    &mut held_rects,
+                    &mode,
+                    &mut overlay,
+                    frozen_frame.as_ref(),
+                    current_tol_value(tol_level),
+                    &active_toast,
+                    toast_until,
+                    &guides,
+                    pending_guide,
+                    &stuck_measurements,
+                    primary.bounds.w as i32,
+                    primary.bounds.h as i32,
+                    context_menu.as_ref(),
+                    &mut last_hud_redraw,
+                );
+            }
         }
     }
 
+    // Clean up the runtime hyprctl bind so the next daemon launch
+    // doesn't stack duplicates (and so a stale `vernier toggle`
+    // bind doesn't keep firing into a dead IPC socket).
+    if on_hyprland {
+        if let Some(accel) = current_accel {
+            let _ = unregister_hyprland_toggle(&accel);
+        }
+    }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
@@ -2128,6 +2358,7 @@ fn populate_hud_appearance(hud: &mut Hud) {
     } else {
         String::new()
     };
+    let (dimension_divisor, corner_indicator) = current_figma_correction(&s);
     hud.measurement_format = HudMeasurementFormat {
         unit_suffix,
         rounding: match s.appearance.rounding_mode {
@@ -2139,7 +2370,10 @@ fn populate_hud_appearance(hud: &mut Hud) {
         wh_indicators: s.general.display_wh_indicators,
         aspect_in_area: s.general.aspect_in_area_tool,
         aspect_mode: s.general.aspect_mode,
+        dimension_divisor,
     };
+    hud.show_cursor = s.general.show_cursor;
+    hud.corner_indicator = corner_indicator;
 }
 
 /// XDG data dir (`$XDG_DATA_HOME` with `~/.local/share` fallback).
@@ -2360,6 +2594,19 @@ fn register_hyprland_toggle_for(accel: &Accelerator, instance: Option<&str>) -> 
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "vernier".to_string());
     let (mods, key) = accel_to_hyprland(accel);
+    // Unbind first so successive registers (initial + watcher
+    // reconnect + configreloaded re-apply) collapse to exactly one
+    // bind instead of stacking. `keyword unbind` is a no-op when
+    // nothing's bound.
+    let unbind_arg = format!("unbind = {mods}, {key}");
+    {
+        let mut prev = std::process::Command::new("hyprctl");
+        if let Some(sig) = instance {
+            prev.args(["-i", sig]);
+        }
+        prev.args(["keyword", &unbind_arg]);
+        let _ = prev.output();
+    }
     let arg = format!("bind = {mods}, {key}, exec, {exe} toggle");
     let mut cmd = std::process::Command::new("hyprctl");
     if let Some(sig) = instance {
@@ -2521,6 +2768,129 @@ fn spawn_hyprland_bind_watcher() {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ActiveWindow {
+    class: String,
+    title: String,
+}
+
+/// Last-known focused window from Hyprland's `activewindow>>` event
+/// stream. Updated by `spawn_active_window_watcher`; read by the HUD
+/// code path to decide whether Figma zoom-correction should fire.
+fn active_window_lock() -> &'static std::sync::RwLock<ActiveWindow> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<ActiveWindow>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(ActiveWindow::default()))
+}
+
+fn current_active_window() -> ActiveWindow {
+    active_window_lock().read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Subscribe to Hyprland's `socket2.sock` event stream and keep
+/// `active_window_lock()` in sync with `activewindow>>` events. The
+/// daemon uses this read-only — there's no main-thread blocking on
+/// the cache, so a sluggish Hyprland event stream just delays the
+/// Figma-detection decision by one frame.
+fn spawn_active_window_watcher() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+    std::thread::Builder::new()
+        .name("vernier-active-window".into())
+        .spawn(|| loop {
+            let path = match current_hyprland_instance() {
+                Some((_, p)) => p,
+                None => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            let stream = match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(s) => s,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            // Prime the cache on (re)connect — without this, the
+            // first poll after Hyprland restart still sees the old
+            // window class.
+            if let Some(initial) = read_active_window_via_hyprctl() {
+                if let Ok(mut g) = active_window_lock().write() {
+                    *g = initial;
+                }
+            }
+            let reader = BufReader::new(stream);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                // `activewindow>>CLASS,TITLE` — note that titles
+                // can contain commas, so split on the first one
+                // only and treat the rest as title.
+                if let Some(rest) = line.strip_prefix("activewindow>>") {
+                    let (class, title) = match rest.split_once(',') {
+                        Some((c, t)) => (c.to_string(), t.to_string()),
+                        None => (rest.to_string(), String::new()),
+                    };
+                    if let Ok(mut g) = active_window_lock().write() {
+                        *g = ActiveWindow { class, title };
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        })
+        .ok();
+}
+
+/// One-shot query of the focused window via `hyprctl activewindow`.
+/// Used to prime the active-window cache on watcher startup so we
+/// don't need a focus event before Figma-detection works.
+fn read_active_window_via_hyprctl() -> Option<ActiveWindow> {
+    let out = std::process::Command::new("hyprctl")
+        .args(["activewindow"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut class = String::new();
+    let mut title = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("class:") {
+            class = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("title:") {
+            title = v.trim().to_string();
+        }
+    }
+    Some(ActiveWindow { class, title })
+}
+
+/// Resolve the current Figma-correction state from the active window
+/// + the bridge's cached zoom + the user's settings. Returns the
+/// divisor to apply (1.0 means no correction) and an indicator
+/// string for the corner pill (`None` if no correction).
+fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
+    if !settings.integrations.figma_zoom_correction {
+        return (1.0, None);
+    }
+    let zoom = match vernier_platform::figma_bridge::current_figma_zoom() {
+        Some(z) if z > 0.0 => z,
+        _ => return (1.0, None),
+    };
+    let win = current_active_window();
+    let class_match = settings
+        .integrations
+        .figma_browser_classes
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&win.class));
+    let title_match = win.title.contains(&settings.integrations.figma_title_suffix);
+    if !(class_match && title_match) {
+        return (1.0, None);
+    }
+    let pct = (zoom * 100.0).round() as i64;
+    (zoom, Some(format!("F \u{00B7} {pct}%")))
+}
+
+#[derive(Debug, Clone, Default)]
 struct ParsedShortcuts {
     clear_and_hide: Option<Accelerator>,
     restore: Option<Accelerator>,
@@ -2571,6 +2941,16 @@ enum NudgeDir {
     Down,
 }
 
+/// Sticky nudge target — pinned when a nudge key is first pressed
+/// while the cursor was over a held rect. `anchor` is the cursor
+/// position at pin time; the selection releases when the mouse
+/// moves further than `NUDGE_RELEASE_PX` from it.
+#[derive(Debug, Clone, Copy)]
+struct NudgeSelection {
+    rect_idx: usize,
+    anchor: (f64, f64),
+}
+
 /// Match `pressed` against any of the four nudge bindings, ignoring
 /// SHIFT (which is reserved as the step-multiplier modifier — the
 /// caller still reads `shift_held` separately).
@@ -2595,6 +2975,84 @@ fn matches_nudge(
         Some(NudgeDir::Down)
     } else {
         None
+    }
+}
+
+/// One nudge increment: shift the held rect at `idx` 1 px in the
+/// given direction (10 px when Shift is held) and repaint the HUD.
+/// Used both for the initial press and for the follow-up
+/// `NudgeTick` events the repeat timer sends.
+#[allow(clippy::too_many_arguments)]
+fn apply_nudge_step(
+    dir: NudgeDir,
+    idx: usize,
+    shift_held: bool,
+    super_held: bool,
+    align_mode: bool,
+    color_alternate: bool,
+    last_pointer_xy: Option<(f64, f64)>,
+    held_rects: &mut Vec<HeldRect>,
+    mode: &InteractionMode,
+    overlay: &mut vernier_platform::OverlayHandle,
+    frozen_frame: Option<&NativeFrame>,
+    tol_value: u32,
+    active_toast: &Option<HudToast>,
+    toast_until: Option<Instant>,
+    guides: &[Guide],
+    pending_guide: Option<GuideAxis>,
+    stuck_measurements: &[StuckMeasurement],
+    screen_w: i32,
+    screen_h: i32,
+    context_menu: Option<&ContextMenuState>,
+    last_hud_redraw: &mut Instant,
+) {
+    if idx >= held_rects.len() {
+        return;
+    }
+    let step = if shift_held { 10.0 } else { 1.0 };
+    let (dx, dy) = match dir {
+        NudgeDir::Left => (-step, 0.0),
+        NudgeDir::Right => (step, 0.0),
+        NudgeDir::Up => (0.0, -step),
+        NudgeDir::Down => (0.0, step),
+    };
+    if let Some(rect) = held_rects.get_mut(idx) {
+        rect.rect_start.0 += dx;
+        rect.rect_start.1 += dy;
+        rect.rect_end.0 += dx;
+        rect.rect_end.1 += dy;
+    }
+    // Rate-limit buffer commits to display refresh. The auto-
+    // repeat timer drives this at ~250Hz which would otherwise
+    // flood the compositor's wayland queue and break the pipe.
+    // Position math still applies every tick; only the redraw
+    // is throttled.
+    if last_hud_redraw.elapsed() < HUD_REDRAW_INTERVAL {
+        return;
+    }
+    if let Some((x, y)) = last_pointer_xy {
+        *last_hud_redraw = Instant::now();
+        let toast = current_toast(active_toast, toast_until);
+        refresh_hud(
+            mode,
+            overlay,
+            frozen_frame,
+            x,
+            y,
+            tol_value,
+            toast,
+            guides,
+            pending_guide,
+            stuck_measurements,
+            held_rects,
+            color_alternate,
+            align_mode,
+            super_held,
+            screen_w,
+            screen_h,
+            None,
+            context_menu,
+        );
     }
 }
 
@@ -2815,6 +3273,11 @@ enum MainEvent {
     /// `exit_measurement` is true for the screenshot toast — the
     /// overlay closes after the toast fades.
     ToastElapsed { exit_measurement: bool },
+    /// Internal: nudge auto-repeat tick. Fired by a worker thread
+    /// while the user holds a nudge key — SCTK's software repeat
+    /// wasn't reliably scheduling on Hyprland, so we drive our
+    /// own timer with a generation counter for cancellation.
+    NudgeTick { dir: NudgeDir, generation: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4092,6 +4555,7 @@ fn handle_pointer_button(
     guides: &mut Vec<Guide>,
     stuck_measurements: &mut Vec<StuckMeasurement>,
     held_rects: &mut Vec<HeldRect>,
+    nudge_selection: &mut Option<NudgeSelection>,
     color_alternate: bool,
     super_held: bool,
 ) -> ButtonOutcome {
@@ -4140,6 +4604,9 @@ fn handle_pointer_button(
             cursor_in_held_rect(cursor_px, rs, re)
         }) {
             log::info!("removing held rect at idx {idx}");
+            // Drop any sticky nudge selection — the index it
+            // referenced is about to disappear (or shift).
+            *nudge_selection = None;
             held_rects.remove(idx);
             return ButtonOutcome::None;
         }
