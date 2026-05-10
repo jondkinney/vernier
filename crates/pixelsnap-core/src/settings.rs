@@ -364,7 +364,7 @@ impl CopyFormat {
 #[serde(default)]
 pub struct ShortcutSettings {
     /// Toggle measure mode. Stored as a textual accelerator
-    /// (`SUPER+CTRL+SHIFT+F`); the platform layer parses on init.
+    /// (`CTRL+SHIFT+ALT+SUPER+F`); the platform layer parses on init.
     pub toggle: String,
     /// Clear all held content and hide the overlay.
     /// (For just-hide-and-keep behavior, use the toggle measure
@@ -428,12 +428,10 @@ pub struct ShortcutSettings {
 impl Default for ShortcutSettings {
     fn default() -> Self {
         Self {
-            // Hyprland's binding-line wraps SUPER around this; the
-            // GlobalShortcuts portal sees CTRL+SHIFT+F.
-            toggle: "CTRL+SHIFT+F".to_string(),
+            toggle: "CTRL+SHIFT+ALT+SUPER+F".to_string(),
             clear_and_hide: "ESC".to_string(),
             clear_and_hide_double_press: true,
-            clear_and_hide_double_press_window_ms: 1000,
+            clear_and_hide_double_press_window_ms: 1500,
             restore_session: "SHIFT+R".to_string(),
             capture: "ENTER".to_string(),
             crosshair_mode: "SHIFT".to_string(),
@@ -443,7 +441,7 @@ impl Default for ShortcutSettings {
             stuck_horizontal: "H".to_string(),
             stuck_vertical: "V".to_string(),
             refresh_capture: "R".to_string(),
-            tolerance_up: "PLUS".to_string(),
+            tolerance_up: "EQUAL".to_string(),
             tolerance_down: "MINUS".to_string(),
             nudge_left: "LEFT".to_string(),
             nudge_right: "RIGHT".to_string(),
