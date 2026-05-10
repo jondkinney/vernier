@@ -2138,16 +2138,12 @@ fn shortcut_row(
             paint_shortcut_chip(ui, chip_rect, bg, fg, &segments);
         }
         if chip_resp.clicked() {
-            *capturing = Some(id);
-        }
-
-        ui.add_space(2.0);
-        let clear_btn = egui::Button::new(
-            egui::RichText::new("×")
-                .size(16.0)
-                .color(egui::Color32::from_gray(200)),
-        );
-        if ui.add_sized([28.0, 28.0], clear_btn).clicked() {
+            // Clicking the chip clears the existing value and enters
+            // capture mode in one step — there's no separate × button
+            // to clear without arming capture, so the chip click does
+            // both. This also makes the change show up as a pending
+            // edit (Revert/Save become active) the moment the user
+            // clicks in, even before they pick a new accelerator.
             value.clear();
             *capturing = Some(id);
         }
