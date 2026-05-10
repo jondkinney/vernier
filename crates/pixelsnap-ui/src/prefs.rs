@@ -1846,21 +1846,46 @@ fn paint_caret(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 /// stroke on the right with a step down, plus a separate bottom
 /// horizontal on the left.
 fn paint_alt(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let w = rect.width();
     let h = rect.height();
     let stroke = egui::Stroke::new(2.0, color);
-    let top_y = rect.top() + h * 0.30;
-    let bot_y = rect.top() + h * 0.70;
-    let left = rect.left() + rect.width() * 0.10;
-    let mid = rect.center().x;
-    let right = rect.right() - rect.width() * 0.10;
-    // Top: horizontal then drop to bottom.
-    painter.line_segment([egui::pos2(mid, top_y), egui::pos2(right, top_y)], stroke);
-    // Bottom: stroke from left to mid (no ascender) — gives the
-    // "step" silhouette that distinguishes ⌥ from ↩.
-    painter.line_segment([egui::pos2(left, bot_y), egui::pos2(mid, bot_y)], stroke);
-    // Diagonal connecting the right end of bottom-left to the left
-    // end of top-right. Mac's ⌥ uses a slight angle here.
-    painter.line_segment([egui::pos2(mid, bot_y), egui::pos2(mid, top_y)], stroke);
+    // Proportions derived from rasterizing the canonical Mac ⌥ glyph
+    // and measuring pixel positions in the 60×52 trimmed glyph:
+    // top-LEFT bar cols 0-22 (x=0%–37%), detached upper-RIGHT cols
+    // 34-59 (x=57%–99%), bottom-RIGHT bar cols 33-59 (x=55%–99%).
+    // Visual corners (where bars meet the diagonal): top at 37%,
+    // bottom at 55%. Vertical extent matches paint_shift (15%–85%).
+    let top_y = rect.top() + h * 0.15;
+    let bot_y = rect.top() + h * 0.85;
+    let left = rect.left();
+    // The glyph is intrinsically right-heavy (bottom-right bar +
+    // detached tick + diagonal-end-on-right vs. only top-left bar
+    // on the left), so a uniform 5% inset would put its visual
+    // mass center near 54% — reading as "more space on the left"
+    // next to the centered Ctrl/Shift chips. Shifting all anchors
+    // ~3pp left aligns the mass center with the chip center.
+    let corner_top_x = left + w * 0.35;
+    let corner_bot_x = left + w * 0.52;
+    // Top-LEFT horizontal.
+    painter.line_segment(
+        [egui::pos2(left + w * 0.02, top_y), egui::pos2(corner_top_x, top_y)],
+        stroke,
+    );
+    // Diagonal connector: bar-corner top to bar-corner bottom.
+    painter.line_segment(
+        [egui::pos2(corner_top_x, top_y), egui::pos2(corner_bot_x, bot_y)],
+        stroke,
+    );
+    // Bottom-RIGHT horizontal — starts where the diagonal lands.
+    painter.line_segment(
+        [egui::pos2(corner_bot_x, bot_y), egui::pos2(left + w * 0.92, bot_y)],
+        stroke,
+    );
+    // Detached upper-right segment.
+    painter.line_segment(
+        [egui::pos2(left + w * 0.64, top_y), egui::pos2(left + w * 0.92, top_y)],
+        stroke,
+    );
 }
 
 /// Enter / Return arrow: a horizontal stroke at the top with a
