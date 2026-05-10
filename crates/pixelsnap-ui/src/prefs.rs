@@ -725,12 +725,6 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
             vernier_core::AspectMode::Reduced,
             "Always show the reduced fraction",
         );
-        ui.add_enabled_ui(false, |ui| {
-            ui.checkbox(
-                &mut s.aspect_in_distance_tool,
-                "Enable in distance tool (not yet wired)",
-            );
-        });
         ui.checkbox(&mut s.aspect_in_area_tool, "Enable in area tool");
     });
 
@@ -747,6 +741,14 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
         ui.label(caption(
             "On (default): the captured frame is locked when measure mode opens; press R to refresh manually. \
              Off: edge detection follows live screen content as the cursor moves.",
+        ));
+    });
+
+    setting(ui, |ui| {
+        ui.checkbox(&mut s.show_cursor, "Show cursor");
+        ui.label(caption(
+            "Show the white-outlined `+` marker over the cursor while measuring. \
+             Off: the marker is hidden — the measurement guides themselves (axis lines, tick caps, W×H pill) keep rendering, and so do the move/resize cursors for guides and held-rect handles.",
         ));
     });
 }
@@ -1145,6 +1147,9 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
 }
 
 fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
+    paint_figma_card(ui, s);
+    ui.add_space(18.0);
+
     setting(ui, |ui| {
         field_label(
             ui,
@@ -1167,6 +1172,148 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
         padded_text_edit(ui, &mut s.external_screenshot_command);
         ui.label(caption("Spawned via the shell, with no arguments."));
     });
+}
+
+/// Top card on the Integrations pane: heading, description, live
+/// connection status, Enable toggle, and an "Install plugin in
+/// Figma" button that copies the manifest path to the clipboard
+/// and opens Figma in the browser. Figma has no deep link to its
+/// "Import plugin from manifest" dialog, so the user still has to
+/// click through `Plugins → Development → Import plugin from
+/// manifest…` — the inline blurb spells out that path.
+fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_gray(34))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(18, 16))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(72.0, 72.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(14),
+                    egui::Color32::from_gray(50),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "F",
+                    egui::FontId::proportional(36.0),
+                    egui::Color32::from_gray(170),
+                );
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Figma integration")
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Reports the active Figma file's viewport zoom \
+                             over a localhost WebSocket so on-screen \
+                             measurements come back in canvas pixels rather \
+                             than zoomed screen pixels. Requires a one-time \
+                             plugin install per machine.",
+                        )
+                        .color(egui::Color32::from_gray(190))
+                        .size(12.5),
+                    );
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut s.figma_zoom_correction, "Enable")
+                        .on_hover_text(
+                            "When off, the daemon ignores the plugin and \
+                             measurements always reflect raw screen pixels.",
+                        );
+                    ui.add_space(8.0);
+
+                    let connected = vernier_platform::figma_bridge::current_figma_zoom()
+                        .is_some();
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(10.0, 10.0),
+                            egui::Sense::hover(),
+                        );
+                        let (color, label) = if connected {
+                            (
+                                egui::Color32::from_rgb(80, 200, 120),
+                                "Plugin connected",
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_gray(120),
+                                "Plugin not connected",
+                            )
+                        };
+                        ui.painter().circle_filled(dot_rect.center(), 5.0, color);
+                        ui.label(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::from_gray(200))
+                                .size(12.5),
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "The button below copies the plugin manifest \
+                             path to your clipboard and opens Figma. In \
+                             Figma, open the main menu, then Plugins > \
+                             Development > Import plugin from manifest..., \
+                             and paste the path.",
+                        )
+                        .color(egui::Color32::from_gray(170))
+                        .size(12.0),
+                    );
+                    ui.add_space(8.0);
+                    let manifest = vernier_platform::figma_bridge::manifest_path();
+                    ui.add_enabled_ui(manifest.is_some(), |ui| {
+                        if ui.button("Install plugin in Figma…").clicked() {
+                            if let Some(path) = manifest.as_ref() {
+                                ui.ctx().copy_text(path.display().to_string());
+                                open_figma_in_browser();
+                                log::info!(
+                                    "figma plugin: copied manifest path {} \
+                                     and launched browser",
+                                    path.display()
+                                );
+                            }
+                        }
+                    });
+                    if manifest.is_none() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Plugin files not found next to the binary. \
+                                 Set $VERNIER_FIGMA_PLUGIN_DIR to the \
+                                 directory containing manifest.json.",
+                            )
+                            .color(egui::Color32::from_rgb(220, 160, 90))
+                            .size(11.5),
+                        );
+                    }
+                });
+            });
+        });
+}
+
+/// Open the Figma web app in the user's default browser. We can't
+/// deep-link into the "Import plugin from manifest" dialog (Figma
+/// exposes no such URL), so we land the user on the recent-files
+/// page and rely on the inline instructions in the card to take
+/// them the rest of the way.
+fn open_figma_in_browser() {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("xdg-open")
+        .arg("https://www.figma.com/files/recent")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn shortcuts_section(
@@ -1427,23 +1574,30 @@ enum CaptureOutcome {
 /// captures the first held modifier (it's a press-and-hold mode,
 /// not a keypress); other shortcuts capture a normal Key event.
 fn capture_outcome(i: &mut egui::InputState, target: ShortcutId) -> Option<CaptureOutcome> {
-    // Esc with no modifiers always cancels — same gesture across every
-    // shortcut row.
-    let escaped = i.events.iter().any(|ev| {
-        matches!(
-            ev,
-            egui::Event::Key {
-                key: egui::Key::Escape,
-                pressed: true,
-                modifiers,
-                ..
-            } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
-                && !modifiers.command && !modifiers.mac_cmd
-        )
-    });
-    if escaped {
-        i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
-        return Some(CaptureOutcome::Cancel);
+    // Esc with no modifiers normally cancels the capture, except
+    // for the Clear-and-hide row whose default IS Esc — there we
+    // need to treat Esc as the binding itself, otherwise the user
+    // can never restore the default after clearing the field.
+    // Cancel that row's capture by clicking elsewhere or another
+    // shortcut button instead.
+    let esc_is_cancel = !matches!(target, ShortcutId::ClearAndHide);
+    if esc_is_cancel {
+        let escaped = i.events.iter().any(|ev| {
+            matches!(
+                ev,
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
+                    && !modifiers.command && !modifiers.mac_cmd
+            )
+        });
+        if escaped {
+            i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
+            return Some(CaptureOutcome::Cancel);
+        }
     }
     if matches!(target, ShortcutId::Crosshair) {
         // egui doesn't fire `Event::Key` for bare-modifier presses,
