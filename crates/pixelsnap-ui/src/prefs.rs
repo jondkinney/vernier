@@ -303,12 +303,18 @@ impl App for PrefsApp {
                         quit_requested = true;
                     }
                     ui.add_space(12.0);
-                    if let Some(msg) = &self.last_status {
-                        ui.label(egui::RichText::new(msg).color(egui::Color32::from_gray(180)));
+                    let dirty = self.dirty();
+                    // The right-to-left layout below renders an
+                    // "Unsaved changes" pip in the same row when
+                    // dirty; suppress the status label then so the
+                    // two don't overlap.
+                    if !dirty {
+                        if let Some(msg) = &self.last_status {
+                            ui.label(egui::RichText::new(msg).color(egui::Color32::from_gray(180)));
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
-                        let dirty = self.dirty();
                         if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
                             self.save_now();
                         }
