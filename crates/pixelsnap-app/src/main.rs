@@ -4954,36 +4954,66 @@ fn take_held_screenshot(
 
     // Always-on capture feedback: padding, retina downscale, and
     // the shutter sound apply regardless of who handles the file.
-    // Sound fires here so it plays both for the satty-handoff path
-    // and the vernier-managed save path.
+    // Sound fires here so it plays both for the handoff path and
+    // the vernier-managed save path.
     if prefs.capture_sound {
         play_shutter_sound();
     }
 
-    // Satty integration short-circuit: write the cropped frame to
-    // a temp PNG and hand it off. Satty owns post-capture file
-    // save / clipboard / notification; those vernier settings
-    // are intentionally skipped here. Padding, retina downscale,
-    // and the shutter sound have already been applied above.
-    if prefs.satty_integration {
-        let temp_path = std::env::temp_dir()
-            .join(format!("vernier-satty-{}.png", current_timestamp()));
-        img.save(&temp_path)
-            .with_context(|| format!("write {}", temp_path.display()))?;
-        let path_str = temp_path.to_string_lossy().into_owned();
-        let spawned = std::process::Command::new("satty")
-            .args(["--filename", &path_str])
-            .spawn();
-        match spawned {
-            Ok(_) => log::info!(
-                "screenshot handed off to satty: {} ({}×{})",
-                path_str, final_w, final_h
-            ),
-            Err(e) => log::warn!(
-                "satty spawn failed ({path_str}): {e:#} — temp file kept for inspection"
-            ),
+    // Handoff integration short-circuit: write the cropped frame to
+    // a temp PNG and hand it off to the configured app. The handoff
+    // app owns post-capture file save / clipboard / notification;
+    // those vernier settings are intentionally skipped here.
+    // Padding, retina downscale, and the shutter sound have already
+    // been applied above.
+    //
+    // When `handoff_command` is empty (fresh install, user hasn't
+    // touched prefs yet), fall back to the auto-detected default
+    // (currently Satty if it's on PATH) so the experience matches
+    // the old hardcoded Satty integration.
+    if prefs.handoff_enabled {
+        let (cmd, args_template, app_label) = if !prefs.handoff_command.is_empty() {
+            let label = if !prefs.handoff_app_name.is_empty() {
+                prefs.handoff_app_name.clone()
+            } else {
+                prefs.handoff_command.clone()
+            };
+            let args = if prefs.handoff_args.is_empty() {
+                "{file}".to_string()
+            } else {
+                prefs.handoff_args.clone()
+            };
+            (prefs.handoff_command.clone(), args, label)
+        } else if let Some(default) = vernier_core::detect_default_handoff() {
+            (default.command, default.args, default.name)
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+        if !cmd.is_empty() {
+            let temp_path = std::env::temp_dir()
+                .join(format!("vernier-handoff-{}.png", current_timestamp()));
+            img.save(&temp_path)
+                .with_context(|| format!("write {}", temp_path.display()))?;
+            let path_str = temp_path.to_string_lossy().into_owned();
+            let argv = vernier_core::render_args(&args_template, &path_str);
+            let spawned = std::process::Command::new(&cmd).args(&argv).spawn();
+            match spawned {
+                Ok(_) => log::info!(
+                    "screenshot handed off to {}: {} ({}×{})",
+                    app_label, path_str, final_w, final_h
+                ),
+                Err(e) => log::warn!(
+                    "handoff spawn failed (cmd={cmd:?}, file={path_str}): {e:#} — \
+                     temp file kept for inspection"
+                ),
+            }
+            return Ok(());
+        } else {
+            log::warn!(
+                "handoff enabled but no app configured and no default detected — \
+                 falling back to vernier-managed save"
+            );
         }
-        return Ok(());
     }
 
     let dir = prefs
@@ -5025,8 +5055,32 @@ fn take_held_screenshot(
     }
 
     let path_str = path.to_string_lossy().into_owned();
-    let satty_action = prefs.satty_edit_action;
+    let edit_action = prefs.handoff_edit_action;
+    // Resolve the handoff app once, on the daemon thread, so the
+    // notification thread closure owns simple Strings — no Settings
+    // borrow held across the notify-send wait.
+    let handoff_for_action = if edit_action {
+        if !prefs.handoff_command.is_empty() {
+            let label = if !prefs.handoff_app_name.is_empty() {
+                prefs.handoff_app_name.clone()
+            } else {
+                prefs.handoff_command.clone()
+            };
+            let args = if prefs.handoff_args.is_empty() {
+                "{file}".to_string()
+            } else {
+                prefs.handoff_args.clone()
+            };
+            Some((prefs.handoff_command.clone(), args, label))
+        } else {
+            vernier_core::detect_default_handoff()
+                .map(|d| (d.command, d.args, d.name))
+        }
+    } else {
+        None
+    };
     std::thread::spawn(move || {
+        let edit_label;
         let mut args: Vec<&str> = vec![
             "-i",
             &path_str,
@@ -5034,33 +5088,23 @@ fn take_held_screenshot(
             "10000",
             "Screenshot saved",
         ];
-        if satty_action {
+        if let Some((_, _, ref name)) = handoff_for_action {
+            edit_label = format!("Click to edit with {name}");
             args.insert(0, "default=Edit");
             args.insert(0, "-A");
-            args.push("Click to edit with Satty");
+            args.push(&edit_label);
         } else {
             args.push(&path_str);
         }
         let result = std::process::Command::new("notify-send").args(&args).output();
-        if !satty_action {
+        let Some((cmd, args_template, _)) = handoff_for_action else {
             return;
-        }
+        };
         if let Ok(out) = result {
             let action = String::from_utf8_lossy(&out.stdout);
             if action.trim() == "default" {
-                let _ = std::process::Command::new("satty")
-                    .args([
-                        "--filename",
-                        &path_str,
-                        "--output-filename",
-                        &path_str,
-                        "--actions-on-enter",
-                        "save-to-clipboard",
-                        "--save-after-copy",
-                        "--copy-command",
-                        "wl-copy",
-                    ])
-                    .spawn();
+                let argv = vernier_core::render_args(&args_template, &path_str);
+                let _ = std::process::Command::new(&cmd).args(&argv).spawn();
             }
         }
     });

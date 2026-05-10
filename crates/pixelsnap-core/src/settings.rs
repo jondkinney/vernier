@@ -98,18 +98,39 @@ pub struct ScreenshotSettings {
     /// file. Off = file-only.
     pub copy_to_clipboard: bool,
     /// Run the post-capture notify-send notification with an "Edit"
-    /// action that opens the file in `satty`.
-    pub satty_edit_action: bool,
-    /// When true, the daemon hands every screenshot directly to
-    /// `satty` (writing to a temp PNG and spawning satty with
-    /// `--filename`). Satty owns the file save / clipboard / share
-    /// flow, so `output_dir`, `filename_template`, `copy_to_clipboard`,
-    /// and `satty_edit_action` are skipped. `padding_px`,
-    /// `retina_downscale`, and `capture_sound` still apply because
-    /// they shape the image bytes (or the local audio feedback)
-    /// regardless of who saves the file. Mirrors macOS macOS
-    /// CleanShot X integration.
-    pub satty_integration: bool,
+    /// action that opens the file in the configured handoff app.
+    /// Renamed from `satty_edit_action` (alias kept for old configs).
+    #[serde(alias = "satty_edit_action")]
+    pub handoff_edit_action: bool,
+    /// When true, the daemon hands every screenshot directly to the
+    /// configured `handoff_command` (writing to a temp PNG and
+    /// spawning the app with [`crate::render_args`] applied to
+    /// `handoff_args`). The handoff app then owns the file save /
+    /// clipboard / share flow, so `output_dir`, `filename_template`,
+    /// `copy_to_clipboard`, and `handoff_edit_action` are skipped.
+    /// `padding_px`, `retina_downscale`, and `capture_sound` still
+    /// apply because they shape the image bytes (or the local audio
+    /// feedback) regardless of who saves the file. Renamed from
+    /// `satty_integration` (alias kept for old configs).
+    #[serde(alias = "satty_integration")]
+    pub handoff_enabled: bool,
+    /// Binary to spawn for handoff — absolute path or PATH-resolved
+    /// name. Empty defers to [`crate::detect_default_handoff`]
+    /// (currently Satty when installed) so a fresh install works
+    /// out-of-the-box.
+    pub handoff_command: String,
+    /// Display name shown on the prefs card and in the notification's
+    /// `Open in <name>` action. Empty falls back to the detected
+    /// default's name (or the binary basename).
+    pub handoff_app_name: String,
+    /// Whitespace-tokenized arg template for the handoff spawn.
+    /// `{file}` is substituted with the captured PNG path. Defaults
+    /// come from the chosen app's `.desktop` Exec line.
+    pub handoff_args: String,
+    /// Absolute path to the handoff app's icon (SVG/PNG). Resolved
+    /// from the chosen app's `.desktop` `Icon=` field at pick time;
+    /// the prefs UI rasterizes it for the integration card.
+    pub handoff_icon_path: String,
 }
 
 impl Default for ScreenshotSettings {
@@ -121,8 +142,12 @@ impl Default for ScreenshotSettings {
             retina_downscale: false,
             capture_sound: true,
             copy_to_clipboard: true,
-            satty_edit_action: true,
-            satty_integration: true,
+            handoff_edit_action: true,
+            handoff_enabled: true,
+            handoff_command: String::new(),
+            handoff_app_name: String::new(),
+            handoff_args: String::new(),
+            handoff_icon_path: String::new(),
         }
     }
 }

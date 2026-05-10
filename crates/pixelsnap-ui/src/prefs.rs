@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
 use vernier_core::{
-    AppearanceSettings, ColorRgba, CopyFormat, GeneralSettings, IntegrationSettings,
+    AppearanceSettings, ColorRgba, CopyFormat, GeneralSettings, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
     ToleranceSettings, Units,
 };
@@ -85,14 +85,20 @@ struct PrefsApp {
     on_quit: Box<dyn FnMut() + Send>,
     last_status: Option<String>,
     logo: Option<egui::TextureHandle>,
-    /// Cached Satty app-icon texture used by the Screenshots pane's
-    /// integration card. `None` if `/usr/share/icons/.../satty.svg`
-    /// isn't installed or fails to rasterize.
-    satty_icon: Option<egui::TextureHandle>,
+    /// Cached icon texture for the configured handoff app, keyed on
+    /// the `handoff_icon_path` it was loaded from. Reloaded by
+    /// [`PrefsApp::sync_handoff_icon`] when the path changes (e.g.
+    /// after the user browses to a different binary). `None` when
+    /// no icon was resolvable for the chosen app.
+    handoff_icon: Option<(String, egui::TextureHandle)>,
     /// Receives the path the user picked from the folder dialog.
     /// `Some(rx)` while the dialog is open; cleared once the user
     /// either picks a folder or cancels.
     folder_pick: Option<Receiver<Option<PathBuf>>>,
+    /// Receives the binary the user picked for the screenshot
+    /// handoff app. Mirror of [`Self::folder_pick`] but for
+    /// `pick_file` instead of `pick_folder`.
+    handoff_pick: Option<Receiver<Option<PathBuf>>>,
     /// While `Some(id)`, the prefs window is in capture mode for
     /// the matching Shortcuts row — the next key press (with
     /// modifiers) is recorded as that shortcut's accelerator.
@@ -121,7 +127,6 @@ impl PrefsApp {
     ) -> Self {
         apply_style(&cc.egui_ctx);
         let logo = load_logo_texture(&cc.egui_ctx);
-        let satty_icon = load_satty_texture(&cc.egui_ctx);
         let initial = Settings::load().unwrap_or_default();
         let now = Instant::now();
         Self {
@@ -132,8 +137,9 @@ impl PrefsApp {
             on_quit,
             last_status: None,
             logo,
-            satty_icon,
+            handoff_icon: None,
             folder_pick: None,
+            handoff_pick: None,
             capturing_shortcut: None,
             static_bind_warning,
             // Assume alive on startup — `run_prefs_window` either
@@ -268,6 +274,72 @@ impl App for PrefsApp {
             }
         }
 
+        // Same drain pattern for the screenshot-handoff binary picker.
+        // On a successful pick we resolve the binary's metadata
+        // (name / icon / args) via the .desktop scanner and copy it
+        // into the edited settings; the icon refresh below picks
+        // up the new path on the next frame.
+        if let Some(rx) = self.handoff_pick.as_ref() {
+            match rx.try_recv() {
+                Ok(Some(path)) => {
+                    let info = vernier_core::lookup_for_binary(&path).unwrap_or_else(|| {
+                        // The picker can hand us a path that doesn't
+                        // resolve (e.g. the user pointed at a file in
+                        // a directory we can't read after the dialog
+                        // closed). Fall back to a stub so the UI
+                        // still updates with what they chose.
+                        let basename = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                        HandoffApp {
+                            name: basename,
+                            command: path.to_string_lossy().into_owned(),
+                            args: "{file}".to_string(),
+                            icon_path: String::new(),
+                        }
+                    });
+                    apply_handoff_app(&mut self.edited.screenshots, info);
+                    self.handoff_pick = None;
+                }
+                Ok(None) => {
+                    self.handoff_pick = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.handoff_pick = None;
+                }
+            }
+        }
+
+        // Keep the cached handoff icon in sync with the configured
+        // path. We compute the *effective* icon path for display:
+        // when nothing is configured yet, fall back to the auto-
+        // detected default's icon (so the card paints with Satty
+        // on a fresh install without persisting it). Reload only on
+        // path change to avoid rasterizing every frame.
+        let effective_icon_path = if self.edited.screenshots.handoff_icon_path.is_empty()
+            && self.edited.screenshots.handoff_command.is_empty()
+        {
+            vernier_core::detect_default_handoff()
+                .map(|d| d.icon_path)
+                .unwrap_or_default()
+        } else {
+            self.edited.screenshots.handoff_icon_path.clone()
+        };
+        let needs_reload = match &self.handoff_icon {
+            Some((cached, _)) => cached.as_str() != effective_icon_path,
+            None => !effective_icon_path.is_empty(),
+        };
+        if needs_reload {
+            self.handoff_icon = if effective_icon_path.is_empty() {
+                None
+            } else {
+                load_handoff_icon_texture(ctx, &effective_icon_path)
+                    .map(|tex| (effective_icon_path.clone(), tex))
+            };
+        }
+
         egui::SidePanel::left("prefs_sidebar")
             .resizable(false)
             .default_width(200.0)
@@ -378,7 +450,8 @@ impl App for PrefsApp {
                             ui,
                             &mut self.edited.screenshots,
                             &mut self.folder_pick,
-                            self.satty_icon.as_ref(),
+                            &mut self.handoff_pick,
+                            self.handoff_icon.as_ref().map(|(_, tex)| tex),
                         ),
                         Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
                         Section::Appearance => {
@@ -671,11 +744,26 @@ fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("vernier_logo", image, egui::TextureOptions::LINEAR))
 }
 
-/// Best-effort load of Satty's app icon from the standard
-/// hicolor theme location. Renders the SVG at 128px square so
-/// it stays sharp when the prefs window is HiDPI.
-fn load_satty_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let path = "/usr/share/icons/hicolor/scalable/apps/satty.svg";
+/// Best-effort load of the handoff app's icon. Currently SVG-only
+/// (rasterized through `vernier-platform`); PNG support can be
+/// bolted on later by routing through the `image` crate. Returns
+/// `None` for non-SVG paths or anything that fails to parse —
+/// callers fall back to a placeholder rect.
+fn load_handoff_icon_texture(
+    ctx: &egui::Context,
+    path: &str,
+) -> Option<egui::TextureHandle> {
+    if path.is_empty() {
+        return None;
+    }
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".svg") {
+        // Most app packages ship an SVG under
+        // /usr/share/icons/hicolor/scalable/apps/ and resolve_icon
+        // prefers it; the rare PNG-only app just renders the
+        // placeholder square.
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let size = 128u32;
     let rgba = vernier_platform::rasterize_svg(&bytes, size)?;
@@ -683,7 +771,17 @@ fn load_satty_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
         return None;
     }
     let image = egui::ColorImage::from_rgba_unmultiplied([size as usize, size as usize], &rgba);
-    Some(ctx.load_texture("satty_icon", image, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture("handoff_icon", image, egui::TextureOptions::LINEAR))
+}
+
+/// Copy a [`HandoffApp`]'s fields into `s`. Used both when the user
+/// browses to a binary and when the prefs UI auto-fills the
+/// detected default for display.
+fn apply_handoff_app(s: &mut ScreenshotSettings, app: HandoffApp) {
+    s.handoff_command = app.command;
+    s.handoff_app_name = app.name;
+    s.handoff_args = app.args;
+    s.handoff_icon_path = app.icon_path;
 }
 
 fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
@@ -773,9 +871,10 @@ fn screenshots_section(
     ui: &mut egui::Ui,
     s: &mut ScreenshotSettings,
     folder_pick: &mut Option<Receiver<Option<PathBuf>>>,
-    satty_icon: Option<&egui::TextureHandle>,
+    handoff_pick: &mut Option<Receiver<Option<PathBuf>>>,
+    handoff_icon: Option<&egui::TextureHandle>,
 ) {
-    paint_satty_card(ui, &mut s.satty_integration, satty_icon);
+    paint_handoff_card(ui, s, handoff_icon, handoff_pick);
     ui.add_space(18.0);
 
     // Always-active settings — these affect the image bytes (or the
@@ -821,8 +920,8 @@ fn screenshots_section(
 
     // Vernier-managed post-capture flow: file save location,
     // template, clipboard copy, edit notification. Greyed out when
-    // satty integration is on — satty owns these.
-    let detail_enabled = !s.satty_integration;
+    // the handoff is on — the chosen app owns these instead.
+    let detail_enabled = !s.handoff_enabled;
     ui.add_enabled_ui(detail_enabled, |ui| {
     setting(ui, |ui| {
         field_label(ui, "Output directory");
@@ -877,23 +976,59 @@ fn screenshots_section(
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.copy_to_clipboard, "Copy image to clipboard");
+        let app_name = handoff_label_for(s);
         ui.checkbox(
-            &mut s.satty_edit_action,
-            "Show \"Edit\" action in notification (opens in Satty)",
+            &mut s.handoff_edit_action,
+            format!("Show \"Edit\" action in notification (opens in {app_name})"),
         );
     });
     });
 }
 
-/// Top card on the Screenshots pane: Satty icon, heading,
-/// description, Enable checkbox. When checked, the daemon hands
-/// every screenshot off to satty (which handles save / clipboard
-/// / share workflows itself), and the rest of the pane greys out.
-fn paint_satty_card(
+/// Display name for the configured (or auto-detected) handoff app.
+/// Used in inline labels like "opens in Satty". Falls back to a
+/// generic phrase when no app is resolvable.
+fn handoff_label_for(s: &ScreenshotSettings) -> String {
+    if !s.handoff_app_name.is_empty() {
+        return s.handoff_app_name.clone();
+    }
+    if !s.handoff_command.is_empty() {
+        return PathBuf::from(&s.handoff_command)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.handoff_command.clone());
+    }
+    if let Some(default) = vernier_core::detect_default_handoff() {
+        return default.name;
+    }
+    "the handoff app".to_string()
+}
+
+/// Top card on the Screenshots pane: handoff-app icon, heading,
+/// chosen-app row with a Browse button, description, and the Enable
+/// checkbox. When the checkbox is on, the daemon hands every
+/// screenshot off to the configured app (which handles save /
+/// clipboard / share workflows itself), and the rest of the pane
+/// greys out.
+///
+/// When no app has been picked yet, falls back to the auto-detected
+/// default (currently Satty if it's installed) for display purposes
+/// only — the settings stay empty until the user explicitly Browses
+/// and Saves, so we don't dirty the prefs window on first open.
+fn paint_handoff_card(
     ui: &mut egui::Ui,
-    enabled: &mut bool,
+    s: &mut ScreenshotSettings,
     icon: Option<&egui::TextureHandle>,
+    handoff_pick: &mut Option<Receiver<Option<PathBuf>>>,
 ) {
+    let app_name = handoff_label_for(s);
+    let command_display = if !s.handoff_command.is_empty() {
+        s.handoff_command.clone()
+    } else {
+        vernier_core::detect_default_handoff()
+            .map(|d| d.command)
+            .unwrap_or_default()
+    };
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_gray(34))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
@@ -908,7 +1043,8 @@ fn paint_satty_card(
                     ui.add_space(14.0);
                 } else {
                     // Placeholder square so the layout stays consistent
-                    // even when satty isn't installed.
+                    // when no app is configured or its icon couldn't
+                    // be resolved.
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(72.0, 72.0),
                         egui::Sense::hover(),
@@ -922,22 +1058,79 @@ fn paint_satty_card(
                 }
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Satty integration")
+                        egui::RichText::new("Screenshot handoff")
                             .size(16.0)
                             .strong(),
                     );
                     ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("App: {app_name}"))
+                                .color(egui::Color32::from_gray(220))
+                                .size(13.0),
+                        );
+                        ui.add_space(8.0);
+                        // Disabled while a previous picker is open
+                        // (rfd doesn't gate concurrent calls and
+                        // we'd get stacked dialogs).
+                        let pick_enabled = handoff_pick.is_none();
+                        if ui
+                            .add_enabled(pick_enabled, egui::Button::new("Browse…"))
+                            .clicked()
+                        {
+                            let starting = if !s.handoff_command.is_empty() {
+                                PathBuf::from(&s.handoff_command)
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                            } else {
+                                None
+                            };
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let mut dialog = rfd::FileDialog::new()
+                                    .set_title("Choose screenshot app");
+                                let start = starting
+                                    .filter(|p| p.exists())
+                                    .unwrap_or_else(|| PathBuf::from("/usr/bin"));
+                                if start.exists() {
+                                    dialog = dialog.set_directory(start);
+                                }
+                                let _ = tx.send(dialog.pick_file());
+                            });
+                            *handoff_pick = Some(rx);
+                        }
+                        if !s.handoff_command.is_empty()
+                            && ui.button("Reset").clicked()
+                        {
+                            // Clear back to "auto-detect default" so
+                            // the user can reset without remembering
+                            // which app they wanted; the card then
+                            // falls back to Satty (if installed).
+                            s.handoff_command.clear();
+                            s.handoff_app_name.clear();
+                            s.handoff_args.clear();
+                            s.handoff_icon_path.clear();
+                        }
+                    });
+                    if !command_display.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&command_display)
+                                .color(egui::Color32::from_gray(160))
+                                .size(11.5),
+                        );
+                    }
+                    ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new(
-                            "Hand the captured region straight to Satty for \
-                             annotation, save, and share. While enabled, the \
-                             options below are managed by Satty.",
-                        )
+                        egui::RichText::new(format!(
+                            "Hand the captured region straight to {app_name} \
+                             for annotation, save, and share. While enabled, \
+                             the options below are managed by {app_name}."
+                        ))
                         .color(egui::Color32::from_gray(190))
                         .size(12.5),
                     );
                     ui.add_space(8.0);
-                    ui.checkbox(enabled, "Enable");
+                    ui.checkbox(&mut s.handoff_enabled, "Enable");
                 });
             });
         });
