@@ -335,7 +335,7 @@ impl App for PrefsApp {
                             ui.add_space(2.0);
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 160, 50),
-                                "unsaved changes",
+                                "Unsaved changes",
                             );
                         }
                     });
