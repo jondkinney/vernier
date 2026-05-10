@@ -41,9 +41,6 @@ pub struct GeneralSettings {
     pub display_wh_indicators: bool,
     /// Aspect-ratio reporting style for the area tool.
     pub aspect_mode: crate::AspectMode,
-    /// Show the aspect-ratio readout in the distance / single-axis
-    /// HUD. (No-op until single-axis aspect rendering ships.)
-    pub aspect_in_distance_tool: bool,
     /// Show the aspect-ratio pill underneath area-tool rectangles.
     pub aspect_in_area_tool: bool,
     /// Snap distance / area drags to placed reference guides.
@@ -53,6 +50,14 @@ pub struct GeneralSettings {
     /// false, the daemon refreshes the frame on every pointer move
     /// so edge detection follows live content.
     pub freeze_screen: bool,
+    /// Show the live measurement crosshair (axis lines + tick
+    /// caps + `+` cursor marker + W×H pill) while measuring. When
+    /// false, the renderer skips that whole block — the user just
+    /// sees the held rects, guides, and stuck measurements they've
+    /// already placed. The move-cursor (placing/dragging guides)
+    /// and resize-cursors (held-rect handles) still appear because
+    /// they're separate code paths tied to specific interactions.
+    pub show_cursor: bool,
 }
 
 impl Default for GeneralSettings {
@@ -63,10 +68,10 @@ impl Default for GeneralSettings {
             display_units: true,
             display_wh_indicators: false,
             aspect_mode: crate::AspectMode::Automatic,
-            aspect_in_distance_tool: false,
             aspect_in_area_tool: true,
             snap_to_guides: true,
             freeze_screen: true,
+            show_cursor: true,
         }
     }
 }
@@ -273,6 +278,21 @@ pub struct IntegrationSettings {
     /// External tool spawned by the right-click menu's "Open
     /// Screenshot Tool" action.
     pub external_screenshot_command: String,
+    /// Divide on-screen measurements by the current Figma viewport
+    /// zoom so dimensions reflect canvas pixels at any zoom level.
+    /// Requires the companion Figma plugin (`figma-plugin/`) to be
+    /// running in the active Figma file.
+    pub figma_zoom_correction: bool,
+    /// TCP port the Figma plugin connects to. Must match
+    /// `figma-plugin/ui.html`.
+    pub figma_bridge_port: u16,
+    /// Window classes treated as "browser tab" candidates for
+    /// Figma detection. The daemon checks `class` against this list
+    /// and matches `title` against the suffix `figma_title_suffix`.
+    pub figma_browser_classes: Vec<String>,
+    /// Title suffix that marks a Figma tab. Default ` – Figma`
+    /// (en-dash) matches Figma's current tab-title convention.
+    pub figma_title_suffix: String,
 }
 
 impl Default for IntegrationSettings {
@@ -280,6 +300,23 @@ impl Default for IntegrationSettings {
         Self {
             copy_dimensions_format: CopyFormat::WidthCommaHeight,
             external_screenshot_command: "omarchy-cmd-screenshot".to_string(),
+            figma_zoom_correction: true,
+            figma_bridge_port: 8765,
+            figma_browser_classes: vec![
+                "chromium".into(),
+                "Chromium".into(),
+                "Google-chrome".into(),
+                "google-chrome".into(),
+                "firefox".into(),
+                "Firefox".into(),
+                "Brave-browser".into(),
+                "brave-browser".into(),
+                "zen".into(),
+                "zen-alpha".into(),
+                "zen-browser".into(),
+                "Vivaldi-stable".into(),
+            ],
+            figma_title_suffix: " \u{2013} Figma".into(),
         }
     }
 }

@@ -392,6 +392,12 @@ struct WaylandState {
     pointers: Vec<wl_pointer::WlPointer>,
     /// Live keyboards, similarly held alive.
     keyboards: Vec<wl_keyboard::WlKeyboard>,
+    /// Calloop loop handle, populated once the event loop is built
+    /// in `init_wayland_thread`. Required for
+    /// `seat_state.get_keyboard_with_repeat`, which delivers
+    /// auto-repeat events while a key is held — without it,
+    /// holding e.g. an arrow key only fires once.
+    loop_handle: Option<calloop::LoopHandle<'static, WaylandState>>,
     /// `wp_cursor_shape_manager_v1` global if the compositor advertises
     /// it (Hyprland does). Used to display the user's actual theme
     /// pointer instead of a hand-drawn arrow.
@@ -487,6 +493,7 @@ fn run_event_loop(
         seat_state,
         pointers: Vec::new(),
         keyboards: Vec::new(),
+        loop_handle: None,
         cursor_shape_manager,
         pointer_shape_devices: HashMap::new(),
         last_pointer_enter: None,
@@ -512,6 +519,9 @@ fn run_event_loop(
     let mut event_loop: EventLoop<WaylandState> = EventLoop::try_new()
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("event loop: {e}")))?;
     let lh = event_loop.handle();
+    // Hand the loop handle to the state so the next keyboard-add
+    // can register auto-repeat against it.
+    state.loop_handle = Some(lh.clone());
 
     WaylandSource::new(conn, event_queue)
         .insert(lh.clone())
@@ -874,7 +884,36 @@ impl SeatHandler for WaylandState {
             }
         }
         if capability == Capability::Keyboard {
-            match self.seat_state.get_keyboard(qh, &seat, None) {
+            // Prefer get_keyboard_with_repeat so SCTK delivers
+            // software auto-repeat events on the calloop source —
+            // matches the compositor's repeat rate / delay so
+            // holding an arrow key nudges continuously. Falls back
+            // to the no-repeat variant only if the loop handle
+            // wasn't initialized yet (shouldn't happen in practice
+            // since init_wayland_thread sets it before the seat
+            // capabilities round-trip).
+            let result = if let Some(lh) = self.loop_handle.clone() {
+                self.seat_state.get_keyboard_with_repeat(
+                    qh,
+                    &seat,
+                    None,
+                    lh,
+                    Box::new(|state, _kbd, event| {
+                        let monitor = state.first_overlay_monitor();
+                        if let Some(monitor) = monitor {
+                            let _ = state.events_tx.send(PlatformEvent::KeyboardKey {
+                                monitor,
+                                keysym: event.keysym.raw(),
+                                pressed: true,
+                                is_repeat: true,
+                            });
+                        }
+                    }),
+                )
+            } else {
+                self.seat_state.get_keyboard(qh, &seat, None)
+            };
+            match result {
                 Ok(k) => self.keyboards.push(k),
                 Err(e) => log::warn!("get_keyboard: {e}"),
             }
@@ -1125,6 +1164,7 @@ impl KeyboardHandler for WaylandState {
                 monitor,
                 keysym: event.keysym.raw(),
                 pressed: true,
+                is_repeat: false,
             });
         }
     }
@@ -1142,6 +1182,7 @@ impl KeyboardHandler for WaylandState {
                 monitor,
                 keysym: event.keysym.raw(),
                 pressed: false,
+                is_repeat: false,
             });
         }
     }
@@ -1151,10 +1192,22 @@ impl KeyboardHandler for WaylandState {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
-        // Auto-repeat events: ignore. We only care about discrete press/release
-        // for ESC and friends.
+        // Auto-repeat fires at the compositor's repeat rate while a
+        // key is held. We forward it as `pressed: true, is_repeat:
+        // true` so handlers that should self-fire (nudge, tolerance
+        // up/down) opt in, while one-shots (clear-and-hide,
+        // capture, color toggle, etc.) ignore it on the daemon side.
+        let monitor = self.first_overlay_monitor();
+        if let Some(monitor) = monitor {
+            let _ = self.events_tx.send(PlatformEvent::KeyboardKey {
+                monitor,
+                keysym: event.keysym.raw(),
+                pressed: true,
+                is_repeat: true,
+            });
+        }
     }
     fn update_modifiers(
         &mut self,
@@ -1583,10 +1636,11 @@ fn render_hud_strokes(
     // badge, or guide. Toast comes after so it sits above the
     // cursor too — fine, toast is a transient status message and
     // the cursor isn't the focus when it's up.
+    // The live measurement crosshair (axis lines + tick caps + W×H
+    // pill) always renders — that's the actual measurement, not the
+    // cursor. Inside `draw_hover_indicators`, the white-outlined `+`
+    // marker (the cursor itself) is gated by `hud.show_cursor`.
     if let HudKind::Hover { cursor, edges } = &hud.kind {
-        // Shift-held alignment mode: the full-screen crosshair always
-        // shows, regardless of any hover-arrow or move-cursor swap
-        // — alignment relies on seeing those lines continuously.
         if hud.align_mode {
             draw_hover_indicators(
                 &mut pixmap,
@@ -1603,6 +1657,8 @@ fn render_hud_strokes(
                 true,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
+                hud.measurement_format.dimension_divisor,
+                hud.show_cursor,
             );
         } else if hud.move_cursor_at.is_some() {
             // The dedicated draw_move_cursor block at the end of
@@ -1627,6 +1683,8 @@ fn render_hud_strokes(
                 true,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
+                hud.measurement_format.dimension_divisor,
+                hud.show_cursor,
             );
         }
     }
@@ -1660,6 +1718,8 @@ fn render_hud_strokes(
                 false,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
+                hud.measurement_format.dimension_divisor,
+                hud.show_cursor,
             );
         }
     }
@@ -1704,7 +1764,45 @@ fn render_hud_strokes(
             scale as f32,
         );
     }
+    if let Some(text) = hud.corner_indicator.as_deref() {
+        draw_corner_indicator(
+            &mut pixmap,
+            &mut pills,
+            text,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
     pills
+}
+
+/// Top-right pill that signals an active integration is rewriting
+/// the on-screen values (e.g. `F · 200%` while the Figma plugin is
+/// connected and a Figma tab is focused). Drawn last so it sits
+/// above measurement HUD elements but below the context menu.
+fn draw_corner_indicator(
+    pixmap: &mut tiny_skia::PixmapMut,
+    pills: &mut Vec<PillLayout>,
+    text: &str,
+    buf_w: f32,
+    buf_h: f32,
+    scale_f: f32,
+) {
+    let _ = buf_h;
+    let margin = 12.0 * scale_f;
+    push_pill(
+        pixmap,
+        pills,
+        text.to_string(),
+        buf_w - margin,
+        margin,
+        PillAnchor::AnchorTopRight,
+        buf_w,
+        buf_h,
+        scale_f,
+        TEXT_LOGICAL_PX,
+    );
 }
 
 /// 2-direction resize cursor — black bar with arrowheads at both
@@ -2183,6 +2281,8 @@ fn draw_hover_indicators(
     show_dim_pill: bool,
     wh_indicators: bool,
     unit_suffix: &str,
+    dimension_divisor: f64,
+    show_cursor: bool,
 ) {
     use tiny_skia::*;
     let scale_f = scale as f32;
@@ -2267,50 +2367,60 @@ fn draw_hover_indicators(
             // mark visible against dark UI; the black core makes it
             // pop on light UI. Drawn after the axis lines so it sits
             // on top of their crossing point.
-            let arm = 6.0 * scale_f;
-            let mut pb = PathBuilder::new();
-            pb.move_to(cx - arm, cy);
-            pb.line_to(cx + arm, cy);
-            pb.move_to(cx, cy - arm);
-            pb.line_to(cx, cy + arm);
-            if let Some(path) = pb.finish() {
-                // Hard physical-pixel widths: 4 px white outline,
-                // 2 px black core, regardless of buffer scale.
-                let mut outline = Paint::default();
-                outline.set_color_rgba8(255, 255, 255, 255);
-                outline.anti_alias = true;
-                pixmap.stroke_path(
-                    &path,
-                    &outline,
-                    &Stroke {
-                        // Total stroke = black core 2 + 3 px white
-                        // halo on each side.
-                        width: 8.0,
-                        line_cap: tiny_skia::LineCap::Round,
-                        ..Default::default()
-                    },
-                    Transform::identity(),
-                    None,
-                );
-                let mut fill = Paint::default();
-                fill.set_color_rgba8(0, 0, 0, 255);
-                fill.anti_alias = true;
-                pixmap.stroke_path(
-                    &path,
-                    &fill,
-                    &Stroke {
-                        width: 2.0,
-                        line_cap: tiny_skia::LineCap::Round,
-                        ..Default::default()
-                    },
-                    Transform::identity(),
-                    None,
-                );
+            //
+            // Gated by `show_cursor` (the prefs "Show cursor" toggle)
+            // — the rest of this function (axis lines, tick caps,
+            // W×H pill) is the measurement HUD itself and stays
+            // visible either way.
+            if show_cursor {
+                let arm = 6.0 * scale_f;
+                let mut pb = PathBuilder::new();
+                pb.move_to(cx - arm, cy);
+                pb.line_to(cx + arm, cy);
+                pb.move_to(cx, cy - arm);
+                pb.line_to(cx, cy + arm);
+                if let Some(path) = pb.finish() {
+                    // Hard physical-pixel widths: 4 px white outline,
+                    // 2 px black core, regardless of buffer scale.
+                    let mut outline = Paint::default();
+                    outline.set_color_rgba8(255, 255, 255, 255);
+                    outline.anti_alias = true;
+                    pixmap.stroke_path(
+                        &path,
+                        &outline,
+                        &Stroke {
+                            // Total stroke = black core 2 + 3 px white
+                            // halo on each side.
+                            width: 8.0,
+                            line_cap: tiny_skia::LineCap::Round,
+                            ..Default::default()
+                        },
+                        Transform::identity(),
+                        None,
+                    );
+                    let mut fill = Paint::default();
+                    fill.set_color_rgba8(0, 0, 0, 255);
+                    fill.anti_alias = true;
+                    pixmap.stroke_path(
+                        &path,
+                        &fill,
+                        &Stroke {
+                            width: 2.0,
+                            line_cap: tiny_skia::LineCap::Round,
+                            ..Default::default()
+                        },
+                        Transform::identity(),
+                        None,
+                    );
+                }
             }
 
-            // Width / height in LOGICAL pixels. Buffer span / scale.
-            let w_px = ((right_x - left_x) / scale_f).round() as u32;
-            let h_px = ((down_y - up_y) / scale_f).round() as u32;
+            // Width / height in LOGICAL pixels. Buffer span / scale,
+            // then divided by the configured dimension divisor (1.0
+            // by default, > 1.0 when Figma zoom-correction is active).
+            let div = if dimension_divisor > 0.0 { dimension_divisor as f32 } else { 1.0 };
+            let w_px = (((right_x - left_x) / scale_f) / div).round() as u32;
+            let h_px = (((down_y - up_y) / scale_f) / div).round() as u32;
 
             // "W × H" with the Unicode multiplication sign. The
             // optional unit suffix (e.g. "px") trails the second
@@ -2561,6 +2671,8 @@ enum PillAnchor {
     Centered,
     /// Position pill so its top-center lands at (anchor_x, anchor_y).
     AnchorTop,
+    /// Position pill so its top-right lands at (anchor_x, anchor_y).
+    AnchorTopRight,
     /// Position pill so its left edge sits at `anchor_x` and its
     /// vertical center sits at `anchor_y`.
     LeftCenter,
@@ -2601,6 +2713,7 @@ fn push_pill(
     let (mut pill_x, mut pill_y) = match anchor {
         PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
         PillAnchor::AnchorTop => (anchor_x - pill_w * 0.5, anchor_y),
+        PillAnchor::AnchorTopRight => (anchor_x - pill_w, anchor_y),
         PillAnchor::LeftCenter => (anchor_x, anchor_y - pill_h * 0.5),
         PillAnchor::BelowRight(off) => (anchor_x + off, anchor_y + off),
     };
@@ -2878,17 +2991,23 @@ fn draw_toast(
 /// add it for single-value pills and omit it for W×H pills.
 fn format_number(value_logical: f64, fmt: &crate::HudMeasurementFormat) -> String {
     use crate::HudRounding::*;
+    let divisor = if fmt.dimension_divisor > 0.0 {
+        fmt.dimension_divisor
+    } else {
+        1.0
+    };
+    let value = value_logical / divisor;
     match fmt.rounding {
         Points => {
-            let r = (value_logical * 10.0).round() / 10.0;
+            let r = (value * 10.0).round() / 10.0;
             if (r - r.round()).abs() < f64::EPSILON {
                 format!("{}", r as i64)
             } else {
                 format!("{r:.1}")
             }
         }
-        PointsRounded => format!("{}", value_logical.round() as i64),
-        ScreenPixels => format!("{}", (value_logical * fmt.scale_factor).round() as i64),
+        PointsRounded => format!("{}", value.round() as i64),
+        ScreenPixels => format!("{}", (value * fmt.scale_factor).round() as i64),
     }
 }
 

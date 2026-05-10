@@ -156,6 +156,18 @@ pub struct Hud {
     /// rounding mode). Defaults to integer logical pixels with a
     /// "px" suffix.
     pub measurement_format: HudMeasurementFormat,
+    /// Show the live measurement crosshair (axis lines + tick caps
+    /// + `+` marker + W×H pill) on hover/held screens. When false
+    /// the renderer skips that whole block. The move cursor
+    /// (guides) and resize cursors (held-rect handles) are NOT
+    /// gated by this — they remain visible since they're the
+    /// only feedback for those interactions.
+    pub show_cursor: bool,
+    /// Optional small "F · 200%" pill rendered in the top-right
+    /// corner. Set when the Figma plugin is connected and the
+    /// active window looks like a Figma tab — signals that the
+    /// dimensions are being scaled to canvas pixels.
+    pub corner_indicator: Option<String>,
 }
 
 /// Knobs the renderer reads to format measurement labels.
@@ -177,6 +189,11 @@ pub struct HudMeasurementFormat {
     /// match exists; Standard always picks a common ratio; Reduced
     /// always picks the reduced fraction.
     pub aspect_mode: vernier_core::AspectMode,
+    /// Divide raw on-screen pixel values by this before rounding so
+    /// dimensions reflect canvas-coordinate pixels (Figma plugin
+    /// integration). 1.0 = no scaling; 2.0 = halve every value
+    /// because the user is viewing at 200% zoom.
+    pub dimension_divisor: f64,
 }
 
 impl Default for HudMeasurementFormat {
@@ -188,6 +205,7 @@ impl Default for HudMeasurementFormat {
             wh_indicators: false,
             aspect_in_area: true,
             aspect_mode: vernier_core::AspectMode::Automatic,
+            dimension_divisor: 1.0,
         }
     }
 }
@@ -343,6 +361,8 @@ impl Hud {
             context_menu: None,
             guide_color: Color::rgba(0x42, 0x9C, 0xFF, 0xF5),
             measurement_format: HudMeasurementFormat::default(),
+            show_cursor: true,
+            corner_indicator: None,
         }
     }
 }
@@ -664,11 +684,15 @@ pub enum PlatformEvent {
     },
     /// A keyboard key was pressed/released while the overlay had focus.
     /// `keysym` is an XKB keysym; `pressed` distinguishes press from
-    /// release.
+    /// release. `is_repeat` is true for auto-repeat events fired by
+    /// the compositor while the key is held — daemon handlers opt
+    /// into repeats per-action (nudge / tolerance ±) so things like
+    /// double-tap-to-clear don't accidentally self-trigger.
     KeyboardKey {
         monitor: MonitorId,
         keysym: u32,
         pressed: bool,
+        is_repeat: bool,
     },
     Quit,
 }
