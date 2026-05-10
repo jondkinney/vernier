@@ -7,6 +7,7 @@ pub mod color;
 pub mod edge;
 pub mod frame;
 pub mod geometry;
+pub mod handoff;
 pub mod measurement;
 pub mod settings;
 
@@ -18,6 +19,7 @@ pub use edge::{
 };
 pub use frame::FrameView;
 pub use geometry::{Px, PxRect};
+pub use handoff::{detect_default as detect_default_handoff, lookup_for_binary, render_args, resolve_icon, HandoffApp};
 pub use measurement::{
     axis_biased_snap, best_snap, Axis, Measurement, Mode as InteractionMode, SnapPoint,
 };
