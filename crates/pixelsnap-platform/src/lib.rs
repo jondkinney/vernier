@@ -15,6 +15,47 @@ pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
     tray::render_app_icon_rgba(size)
 }
 
+/// Rasterize an SVG (`svg_bytes`) into a `size × size` RGBA8
+/// non-premultiplied buffer, fitting the SVG into the square with
+/// uniform scaling. Returns `None` if the SVG can't be parsed or
+/// the pixmap can't be allocated. Used by the prefs window to
+/// surface third-party app icons (e.g. Satty) loaded from
+/// `/usr/share/icons/hicolor/.../apps/*.svg`.
+pub fn rasterize_svg(svg_bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    // Use resvg's re-exported tiny-skia / usvg types directly —
+    // resvg pins its own version and mixing 0.11 vs 0.12 fails to
+    // compile.
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg_bytes, &opts).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+    let svg_size = tree.size();
+    let svg_max = svg_size.width().max(svg_size.height()).max(1.0);
+    let scale = size as f32 / svg_max;
+    // Center the (uniformly scaled) SVG inside the square.
+    let dx = (size as f32 - svg_size.width() * scale) * 0.5;
+    let dy = (size as f32 - svg_size.height() * scale) * 0.5;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia pixmaps are RGBA premultiplied; egui wants
+    // unpremultiplied so it can apply alpha correctly. Demultiply
+    // by dividing each channel by alpha (when alpha > 0).
+    let mut out = pixmap.data().to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            continue;
+        }
+        let inv = 255.0 / a as f32;
+        px[0] = ((px[0] as f32 * inv).round() as u32).min(255) as u8;
+        px[1] = ((px[1] as f32 * inv).round() as u32).min(255) as u8;
+        px[2] = ((px[2] as f32 * inv).round() as u32).min(255) as u8;
+    }
+    Some(out)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

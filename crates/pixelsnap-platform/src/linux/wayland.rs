@@ -1601,6 +1601,8 @@ fn render_hud_strokes(
                 &stroke,
                 &tick_stroke,
                 true,
+                hud.measurement_format.wh_indicators,
+                &hud.measurement_format.unit_suffix,
             );
         } else if hud.move_cursor_at.is_some() {
             // The dedicated draw_move_cursor block at the end of
@@ -1623,6 +1625,8 @@ fn render_hud_strokes(
                 &stroke,
                 &tick_stroke,
                 true,
+                hud.measurement_format.wh_indicators,
+                &hud.measurement_format.unit_suffix,
             );
         }
     }
@@ -1654,6 +1658,8 @@ fn render_hud_strokes(
                 &stroke,
                 &tick_stroke,
                 false,
+                hud.measurement_format.wh_indicators,
+                &hud.measurement_format.unit_suffix,
             );
         }
     }
@@ -2175,6 +2181,8 @@ fn draw_hover_indicators(
     stroke: &tiny_skia::Stroke,
     tick_stroke: &tiny_skia::Stroke,
     show_dim_pill: bool,
+    wh_indicators: bool,
+    unit_suffix: &str,
 ) {
     use tiny_skia::*;
     let scale_f = scale as f32;
@@ -2304,9 +2312,19 @@ fn draw_hover_indicators(
             let w_px = ((right_x - left_x) / scale_f).round() as u32;
             let h_px = ((down_y - up_y) / scale_f).round() as u32;
 
-            // Match macOS format: "W × H" with the Unicode
-            // multiplication sign, no "px" suffix.
-            let text = format!("{} \u{00D7} {}", w_px, h_px);
+            // "W × H" with the Unicode multiplication sign. The
+            // optional unit suffix (e.g. "px") trails the second
+            // number, or each number when `wh_indicators` is on —
+            // matches the held-rect pill so the live and committed
+            // readouts agree.
+            let text = if wh_indicators {
+                format!(
+                    "W: {}{} \u{00D7} H: {}{}",
+                    w_px, unit_suffix, h_px, unit_suffix
+                )
+            } else {
+                format!("{} \u{00D7} {}{}", w_px, h_px, unit_suffix)
+            };
             let px_size = TEXT_LOGICAL_PX * scale_f;
             // Measure text via fontdue. If the font is missing we still
             // render the pill (just empty) at a sensible width using the
@@ -2409,12 +2427,22 @@ fn draw_area_rect(
     // over it (camera_armed=true), swap the text for a camera icon
     // while keeping the same pill bounds so the visible chip doesn't
     // jump as you hover in/out.
-    let dim_text = format!(
-        "{} \u{00D7} {}{}",
-        format_number(w_logical_f, fmt),
-        format_number(h_logical_f, fmt),
-        fmt.unit_suffix
-    );
+    let dim_text = if fmt.wh_indicators {
+        format!(
+            "W: {}{} \u{00D7} H: {}{}",
+            format_number(w_logical_f, fmt),
+            fmt.unit_suffix,
+            format_number(h_logical_f, fmt),
+            fmt.unit_suffix,
+        )
+    } else {
+        format!(
+            "{} \u{00D7} {}{}",
+            format_number(w_logical_f, fmt),
+            format_number(h_logical_f, fmt),
+            fmt.unit_suffix
+        )
+    };
     // Drawing-mode pills sit below the rect so the user can see what
     // they're highlighting. Held rects keep the centered position
     // (after snap-shrink they're tight to content, less obscuring).
@@ -2468,7 +2496,12 @@ fn draw_area_rect(
 
     // Aspect ratio pill — sits just below the dimension pill when
     // both are below the rect, otherwise just below the rect.
-    if let Some(aspect_text) = estimate_aspect_text(w_logical, h_logical) {
+    let aspect_text = if fmt.aspect_in_area {
+        estimate_aspect_text(w_logical, h_logical, fmt.aspect_mode)
+    } else {
+        None
+    };
+    if let Some(aspect_text) = aspect_text {
         let aspect_y = if pill_below {
             ry + rh + 8.0 * scale_f + (TEXT_LOGICAL_PX + 2.0 * 5.0) * scale_f + 6.0 * scale_f
         } else {
@@ -2489,78 +2522,37 @@ fn draw_area_rect(
     }
 }
 
-/// Find the simplest fraction approximating `width : height`. Returns
-/// the ratio formatted as either `A : B` (exact match against a curated
-/// common ratio) or `~ A : B` (approximate). Returns `None` if nothing
-/// within tolerance bounds is found.
-///
-/// Approach: first check a curated list of "real" display/photo ratios
-/// (16:9, 4:3, etc.) within 2% — those get displayed as-is. If nothing
-/// matches there, enumerate fractions by smallest denominator first and
-/// return the first one within 4%, marked approximate.
-fn estimate_aspect_text(width: u32, height: u32) -> Option<String> {
+/// Format the aspect-ratio pill for the area tool. Delegates to the
+/// shared `vernier_core::aspect` classifier so the pill respects the
+/// user's configured `AspectMode` (Automatic / Standard / Reduced /
+/// CommonOnly). Returns `None` when the configured mode declines to
+/// report a ratio (CommonOnly with no curated match).
+fn estimate_aspect_text(
+    width: u32,
+    height: u32,
+    mode: vernier_core::AspectMode,
+) -> Option<String> {
+    use vernier_core::{CommonRatio, Ratio};
     if width == 0 || height == 0 {
         return None;
     }
-    let target = width as f64 / height as f64;
-
-    // Real-world display, photography, and print ratios. Both
-    // orientations included so portrait rectangles match too.
-    const CURATED: &[(u32, u32)] = &[
-        (1, 1),
-        (16, 9),
-        (9, 16),
-        (4, 3),
-        (3, 4),
-        (16, 10),
-        (10, 16),
-        (21, 9),
-        (9, 21),
-        (3, 2),
-        (2, 3),
-        (5, 4),
-        (4, 5),
-        (5, 3),
-        (3, 5),
-        (2, 1),
-        (1, 2),
-    ];
-
-    let mut best_curated: Option<((u32, u32), f64)> = None;
-    for &(n, d) in CURATED {
-        let r = n as f64 / d as f64;
-        let err = (r - target).abs() / target;
-        if err <= 0.02 && best_curated.map_or(true, |(_, e)| err < e) {
-            best_curated = Some(((n, d), err));
-        }
-    }
-    if let Some(((n, d), err)) = best_curated {
-        let prefix = if err < 0.005 { "" } else { "\u{223C} " };
-        return Some(format!("{}{} : {}", prefix, n, d));
-    }
-
-    // Smallest-denominator approximation. 4% tolerance picks "simple"
-    // fractions like 7 : 5 for slightly-off ratios where no curated
-    // option fits.
-    for b in 1..=10u32 {
-        let a = (target * b as f64).round() as u32;
-        if a == 0 {
-            continue;
-        }
-        if gcd_u32(a, b) != 1 {
-            continue;
-        }
-        let r = a as f64 / b as f64;
-        let err = (r - target).abs() / target;
-        if err <= 0.04 {
-            return Some(format!("\u{223C} {} : {}", a, b));
-        }
-    }
-    None
-}
-
-fn gcd_u32(a: u32, b: u32) -> u32 {
-    if b == 0 { a } else { gcd_u32(b, a % b) }
+    let ratio = vernier_core::classify_aspect(width, height, mode, 0.02)?;
+    let (n, d) = match ratio {
+        Ratio::Common(c) => match c {
+            CommonRatio::R16x9 => (16, 9),
+            CommonRatio::R4x3 => (4, 3),
+            CommonRatio::R1x1 => (1, 1),
+            CommonRatio::R21x9 => (21, 9),
+            CommonRatio::R16x10 => (16, 10),
+            CommonRatio::R5x4 => (5, 4),
+            CommonRatio::R3x2 => (3, 2),
+            CommonRatio::R2x1 => (2, 1),
+            CommonRatio::R9x16 => (9, 16),
+            CommonRatio::R3x4 => (3, 4),
+        },
+        Ratio::Reduced { num, den } => (num, den),
+    };
+    Some(format!("{} : {}", n, d))
 }
 
 #[derive(Copy, Clone)]

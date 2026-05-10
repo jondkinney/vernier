@@ -166,6 +166,17 @@ pub struct HudMeasurementFormat {
     /// Display scale factor of the active monitor; multiplied in
     /// when [`HudRounding::ScreenPixels`] is selected.
     pub scale_factor: f64,
+    /// Prefix area-pill numbers with `W:` and `H:` labels.
+    pub wh_indicators: bool,
+    /// Show the aspect-ratio pill on area rectangles. When false,
+    /// the rect renders without an aspect pill regardless of mode.
+    pub aspect_in_area: bool,
+    /// Reporting style for the aspect-ratio pill: Automatic picks
+    /// a curated common ratio when within tolerance, otherwise the
+    /// reduced fraction; CommonOnly hides the pill if no curated
+    /// match exists; Standard always picks a common ratio; Reduced
+    /// always picks the reduced fraction.
+    pub aspect_mode: vernier_core::AspectMode,
 }
 
 impl Default for HudMeasurementFormat {
@@ -174,6 +185,9 @@ impl Default for HudMeasurementFormat {
             unit_suffix: "px".to_string(),
             rounding: HudRounding::PointsRounded,
             scale_factor: 1.0,
+            wh_indicators: false,
+            aspect_in_area: true,
+            aspect_mode: vernier_core::AspectMode::Automatic,
         }
     }
 }
@@ -438,6 +452,14 @@ impl Accelerator {
                 "down" => key = Some(Key::Down),
                 "left" => key = Some(Key::Left),
                 "right" => key = Some(Key::Right),
+                // Punctuation: spelled out so the `+` separator
+                // doesn't have to be escaped. Keypad variants are
+                // normalized to the same `Char` so binding "PLUS"
+                // catches both main-row and numpad keys.
+                "plus" | "kp_add" => key = Some(Key::Char('+')),
+                "minus" | "kp_subtract" => key = Some(Key::Char('-')),
+                "equal" | "equals" => key = Some(Key::Char('=')),
+                "underscore" => key = Some(Key::Char('_')),
                 other => {
                     if let Some(rest) = other.strip_prefix('f') {
                         if let Ok(n) = rest.parse::<u8>() {
@@ -475,6 +497,12 @@ impl Accelerator {
             parts.push("SUPER".to_string());
         }
         let key_str = match self.key {
+            // Punctuation is spelled out so the saved string
+            // doesn't collide with the `+` modifier separator.
+            Key::Char('+') => "PLUS".to_string(),
+            Key::Char('-') => "MINUS".to_string(),
+            Key::Char('=') => "EQUAL".to_string(),
+            Key::Char('_') => "UNDERSCORE".to_string(),
             Key::Char(c) => c.to_ascii_uppercase().to_string(),
             Key::F(n) => format!("F{n}"),
             Key::Escape => "ESC".to_string(),

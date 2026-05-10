@@ -12,7 +12,7 @@
 //!   tolerance, return `None` so the UI can hide the readout.
 
 /// Reporting mode for aspect ratios.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Automatic,
     Standard,

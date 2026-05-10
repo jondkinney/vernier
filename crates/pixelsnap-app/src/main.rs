@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vernier_core::{
-    classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg, AspectMode,
+    classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
     EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
     Tolerance, Units,
 };
@@ -51,20 +51,8 @@ enum Cmd {
     /// `~/.config/vernier/settings.toml`, lets the user edit them
     /// across the General / Screenshots / Tolerance / Appearance /
     /// Integrations / Shortcuts / About sections, and pings the
-    /// running daemon to reload after each save. Optional `--x` /
-    /// `--y` / `--w` / `--h` re-anchor + resize the window via
-    /// hyprctl after it appears (used by the Restart flow to put
-    /// the new prefs back where the previous one was).
-    Prefs {
-        #[arg(long)]
-        x: Option<i32>,
-        #[arg(long)]
-        y: Option<i32>,
-        #[arg(long)]
-        w: Option<u32>,
-        #[arg(long)]
-        h: Option<u32>,
-    },
+    /// running daemon to reload after each save.
+    Prefs,
     /// Tell the running daemon to re-read its settings file. Sent
     /// automatically by the prefs window after each save.
     ReloadSettings,
@@ -88,7 +76,7 @@ fn main() -> Result<()> {
         Some(Cmd::DetectEdges { x, y, tolerance }) => {
             run_client_command(&format!("detect-edges {x} {y} {tolerance}"))
         }
-        Some(Cmd::Prefs { x, y, w, h }) => run_prefs_window(PrefsGeometry { x, y, w, h }),
+        Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
         None => {
             // If a daemon is already running, treat the bare invocation
@@ -122,26 +110,53 @@ fn existing_daemon_responsive() -> bool {
     std::os::unix::net::UnixStream::connect(&path).is_ok()
 }
 
-/// Optional initial geometry (in compositor logical px) for the
-/// prefs window — populated by the Restart flow so the new window
-/// reopens where the old one was.
-#[derive(Debug, Clone, Copy, Default)]
-struct PrefsGeometry {
-    x: Option<i32>,
-    y: Option<i32>,
-    w: Option<u32>,
-    h: Option<u32>,
-}
-
 /// Open the egui prefs window. After each successful save the
 /// in-process callback pings the running daemon over IPC so it
 /// reloads `settings.toml` without restart. The Quit button in
 /// the prefs window dispatches the same `vernier quit` IPC the
-/// CLI uses. Restart preserves the window geometry by querying
-/// hyprctl, killing+respawning the daemon, and respawning a fresh
-/// `vernier prefs --x --y --w --h`.
-fn run_prefs_window(geometry: PrefsGeometry) -> Result<()> {
+/// CLI uses.
+///
+/// Singleton: a Unix-socket lockfile in `$XDG_RUNTIME_DIR` ensures
+/// only one prefs window can be open at a time. When a second
+/// `vernier prefs` is invoked, we ask Hyprland (best-effort) to
+/// focus the existing window and exit immediately.
+///
+/// If no daemon is responsive when the launcher invokes `vernier
+/// prefs` (the desktop entry's Exec line), we spawn one as a
+/// detached child so the user gets the tray icon + global toggle
+/// hotkey alongside the prefs window. Without this, clicking the
+/// launcher after a previous Quit only opens prefs and leaves the
+/// hotkey dead.
+fn run_prefs_window() -> Result<()> {
+    let lock_path = prefs_lock_path()?;
+    let _prefs_lock = match acquire_prefs_singleton_lock(&lock_path) {
+        Some(l) => l,
+        None => {
+            log::info!(
+                "prefs window already open (lock at {}); focusing existing one",
+                lock_path.display()
+            );
+            // Best-effort raise: only meaningful on Hyprland, but
+            // safe to ignore failures elsewhere — the existing
+            // window is already on screen.
+            let _ = std::process::Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", "class:vernier-prefs"])
+                .output();
+            return Ok(());
+        }
+    };
     let static_bind = static_vernier_bind_in_hypr_config();
+    if !existing_daemon_responsive() {
+        if let Ok(exe) = std::env::current_exe() {
+            match std::process::Command::new(&exe).spawn() {
+                Ok(c) => log::info!("daemon auto-spawned by prefs launcher (pid {})", c.id()),
+                Err(e) => log::warn!("could not spawn daemon: {e:#}"),
+            }
+            // Brief pause so the daemon binds the IPC socket before
+            // the prefs window starts pinging it on Save.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
     let on_saved: Box<dyn FnMut() + Send> = Box::new(|| {
         // Best-effort: if no daemon is running, the prefs window
         // still works — settings just take effect on next launch.
@@ -154,100 +169,7 @@ fn run_prefs_window(geometry: PrefsGeometry) -> Result<()> {
             log::warn!("daemon quit IPC failed: {e:#}");
         }
     });
-    let on_restart: Box<dyn FnMut() + Send> = Box::new(|| {
-        let saved_geom = read_prefs_window_geometry();
-        if let Err(e) = run_client_command("quit") {
-            log::warn!("daemon quit IPC failed during restart: {e:#}");
-        }
-        // Wait for the dbus name + IPC socket to release.
-        std::thread::sleep(Duration::from_millis(300));
-        let exe = std::env::current_exe()
-            .ok()
-            .unwrap_or_else(|| std::path::PathBuf::from("vernier"));
-        match std::process::Command::new(&exe).spawn() {
-            Ok(child) => log::info!("daemon respawned (pid {})", child.id()),
-            Err(e) => log::warn!("respawn daemon: {e:#}"),
-        }
-        // Give the new daemon a moment to bind its IPC socket
-        // before the new prefs window starts pinging it.
-        std::thread::sleep(Duration::from_millis(400));
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("prefs");
-        if let Some((x, y, w, h)) = saved_geom {
-            cmd.args([
-                "--x",
-                &x.to_string(),
-                "--y",
-                &y.to_string(),
-                "--w",
-                &w.to_string(),
-                "--h",
-                &h.to_string(),
-            ]);
-        }
-        match cmd.spawn() {
-            Ok(child) => log::info!("prefs respawned (pid {})", child.id()),
-            Err(e) => log::warn!("respawn prefs: {e:#}"),
-        }
-    });
-    vernier_ui::run_prefs(
-        on_saved,
-        on_quit,
-        on_restart,
-        geometry_into_ui(geometry),
-        static_bind,
-    )
-}
-
-fn geometry_into_ui(g: PrefsGeometry) -> vernier_ui::PrefsGeometry {
-    vernier_ui::PrefsGeometry { x: g.x, y: g.y, w: g.w, h: g.h }
-}
-
-/// Find the current prefs window in `hyprctl clients` (matched on
-/// the `vernier-prefs` app_id we set on the eframe viewport) and
-/// return its `(x, y, w, h)` in compositor logical px. Returns
-/// `None` if the binary isn't available, the JSON can't be
-/// parsed, or the window isn't there.
-fn read_prefs_window_geometry() -> Option<(i32, i32, u32, u32)> {
-    let out = std::process::Command::new("hyprctl")
-        .args(["-j", "clients"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body = String::from_utf8(out.stdout).ok()?;
-    parse_prefs_geometry_from_clients_json(&body)
-}
-
-/// Tiny ad-hoc parser for the fields we need from `hyprctl -j
-/// clients` — full JSON parsing would pull in serde_json just for
-/// this. The structure is an array of objects each with `class`,
-/// `at: [x, y]`, and `size: [w, h]` keys; we look for the first
-/// object whose class is exactly `vernier-prefs`.
-fn parse_prefs_geometry_from_clients_json(s: &str) -> Option<(i32, i32, u32, u32)> {
-    // Find a `"class": "vernier-prefs"` occurrence.
-    let class_idx = s.find("\"class\": \"vernier-prefs\"")?;
-    // From there, look forward for `"at":` and `"size":` within a
-    // small window.
-    let tail = &s[class_idx..];
-    let at_start = tail.find("\"at\":")? + class_idx;
-    let after_at = &s[at_start..];
-    let bracket = after_at.find('[')?;
-    let close = after_at[bracket..].find(']')?;
-    let at_inner = &after_at[bracket + 1..bracket + close];
-    let mut at_parts = at_inner.split(',').map(|p| p.trim().parse::<i32>().ok());
-    let x = at_parts.next()??;
-    let y = at_parts.next()??;
-    let size_start = tail.find("\"size\":")? + class_idx;
-    let after_sz = &s[size_start..];
-    let bracket = after_sz.find('[')?;
-    let close = after_sz[bracket..].find(']')?;
-    let sz_inner = &after_sz[bracket + 1..bracket + close];
-    let mut sz_parts = sz_inner.split(',').map(|p| p.trim().parse::<i32>().ok());
-    let w = sz_parts.next()?? as u32;
-    let h = sz_parts.next()?? as u32;
-    Some((x, y, w, h))
+    vernier_ui::run_prefs(on_saved, on_quit, static_bind)
 }
 
 fn run_client_command(cmd: &str) -> Result<()> {
@@ -269,6 +191,25 @@ fn run_client_command(cmd: &str) -> Result<()> {
 
 fn run_daemon() -> Result<()> {
     log::info!("vernier {} — daemon", env!("CARGO_PKG_VERSION"));
+
+    // Race-free singleton claim via flock — must happen before any
+    // portal work. If two daemons start simultaneously (e.g. the
+    // prefs auto-spawn racing with a fresh launcher click), only one
+    // gets the lock; the loser exits before kicking off a screencast
+    // handshake that would prompt the user a second time.
+    let _daemon_lock = match acquire_daemon_singleton_lock()? {
+        Some(f) => f,
+        None => {
+            log::info!("another vernier daemon is already running; exiting");
+            return Ok(());
+        }
+    };
+
+    // Block SIGTERM/SIGINT process-wide so the dedicated signal
+    // thread (spawned later, once `combined_tx` exists) can convert
+    // them into a graceful Quit. Must run before any thread spawns —
+    // the block is inherited.
+    block_quit_signals()?;
 
     let initial_settings = match Settings::load() {
         Ok(s) => s,
@@ -310,7 +251,16 @@ fn run_daemon() -> Result<()> {
     set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
     let _tray = if !initial_settings.general.hide_tray_icon {
-        Some(platform.create_tray(TrayMenu::minimal("vernier"))?)
+        match platform.create_tray(TrayMenu::minimal("vernier")) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::warn!(
+                    "tray icon registration failed: {e:#}. Continuing without a tray; \
+                     drive the daemon via the global hotkey or `vernier toggle`."
+                );
+                None
+            }
+        }
     } else {
         log::info!("tray icon hidden via settings.general.hide_tray_icon");
         None
@@ -352,6 +302,12 @@ fn run_daemon() -> Result<()> {
             if !register_hyprland_toggle(&accel) {
                 log::warn!("hyprctl bind for toggle failed");
             }
+            // Keep the bind alive across `hyprctl reload` (which
+            // wipes runtime keyword binds) and Hyprland restarts
+            // (which spin up a new instance signature). The watcher
+            // re-derives the accel from settings each time, so prefs
+            // edits are picked up automatically.
+            spawn_hyprland_bind_watcher();
         } else {
             current_hotkey = match platform.register_hotkey(accel, "Toggle vernier") {
                 Ok(id) => {
@@ -386,12 +342,22 @@ fn run_daemon() -> Result<()> {
             }
         })?;
 
-    // IPC socket for `vernier toggle` / `vernier quit`.
+    // IPC socket for `vernier toggle` / `vernier quit`. The
+    // daemon flock above already guarantees we're the only daemon,
+    // so we can unconditionally remove a stale socket file and bind.
     let socket_path = ipc_socket_path()?;
     let _ = std::fs::remove_file(&socket_path);
     let listener = std::os::unix::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("bind ipc socket at {}", socket_path.display()))?;
     log::info!("ipc socket: {}", socket_path.display());
+
+    // Convert SIGTERM/SIGINT into a clean quit through the same
+    // event channel the IPC `quit` command uses. Doing this here
+    // (after `combined_tx` exists) keeps shutdown ordering identical
+    // to a `vernier quit`: the loop breaks, platform drops, the
+    // ashpd D-Bus connection closes, xdg-desktop-portal flushes the
+    // screencast restore token to its GVariant DB.
+    spawn_signal_quit_thread(combined_tx.clone())?;
 
     let combined_for_ipc = combined_tx.clone();
     std::thread::Builder::new()
@@ -456,6 +422,11 @@ fn run_daemon() -> Result<()> {
     // so a bare keypress can match against the live config rather
     // than against a hardcoded Esc / Shift+R / Enter table.
     let mut shortcut_accels = parse_shortcut_accels(&initial_settings);
+    log_shortcut_accels(&shortcut_accels);
+    // Crosshair (alignment) mode is "on while the configured modifier
+    // is held". Recomputed on every modifier change and on each
+    // settings reload so a re-bound modifier takes effect immediately.
+    let mut align_mode: bool = false;
     // Index into `guides` of the guide currently being dragged via
     // pointer down on the line — None when not dragging.
     let mut dragging_guide: Option<usize> = None;
@@ -466,11 +437,11 @@ fn run_daemon() -> Result<()> {
     // on the same guide within DOUBLE_CLICK_WINDOW deletes it.
     let mut last_guide_click: Option<(usize, Instant)> = None;
     const GUIDE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
-    // Most recent Esc press time. Esc requires a double-press within
-    // ESC_DOUBLE_WINDOW to actually exit measurement mode — single
-    // press just shows a hint toast.
+    // Last clear-and-hide press time. When the user has opted
+    // into double-press confirmation, a second press within the
+    // configured window (`clear_and_hide_double_press_window_ms`)
+    // fires the action. Otherwise the first press fires it.
     let mut last_esc_at: Option<Instant> = None;
-    const ESC_DOUBLE_WINDOW: Duration = Duration::from_millis(700);
     // Live resize op against a held rect — set on press over an
     // edge/corner, cleared on release.
     let mut resizing: Option<ResizeOp> = None;
@@ -559,6 +530,7 @@ fn run_daemon() -> Result<()> {
                     }
                     if needs_redraw && last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
                         last_hud_redraw = Instant::now();
+                        refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
                             &mode,
@@ -566,14 +538,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -600,6 +572,7 @@ fn run_daemon() -> Result<()> {
                 }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
                     last_hud_redraw = Instant::now();
+                    refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
                     // Active resize wins; otherwise compute the
                     // handle the cursor is hovering on any held rect.
                     let active_handle = resizing.map(|op| op.handle).or_else(|| {
@@ -640,14 +613,14 @@ fn run_daemon() -> Result<()> {
                         frozen_frame.as_ref(),
                         x,
                         y,
-                        tol_level.value(),
+                        current_tol_value(tol_level),
                         toast,
                         &guides,
                         pending_guide,
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
-                        shift_held,
+                        align_mode,
                         super_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -711,14 +684,14 @@ fn run_daemon() -> Result<()> {
                         frozen_frame.as_ref(),
                         x,
                         y,
-                        tol_level.value(),
+                        current_tol_value(tol_level),
                         toast,
                         &guides,
                         pending_guide,
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
-                        shift_held,
+                        align_mode,
                         super_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -759,7 +732,7 @@ fn run_daemon() -> Result<()> {
                                         frozen_frame.as_ref(),
                                         cx,
                                         cy,
-                                        tol_level.value(),
+                                        current_tol_value(tol_level),
                                         &guides,
                                     );
                                     let m = freeze_axis_measurement(
@@ -779,7 +752,7 @@ fn run_daemon() -> Result<()> {
                                         frozen_frame.as_ref(),
                                         cx,
                                         cy,
-                                        tol_level.value(),
+                                        current_tol_value(tol_level),
                                         &guides,
                                     );
                                     let m = freeze_axis_measurement(
@@ -880,14 +853,14 @@ fn run_daemon() -> Result<()> {
                         frozen_frame.as_ref(),
                         x,
                         y,
-                        tol_level.value(),
+                        current_tol_value(tol_level),
                         toast,
                         &guides,
                         pending_guide,
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
-                        shift_held,
+                        align_mode,
                         super_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -922,7 +895,7 @@ fn run_daemon() -> Result<()> {
                                     (lo_x, lo_y),
                                     (hi_x, hi_y),
                                     op.handle,
-                                    tol_level.value(),
+                                    current_tol_value(tol_level),
                                 );
                                 rect.rect_start = snapped_lo;
                                 rect.rect_end = snapped_hi;
@@ -936,14 +909,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -998,14 +971,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1034,14 +1007,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1064,14 +1037,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1126,14 +1099,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1161,7 +1134,7 @@ fn run_daemon() -> Result<()> {
                                     frozen_frame.as_ref(),
                                     x,
                                     y,
-                                    tol_level.value(),
+                                    current_tol_value(tol_level),
                                     &guides,
                                 );
                                 match axis {
@@ -1179,14 +1152,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1203,7 +1176,7 @@ fn run_daemon() -> Result<()> {
                         x,
                         y,
                         frozen_frame.as_ref(),
-                        tol_level.value(),
+                        current_tol_value(tol_level),
                         &mut guides,
                         &mut stuck_measurements,
                         &mut held_rects,
@@ -1212,18 +1185,41 @@ fn run_daemon() -> Result<()> {
                     );
                     last_hud_redraw = Instant::now();
                     if let ButtonOutcome::ScreenshotTaken = outcome {
+                        // Stay in measure mode after a screenshot —
+                        // the held rect remains hoverable so the user
+                        // can re-shoot the same region (or any other
+                        // held rect) without re-toggling. Toast just
+                        // confirms the capture; it elapses without
+                        // exiting measure mode.
                         let toast = HudToast { text: "Screenshot taken".into() };
-                        let mut hud = Hud::hover((x, y));
-                        hud.kind = HudKind::None;
-                        hud.toast = Some(toast.clone());
-                        overlay.set_hud(Some(hud));
-                        active_toast = Some(toast);
+                        active_toast = Some(toast.clone());
                         toast_until =
                             Some(Instant::now() + Duration::from_millis(TOAST_SCREENSHOT_MS));
                         spawn_toast_timer(
                             &combined_tx,
                             Duration::from_millis(TOAST_SCREENSHOT_MS),
-                            true,
+                            false,
+                        );
+                        let toast_ref = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            current_tol_value(tol_level),
+                            toast_ref,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            align_mode,
+                            super_held,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                            context_menu.as_ref(),
                         );
                     } else {
                         // Push the latest HUD now so removals (held
@@ -1238,14 +1234,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1259,52 +1255,54 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::KeyboardKey {
                 keysym, pressed, ..
             }) => {
+                log::debug!(
+                    "key event: keysym=0x{:x} pressed={} mode={:?}",
+                    keysym, pressed, std::mem::discriminant(&mode)
+                );
                 // Track modifiers regardless of mode so they're
                 // current when the next non-modifier action fires.
                 let is_shift = keysym == 0xffe1 || keysym == 0xffe2;
                 let is_super = keysym == 0xffeb || keysym == 0xffec;
                 let is_ctrl = keysym == 0xffe3 || keysym == 0xffe4;
                 let is_alt = keysym == 0xffe9 || keysym == 0xffea;
-                if is_ctrl {
-                    ctrl_held = pressed;
-                    continue;
-                }
-                if is_alt {
-                    alt_held = pressed;
-                    continue;
-                }
-                if is_shift {
-                    shift_held = pressed;
-                    if !matches!(mode, InteractionMode::Idle) {
-                        if let Some((x, y)) = last_pointer_xy {
-                            last_hud_redraw = Instant::now();
-                            let toast = current_toast(&active_toast, toast_until);
-                            refresh_hud(
-                                &mode,
-                                &mut overlay,
-                                frozen_frame.as_ref(),
-                                x,
-                                y,
-                                tol_level.value(),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                shift_held,
-                                super_held,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
-                            );
+                if is_shift || is_ctrl || is_alt || is_super {
+                    if is_shift { shift_held = pressed; }
+                    if is_ctrl { ctrl_held = pressed; }
+                    if is_alt { alt_held = pressed; }
+                    if is_super { super_held = pressed; }
+                    let new_align = shortcut_accels
+                        .crosshair
+                        .map(|m| modifier_held(m, shift_held, ctrl_held, alt_held, super_held))
+                        .unwrap_or(false);
+                    if new_align != align_mode {
+                        align_mode = new_align;
+                        if !matches!(mode, InteractionMode::Idle) {
+                            if let Some((x, y)) = last_pointer_xy {
+                                last_hud_redraw = Instant::now();
+                                let toast = current_toast(&active_toast, toast_until);
+                                refresh_hud(
+                                    &mode,
+                                    &mut overlay,
+                                    frozen_frame.as_ref(),
+                                    x,
+                                    y,
+                                    current_tol_value(tol_level),
+                                    toast,
+                                    &guides,
+                                    pending_guide,
+                                    &stuck_measurements,
+                                    &held_rects,
+                                    color_alternate,
+                                    align_mode,
+                                    super_held,
+                                    primary.bounds.w as i32,
+                                    primary.bounds.h as i32,
+                                    None,
+                                    context_menu.as_ref(),
+                                );
+                            }
                         }
                     }
-                    continue;
-                }
-                if is_super {
-                    super_held = pressed;
                     continue;
                 }
                 let pressed_accel =
@@ -1328,14 +1326,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1345,36 +1343,46 @@ fn run_daemon() -> Result<()> {
                         }
                     }
                 } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.background
+                    && pressed_accel == shortcut_accels.clear_and_hide
                 {
-                    // Configured background-mode shortcut (default
-                    // Esc). Two quick presses exit; a single press
-                    // just hints. Lets the user "back out" of
-                    // pending placements / drags without losing the
-                    // whole session.
+                    // Configured clear-and-hide shortcut (default
+                    // Esc). When `clear_and_hide_double_press` is
+                    // on (default), the action requires a second
+                    // press within the configured window; the first
+                    // press shows a confirmation toast. When off,
+                    // a single press fires immediately. Either
+                    // way the action saves session (if persistence
+                    // is on), wipes every held rect / guide / stuck
+                    // measurement, and toggles measure mode off.
+                    let s = current_settings();
+                    let need_double = s.shortcuts.clear_and_hide_double_press;
+                    let window = Duration::from_millis(
+                        s.shortcuts.clear_and_hide_double_press_window_ms.clamp(100, 3000) as u64,
+                    );
                     let now = Instant::now();
                     let is_double = last_esc_at
-                        .map(|t| now.duration_since(t) <= ESC_DOUBLE_WINDOW)
+                        .map(|t| now.duration_since(t) <= window)
                         .unwrap_or(false);
-                    if is_double {
-                        let persist = current_settings().general.session_persistence;
+                    let fire = !need_double || is_double;
+                    if fire {
+                        if let Err(e) =
+                            save_session(&held_rects, &guides, &stuck_measurements)
+                        {
+                            log::warn!("save session: {e:#}");
+                        }
                         log::info!(
-                            "esc×2 — {} session ({} rect(s), {} guide(s), {} stuck) and exiting",
-                            if persist { "saving" } else { "discarding" },
+                            "clear-and-hide×2 — clearing {} rect(s), {} guide(s), {} stuck",
                             held_rects.len(),
                             guides.len(),
                             stuck_measurements.len(),
                         );
-                        if persist {
-                            if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
-                                log::warn!("save session: {e:#}");
-                            }
-                        }
                         last_esc_at = None;
-                        guides.clear();
-                        pending_guide = None;
-                        stuck_measurements.clear();
                         held_rects.clear();
+                        guides.clear();
+                        stuck_measurements.clear();
+                        pending_guide = None;
+                        active_toast = None;
+                        toast_until = None;
                         toggle_measurement(
                             &mut mode,
                             &mut overlay,
@@ -1388,15 +1396,16 @@ fn run_daemon() -> Result<()> {
                         );
                     } else {
                         last_esc_at = Some(now);
+                        let key_label = shortcut_accels
+                            .clear_and_hide
+                            .as_ref()
+                            .map(|a| a.to_string_key())
+                            .unwrap_or_else(|| "Esc".into());
                         active_toast = Some(HudToast {
-                            text: "Press Esc again to exit".into(),
+                            text: format!("Press {key_label} again to clear and exit"),
                         });
-                        toast_until = Some(now + ESC_DOUBLE_WINDOW);
-                        spawn_toast_timer(
-                            &combined_tx,
-                            ESC_DOUBLE_WINDOW,
-                            false,
-                        );
+                        toast_until = Some(now + window);
+                        spawn_toast_timer(&combined_tx, window, false);
                         if let Some((x, y)) = last_pointer_xy {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
@@ -1406,14 +1415,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1422,12 +1431,15 @@ fn run_daemon() -> Result<()> {
                             );
                         }
                     }
-                } else if keysym == 0x0048 || keysym == 0x0042 || keysym == 0x0056 {
-                    // Capital H or B → horizontal guide; Capital V →
-                    // vertical guide. (B sits next to V on the keyboard
-                    // so the pair maps cleanly: B for horizontal, V
-                    // for vertical.)
-                    let axis = if keysym == 0x0056 {
+                } else if pressed_accel.is_some()
+                    && (pressed_accel == shortcut_accels.guide_horizontal
+                        || pressed_accel == shortcut_accels.guide_vertical)
+                {
+                    // Configured guide-placement shortcuts (default
+                    // SHIFT+H = horizontal, SHIFT+V = vertical). The
+                    // overlay enters "pending guide" mode and sticks
+                    // it on the next click.
+                    let axis = if pressed_accel == shortcut_accels.guide_vertical {
                         GuideAxis::Vertical
                     } else {
                         GuideAxis::Horizontal
@@ -1443,14 +1455,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1458,11 +1470,13 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym == 0x0078 {
-                    // Lowercase 'x' toggles the measurement HUD's
-                    // foreground between coral red (default) and
-                    // black (alternate). Useful when the underlying
-                    // UI clashes with one of the two.
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.color_toggle
+                {
+                    // Configured color-toggle shortcut (default `X`).
+                    // Swaps the HUD foreground between primary
+                    // (coral red) and alternate (black) so it stays
+                    // legible against busy backgrounds either way.
                     color_alternate = !color_alternate;
                     log::info!(
                         "color_alternate → {}",
@@ -1477,14 +1491,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1492,12 +1506,16 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym == 0x0068 || keysym == 0x0062 || keysym == 0x0076 {
-                    // Lowercase 'h' or 'b' → horizontal stuck axis;
-                    // 'v' → vertical. Freezes the current crosshair's
-                    // extent in that axis with the pixel value pinned.
+                } else if pressed_accel.is_some()
+                    && (pressed_accel == shortcut_accels.stuck_horizontal
+                        || pressed_accel == shortcut_accels.stuck_vertical)
+                {
+                    // Configured stuck-axis shortcuts (default `H` =
+                    // horizontal, `V` = vertical). Freezes the current
+                    // crosshair's extent in that axis with the pixel
+                    // value pinned.
                     if let Some((x, y)) = last_pointer_xy {
-                        let axis = if keysym == 0x0076 {
+                        let axis = if pressed_accel == shortcut_accels.stuck_vertical {
                             GuideAxis::Vertical
                         } else {
                             GuideAxis::Horizontal
@@ -1506,7 +1524,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             &guides,
                         );
                         let measurement = freeze_axis_measurement(
@@ -1532,14 +1550,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1547,9 +1565,11 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym_increases_tolerance(keysym) {
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.tolerance_up
+                {
                     tol_level = tol_level.higher();
-                    log::info!("tolerance → {} ({})", tol_level.label(), tol_level.value());
+                    log::info!("tolerance → {} ({})", tol_level.label(), current_tol_value(tol_level));
                     let toast = HudToast {
                         text: format!("Tolerance: {}", tol_level.label()),
                     };
@@ -1569,14 +1589,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1584,9 +1604,11 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym_decreases_tolerance(keysym) {
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.tolerance_down
+                {
                     tol_level = tol_level.lower();
-                    log::info!("tolerance → {} ({})", tol_level.label(), tol_level.value());
+                    log::info!("tolerance → {} ({})", tol_level.label(), current_tol_value(tol_level));
                     let toast = HudToast {
                         text: format!("Tolerance: {}", tol_level.label()),
                     };
@@ -1606,14 +1628,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1621,10 +1643,12 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if keysym == 0x0072 {
-                    // Lowercase 'r' — re-capture the screen so the
-                    // user can refresh after the underlying content
-                    // changed. Capital R is reserved for restore.
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.refresh_capture
+                {
+                    // Configured refresh-capture shortcut (default
+                    // `R`) — recapture the screen so subsequent
+                    // edge detection sees the current content.
                     match platform.capture_screen_native(primary.id) {
                         Ok(f) => {
                             log::info!("frame refreshed");
@@ -1638,14 +1662,14 @@ fn run_daemon() -> Result<()> {
                                     frozen_frame.as_ref(),
                                     x,
                                     y,
-                                    tol_level.value(),
+                                    current_tol_value(tol_level),
                                     toast,
                                     &guides,
                                     pending_guide,
                                     &stuck_measurements,
                                     &held_rects,
                                     color_alternate,
-                                    shift_held,
+                                    align_mode,
                                     super_held,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -1698,14 +1722,14 @@ fn run_daemon() -> Result<()> {
                             frozen_frame.as_ref(),
                             x,
                             y,
-                            tol_level.value(),
+                            current_tol_value(tol_level),
                             toast,
                             &guides,
                             pending_guide,
                             &stuck_measurements,
                             &held_rects,
                             color_alternate,
-                            shift_held,
+                            align_mode,
                             super_held,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1762,14 +1786,14 @@ fn run_daemon() -> Result<()> {
                                     frozen_frame.as_ref(),
                                     x,
                                     y,
-                                    tol_level.value(),
+                                    current_tol_value(tol_level),
                                     toast,
                                     &guides,
                                     pending_guide,
                                     &stuck_measurements,
                                     &held_rects,
                                     color_alternate,
-                                    shift_held,
+                                    align_mode,
                                     super_held,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -1781,12 +1805,14 @@ fn run_daemon() -> Result<()> {
                     } else {
                         log::info!("Enter: no held rect under cursor — nothing to copy");
                     }
-                } else if matches!(
-                    keysym,
-                    0xff51 | 0xff52 | 0xff53 | 0xff54
-                ) {
-                    // Arrow keys — nudge the hovered held rect.
-                    // Shift = 10px step, plain = 1px.
+                } else if matches_nudge(&pressed_accel, &shortcut_accels).is_some() {
+                    // Configured nudge shortcuts (default arrow
+                    // keys). SHIFT is treated as a 10× step
+                    // multiplier independent of the bound key, so a
+                    // user who binds e.g. SHIFT+H+W would still get
+                    // the multiplier on top.
+                    let dir = matches_nudge(&pressed_accel, &shortcut_accels)
+                        .expect("matches_nudge guarded above");
                     let cursor_px = last_pointer_xy
                         .map(|(x, y)| Px::new(x as i32, y as i32));
                     let target_idx = cursor_px.and_then(|c| {
@@ -1798,12 +1824,11 @@ fn run_daemon() -> Result<()> {
                     });
                     if let Some(idx) = target_idx {
                         let step = if shift_held { 10.0 } else { 1.0 };
-                        let (dx, dy) = match keysym {
-                            0xff51 => (-step, 0.0), // Left
-                            0xff52 => (0.0, -step), // Up
-                            0xff53 => (step, 0.0),  // Right
-                            0xff54 => (0.0, step),  // Down
-                            _ => (0.0, 0.0),
+                        let (dx, dy) = match dir {
+                            NudgeDir::Left => (-step, 0.0),
+                            NudgeDir::Right => (step, 0.0),
+                            NudgeDir::Up => (0.0, -step),
+                            NudgeDir::Down => (0.0, step),
                         };
                         if let Some(rect) = held_rects.get_mut(idx) {
                             rect.rect_start.0 += dx;
@@ -1820,14 +1845,14 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame.as_ref(),
                                 x,
                                 y,
-                                tol_level.value(),
+                                current_tol_value(tol_level),
                                 toast,
                                 &guides,
                                 pending_guide,
                                 &stuck_measurements,
                                 &held_rects,
                                 color_alternate,
-                                shift_held,
+                                align_mode,
                                 super_held,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1895,6 +1920,11 @@ fn run_daemon() -> Result<()> {
                         // user immediately sees their pref reflected.
                         tol_level = s.tolerance.default_level;
                         shortcut_accels = parse_shortcut_accels(&s);
+                        align_mode = shortcut_accels
+                            .crosshair
+                            .map(|m| modifier_held(m, shift_held, ctrl_held, alt_held, super_held))
+                            .unwrap_or(false);
+                        log_shortcut_accels(&shortcut_accels);
                         // Re-register the toggle hotkey if the user
                         // changed it. An empty / unparseable
                         // setting unregisters without re-binding.
@@ -1990,14 +2020,14 @@ fn run_daemon() -> Result<()> {
                         frozen_frame.as_ref(),
                         x,
                         y,
-                        tol_level.value(),
+                        current_tol_value(tol_level),
                         None,
                         &guides,
                         pending_guide,
                         &stuck_measurements,
                         &held_rects,
                         color_alternate,
-                        shift_held,
+                        align_mode,
                         super_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -2023,6 +2053,10 @@ fn settings_lock() -> &'static std::sync::Mutex<Settings> {
     use std::sync::{Mutex, OnceLock};
     static CELL: OnceLock<Mutex<Settings>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(Settings::load().unwrap_or_default()))
+}
+
+fn current_tol_value(level: vernier_core::ToleranceLevel) -> u32 {
+    current_settings().tolerance.value_for(level)
 }
 
 fn current_settings() -> Settings {
@@ -2059,6 +2093,25 @@ fn set_primary_scale_factor(s: f64) {
     *scale_factor_lock().lock().unwrap() = s;
 }
 
+/// When `general.freeze_screen` is off, pull the latest frame from
+/// PipeWire so edge detection follows live content. No-op in the
+/// default frozen mode (the user explicitly refreshes via the R key).
+/// Errors are logged at debug — a transient capture miss just leaves
+/// the previous frame in place for this redraw.
+fn refresh_frame_if_live(
+    platform: &dyn Platform,
+    monitor: MonitorId,
+    frozen_frame: &mut Option<NativeFrame>,
+) {
+    if current_settings().general.freeze_screen {
+        return;
+    }
+    match platform.capture_screen_native(monitor) {
+        Ok(f) => *frozen_frame = Some(f),
+        Err(e) => log::debug!("live-frame capture skipped: {e}"),
+    }
+}
+
 /// Pull the currently-configured guide color + measurement format
 /// from settings and write them into a freshly-built `Hud`. Called
 /// at every refresh_hud branch so the live HUD reflects prefs
@@ -2067,17 +2120,25 @@ fn populate_hud_appearance(hud: &mut Hud) {
     let s = current_settings();
     let g = s.appearance.guide_color;
     hud.guide_color = PlatColor::rgba(g.r, g.g, g.b, g.a);
-    hud.measurement_format = HudMeasurementFormat {
-        unit_suffix: match s.appearance.units {
+    let unit_suffix = if s.general.display_units {
+        match s.appearance.units {
             Units::Px => "px".to_string(),
             Units::Pt => "pt".to_string(),
-        },
+        }
+    } else {
+        String::new()
+    };
+    hud.measurement_format = HudMeasurementFormat {
+        unit_suffix,
         rounding: match s.appearance.rounding_mode {
             RoundingMode::Points => HudRounding::Points,
             RoundingMode::PointsRounded => HudRounding::PointsRounded,
             RoundingMode::ScreenPixels => HudRounding::ScreenPixels,
         },
         scale_factor: primary_scale_factor(),
+        wh_indicators: s.general.display_wh_indicators,
+        aspect_in_area: s.general.aspect_in_area_tool,
+        aspect_mode: s.general.aspect_mode,
     };
 }
 
@@ -2286,16 +2347,26 @@ fn accel_to_hyprland(accel: &Accelerator) -> (String, String) {
 /// that runs `vernier toggle` (the IPC client command). Returns
 /// `false` if the spawn or hyprctl call failed.
 fn register_hyprland_toggle(accel: &Accelerator) -> bool {
+    register_hyprland_toggle_for(accel, None)
+}
+
+/// Register the toggle bind, optionally targeting a specific Hyprland
+/// instance via `hyprctl --instance <sig>`. The bind watcher uses
+/// this to address a freshly-spawned Hyprland whose instance signature
+/// differs from the one in our process's environment.
+fn register_hyprland_toggle_for(accel: &Accelerator, instance: Option<&str>) -> bool {
     let exe = std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "vernier".to_string());
     let (mods, key) = accel_to_hyprland(accel);
     let arg = format!("bind = {mods}, {key}, exec, {exe} toggle");
-    match std::process::Command::new("hyprctl")
-        .args(["keyword", &arg])
-        .output()
-    {
+    let mut cmd = std::process::Command::new("hyprctl");
+    if let Some(sig) = instance {
+        cmd.args(["-i", sig]);
+    }
+    cmd.args(["keyword", &arg]);
+    match cmd.output() {
         Ok(out) => {
             if !out.status.success() {
                 log::warn!(
@@ -2337,18 +2408,253 @@ fn unregister_hyprland_toggle(accel: &Accelerator) -> bool {
     }
 }
 
+/// Resolve the toggle accelerator from the cached settings. Returns
+/// `None` when `shortcuts.toggle` is empty or unparseable, which is
+/// the same as "no hotkey registered" at startup.
+fn current_toggle_accel() -> Option<Accelerator> {
+    let s = current_settings();
+    if s.shortcuts.toggle.trim().is_empty() {
+        return None;
+    }
+    Accelerator::parse(&s.shortcuts.toggle)
+}
+
+/// Locate the live Hyprland instance: prefer `HYPRLAND_INSTANCE_SIGNATURE`
+/// from our process env when its `.socket2.sock` still exists; otherwise
+/// fall back to the most recently-modified instance directory under
+/// `$XDG_RUNTIME_DIR/hypr/`. The fallback handles the case where Hyprland
+/// restarted while our daemon kept running, leaving a stale env var.
+/// Returns `(signature, path/to/.socket2.sock)`.
+fn current_hyprland_instance() -> Option<(String, PathBuf)> {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+    let hypr_dir = xdg.join("hypr");
+    if let Some(sig_os) = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE") {
+        let sock = hypr_dir.join(&sig_os).join(".socket2.sock");
+        if sock.exists() {
+            return Some((sig_os.to_string_lossy().into_owned(), sock));
+        }
+    }
+    let mut newest: Option<(std::time::SystemTime, String, PathBuf)> = None;
+    for entry in std::fs::read_dir(&hypr_dir).ok()?.flatten() {
+        let dir = entry.path();
+        let sock = dir.join(".socket2.sock");
+        if !sock.exists() {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let sig = entry.file_name().to_string_lossy().into_owned();
+        if newest.as_ref().map_or(true, |(t, _, _)| mtime > *t) {
+            newest = Some((mtime, sig, sock));
+        }
+    }
+    newest.map(|(_, sig, sock)| (sig, sock))
+}
+
+/// Background thread that follows Hyprland's event socket and
+/// re-applies our `hyprctl bind` whenever the bind would otherwise
+/// be lost: on every successful socket connect (covers fresh
+/// daemon-launch and Hyprland restart), and on every `configreloaded`
+/// event (covers `hyprctl reload`, which wipes runtime binds).
+///
+/// The thread loops forever. On socket EOF / read error / disconnect
+/// it sleeps briefly and tries to discover the current Hyprland
+/// instance again — so a Hyprland restart that changes the
+/// `HYPRLAND_INSTANCE_SIGNATURE` is followed transparently as long as
+/// our process can read `$XDG_RUNTIME_DIR/hypr/`.
+fn spawn_hyprland_bind_watcher() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+    std::thread::Builder::new()
+        .name("vernier-hypr-bind-watcher".into())
+        .spawn(|| {
+            let mut last_sig = String::new();
+            loop {
+                let (sig, sock_path) = match current_hyprland_instance() {
+                    Some(v) => v,
+                    None => {
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                let stream = match std::os::unix::net::UnixStream::connect(&sock_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::debug!("hypr socket2 connect ({}): {e}", sock_path.display());
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                let new_instance = sig != last_sig;
+                if new_instance {
+                    log::info!("hypr socket2 connected (instance {sig})");
+                    last_sig = sig.clone();
+                }
+                // Fresh connect = good moment to (re)apply the bind.
+                // Either we just started and need it, or Hyprland came
+                // back from a restart and lost everything.
+                if let Some(accel) = current_toggle_accel() {
+                    register_hyprland_toggle_for(&accel, Some(&sig));
+                }
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if line.starts_with("configreloaded>>") {
+                        log::info!(
+                            "hyprland configreloaded — re-applying vernier toggle bind"
+                        );
+                        if let Some(accel) = current_toggle_accel() {
+                            register_hyprland_toggle_for(&accel, Some(&sig));
+                        }
+                    }
+                }
+                // Reader returned EOF / error — Hyprland likely
+                // restarted or the socket was closed. Force a fresh
+                // instance lookup on the next iteration.
+                last_sig.clear();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+        .ok();
+}
+
 #[derive(Debug, Clone, Default)]
 struct ParsedShortcuts {
-    background: Option<Accelerator>,
+    clear_and_hide: Option<Accelerator>,
     restore: Option<Accelerator>,
     capture: Option<Accelerator>,
+    /// Single-modifier "press-and-hold" binding for Crosshair
+    /// (alignment) mode. Stored as `Modifiers` (single bit) rather
+    /// than `Accelerator` because there's no key — the daemon just
+    /// watches whether that modifier is currently held.
+    crosshair: Option<vernier_platform::Modifiers>,
+    guide_horizontal: Option<Accelerator>,
+    guide_vertical: Option<Accelerator>,
+    color_toggle: Option<Accelerator>,
+    stuck_horizontal: Option<Accelerator>,
+    stuck_vertical: Option<Accelerator>,
+    refresh_capture: Option<Accelerator>,
+    tolerance_up: Option<Accelerator>,
+    tolerance_down: Option<Accelerator>,
+    nudge_left: Option<Accelerator>,
+    nudge_right: Option<Accelerator>,
+    nudge_up: Option<Accelerator>,
+    nudge_down: Option<Accelerator>,
+}
+
+fn parse_modifier_only(s: &str) -> Option<vernier_platform::Modifiers> {
+    use vernier_platform::Modifiers;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "shift" => Some(Modifiers::SHIFT),
+        "ctrl" | "control" => Some(Modifiers::CTRL),
+        "alt" | "opt" | "option" => Some(Modifiers::ALT),
+        "super" | "meta" | "cmd" | "command" | "win" => Some(Modifiers::META),
+        _ => None,
+    }
+}
+
+fn modifier_held(m: vernier_platform::Modifiers, shift: bool, ctrl: bool, alt: bool, sup: bool) -> bool {
+    use vernier_platform::Modifiers;
+    (m == Modifiers::SHIFT && shift)
+        || (m == Modifiers::CTRL && ctrl)
+        || (m == Modifiers::ALT && alt)
+        || (m == Modifiers::META && sup)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NudgeDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Match `pressed` against any of the four nudge bindings, ignoring
+/// SHIFT (which is reserved as the step-multiplier modifier — the
+/// caller still reads `shift_held` separately).
+fn matches_nudge(
+    pressed: &Option<Accelerator>,
+    accels: &ParsedShortcuts,
+) -> Option<NudgeDir> {
+    use vernier_platform::Modifiers;
+    let Some(a) = pressed else { return None };
+    let stripped = Accelerator {
+        modifiers: Modifiers(a.modifiers.0 & !Modifiers::SHIFT.0),
+        key: a.key,
+    };
+    let s = Some(stripped);
+    if s == accels.nudge_left {
+        Some(NudgeDir::Left)
+    } else if s == accels.nudge_right {
+        Some(NudgeDir::Right)
+    } else if s == accels.nudge_up {
+        Some(NudgeDir::Up)
+    } else if s == accels.nudge_down {
+        Some(NudgeDir::Down)
+    } else {
+        None
+    }
+}
+
+fn log_shortcut_accels(p: &ParsedShortcuts) {
+    use vernier_platform::Modifiers;
+    let fmt = |a: &Option<Accelerator>| {
+        a.as_ref()
+            .map(|x| x.to_string_key())
+            .unwrap_or_else(|| "<unset>".into())
+    };
+    let fmt_mod = |m: &Option<Modifiers>| -> String {
+        match m {
+            Some(x) if *x == Modifiers::SHIFT => "SHIFT".into(),
+            Some(x) if *x == Modifiers::CTRL => "CTRL".into(),
+            Some(x) if *x == Modifiers::ALT => "ALT".into(),
+            Some(x) if *x == Modifiers::META => "SUPER".into(),
+            _ => "<unset>".into(),
+        }
+    };
+    log::info!(
+        "shortcuts reloaded — clear_and_hide={} restore={} capture={} crosshair={} \
+         guide_h={} guide_v={} color_toggle={} stuck_h={} stuck_v={} \
+         refresh={} tol_up={} tol_down={} nudge_l={} nudge_r={} nudge_u={} nudge_d={}",
+        fmt(&p.clear_and_hide),
+        fmt(&p.restore),
+        fmt(&p.capture),
+        fmt_mod(&p.crosshair),
+        fmt(&p.guide_horizontal),
+        fmt(&p.guide_vertical),
+        fmt(&p.color_toggle),
+        fmt(&p.stuck_horizontal),
+        fmt(&p.stuck_vertical),
+        fmt(&p.refresh_capture),
+        fmt(&p.tolerance_up),
+        fmt(&p.tolerance_down),
+        fmt(&p.nudge_left),
+        fmt(&p.nudge_right),
+        fmt(&p.nudge_up),
+        fmt(&p.nudge_down),
+    );
 }
 
 fn parse_shortcut_accels(s: &Settings) -> ParsedShortcuts {
     ParsedShortcuts {
-        background: Accelerator::parse(&s.shortcuts.background_mode),
+        clear_and_hide: Accelerator::parse(&s.shortcuts.clear_and_hide),
         restore: Accelerator::parse(&s.shortcuts.restore_session),
         capture: Accelerator::parse(&s.shortcuts.capture),
+        crosshair: parse_modifier_only(&s.shortcuts.crosshair_mode),
+        guide_horizontal: Accelerator::parse(&s.shortcuts.guide_horizontal),
+        guide_vertical: Accelerator::parse(&s.shortcuts.guide_vertical),
+        color_toggle: Accelerator::parse(&s.shortcuts.color_toggle),
+        stuck_horizontal: Accelerator::parse(&s.shortcuts.stuck_horizontal),
+        stuck_vertical: Accelerator::parse(&s.shortcuts.stuck_vertical),
+        refresh_capture: Accelerator::parse(&s.shortcuts.refresh_capture),
+        tolerance_up: Accelerator::parse(&s.shortcuts.tolerance_up),
+        tolerance_down: Accelerator::parse(&s.shortcuts.tolerance_down),
+        nudge_left: Accelerator::parse(&s.shortcuts.nudge_left),
+        nudge_right: Accelerator::parse(&s.shortcuts.nudge_right),
+        nudge_up: Accelerator::parse(&s.shortcuts.nudge_up),
+        nudge_down: Accelerator::parse(&s.shortcuts.nudge_down),
     }
 }
 
@@ -2385,6 +2691,13 @@ fn xkb_to_accelerator(
         0x0041..=0x005a => Key::Char(char::from_u32(keysym + 0x20)?),
         // Digits 0-9 (no modifier).
         0x0030..=0x0039 => Key::Char(char::from_u32(keysym)?),
+        // Punctuation that the prefs UI spells out (PLUS / MINUS
+        // / EQUAL / UNDERSCORE). Keypad variants normalize to the
+        // same Char so a single binding catches both.
+        0x002b | 0xffab => Key::Char('+'),
+        0x002d | 0xffad => Key::Char('-'),
+        0x003d => Key::Char('='),
+        0x005f => Key::Char('_'),
         _ => return None,
     };
     let mut modifiers = Modifiers::NONE;
@@ -2399,6 +2712,13 @@ fn xkb_to_accelerator(
     }
     if super_held {
         modifiers |= Modifiers::META;
+    }
+    // Shifted-only punctuation (`+` and `_` on US layouts) already
+    // implies SHIFT in the keysym itself — strip it so the
+    // accelerator round-trips with the stored "PLUS" / "UNDERSCORE"
+    // (which parse as Char with NO modifier).
+    if matches!(key, Key::Char('+') | Key::Char('_')) {
+        modifiers = Modifiers(modifiers.0 & !Modifiers::SHIFT.0);
     }
     Some(Accelerator { modifiers, key })
 }
@@ -3232,8 +3552,11 @@ fn snap_to_nearest_x_edge(cursor_x: f64, edges: &[Option<HudEdge>; 4]) -> f64 {
 
 /// Snap an x coordinate to the nearest vertical guide within 8 logical
 /// px. Used while drawing or resizing held rects so edges align cleanly
-/// with reference guides.
+/// with reference guides. No-op when `general.snap_to_guides` is off.
 fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
+    if !current_settings().general.snap_to_guides {
+        return x;
+    }
     const SNAP_PX: f64 = 8.0;
     let mut best = x;
     let mut best_d = SNAP_PX;
@@ -3249,6 +3572,9 @@ fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
 
 /// Mirror of [`snap_x_to_guides`] for horizontal guides.
 fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
+    if !current_settings().general.snap_to_guides {
+        return y;
+    }
     const SNAP_PX: f64 = 8.0;
     let mut best = y;
     let mut best_d = SNAP_PX;
@@ -3690,28 +4016,6 @@ fn cursor_in_held_rect(cursor: Px, rect_start: Px, rect_end: Px) -> bool {
     cursor.x > lo_x && cursor.x < hi_x && cursor.y > lo_y && cursor.y < hi_y
 }
 
-/// XKB keysyms that should bump tolerance up: `+`, `=` (unshifted +),
-/// keypad `+`.
-fn keysym_increases_tolerance(keysym: u32) -> bool {
-    matches!(
-        keysym,
-        0x002b // plus
-        | 0x003d // equal
-        | 0xffab // KP_Add
-    )
-}
-
-/// XKB keysyms that should bump tolerance down: `-`, `_` (shifted -),
-/// keypad `-`.
-fn keysym_decreases_tolerance(keysym: u32) -> bool {
-    matches!(
-        keysym,
-        0x002d // minus
-        | 0x005f // underscore
-        | 0xffad // KP_Subtract
-    )
-}
-
 /// Capture the latest screen frame and run edge detection at the
 /// surface-local cursor `(x, y)`. The result is in surface coordinates
 /// so the HUD can render directly.
@@ -3889,7 +4193,12 @@ fn handle_pointer_button(
             SnapPoint::loose(Px::new(snapped_end.0.round() as i32, snapped_end.1.round() as i32)),
         );
         let aspect = if measurement.width() > 0 && measurement.height() > 0 {
-            classify_aspect(measurement.width(), measurement.height(), AspectMode::Automatic, 0.02)
+            classify_aspect(
+                measurement.width(),
+                measurement.height(),
+                current_settings().general.aspect_mode,
+                0.02,
+            )
         } else {
             None
         };
@@ -4169,6 +4478,41 @@ fn take_held_screenshot(
     };
     let final_w = img.width();
     let final_h = img.height();
+
+    // Always-on capture feedback: padding, retina downscale, and
+    // the shutter sound apply regardless of who handles the file.
+    // Sound fires here so it plays both for the satty-handoff path
+    // and the vernier-managed save path.
+    if prefs.capture_sound {
+        play_shutter_sound();
+    }
+
+    // Satty integration short-circuit: write the cropped frame to
+    // a temp PNG and hand it off. Satty owns post-capture file
+    // save / clipboard / notification; those vernier settings
+    // are intentionally skipped here. Padding, retina downscale,
+    // and the shutter sound have already been applied above.
+    if prefs.satty_integration {
+        let temp_path = std::env::temp_dir()
+            .join(format!("vernier-satty-{}.png", current_timestamp()));
+        img.save(&temp_path)
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        let path_str = temp_path.to_string_lossy().into_owned();
+        let spawned = std::process::Command::new("satty")
+            .args(["--filename", &path_str])
+            .spawn();
+        match spawned {
+            Ok(_) => log::info!(
+                "screenshot handed off to satty: {} ({}×{})",
+                path_str, final_w, final_h
+            ),
+            Err(e) => log::warn!(
+                "satty spawn failed ({path_str}): {e:#} — temp file kept for inspection"
+            ),
+        }
+        return Ok(());
+    }
+
     let dir = prefs
         .output_dir
         .clone()
@@ -4205,24 +4549,6 @@ fn take_held_screenshot(
                 .stdin(file)
                 .spawn();
         }
-    }
-
-    if prefs.capture_sound {
-        // Best-effort: rely on the user's `canberra-gtk-play` /
-        // `paplay` setup for Omarchy's stock shutter sound.
-        std::thread::spawn(|| {
-            for cmd in ["canberra-gtk-play", "paplay"] {
-                let mut c = std::process::Command::new(cmd);
-                if cmd == "canberra-gtk-play" {
-                    c.args(["-i", "screen-capture"]);
-                } else {
-                    c.arg("/usr/share/sounds/freedesktop/stereo/screen-capture.oga");
-                }
-                if c.spawn().is_ok() {
-                    break;
-                }
-            }
-        });
     }
 
     let path_str = path.to_string_lossy().into_owned();
@@ -4271,6 +4597,27 @@ fn take_held_screenshot(
 
 /// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
 /// path; the screenshot capture has its own image-mode call.
+/// Best-effort shutter-sound playback. Spawns a detached process so
+/// the daemon's main loop doesn't block while the audio plays.
+/// Tries canberra-gtk-play (with the standard `screen-capture`
+/// theme name) first, falls back to paplay against the freedesktop
+/// sound file. Silent if neither is installed.
+fn play_shutter_sound() {
+    std::thread::spawn(|| {
+        for cmd in ["canberra-gtk-play", "paplay"] {
+            let mut c = std::process::Command::new(cmd);
+            if cmd == "canberra-gtk-play" {
+                c.args(["-i", "screen-capture"]);
+            } else {
+                c.arg("/usr/share/sounds/freedesktop/stereo/screen-capture.oga");
+            }
+            if c.spawn().is_ok() {
+                break;
+            }
+        }
+    });
+}
+
 fn write_clipboard_text(text: &str) -> Result<()> {
     use std::io::Write;
     let mut child = std::process::Command::new("wl-copy")
@@ -4446,4 +4793,103 @@ fn ipc_socket_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     Ok(runtime_dir.join("vernier.sock"))
+}
+
+/// Lockfile path used to enforce single-instance for the prefs
+/// window. A `UnixListener` bound here proves ownership; the OS
+/// releases the bind when the prefs process exits.
+fn prefs_lock_path() -> Result<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    Ok(runtime_dir.join("vernier.prefs.lock"))
+}
+
+/// Try to claim the prefs singleton lock. Returns `Some(listener)`
+/// when this process is the sole prefs window — keep it alive for
+/// the lifetime of the prefs UI. Returns `None` when another
+/// prefs is already running (a connect to the lock socket
+/// succeeds), in which case the caller should focus the existing
+/// window and exit.
+fn acquire_prefs_singleton_lock(path: &Path) -> Option<std::os::unix::net::UnixListener> {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return None;
+    }
+    let _ = std::fs::remove_file(path);
+    std::os::unix::net::UnixListener::bind(path).ok()
+}
+
+/// Race-free daemon singleton via `flock(LOCK_EX|LOCK_NB)`. The lock
+/// is released by the kernel when the returned `File`'s last fd is
+/// closed — so it survives panics and clean exits, and is reclaimable
+/// even after a SIGKILL. Holding this before any portal work prevents
+/// two racing daemons from each prompting xdph for screencast consent.
+fn acquire_daemon_singleton_lock() -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let lock_path = runtime_dir.join("vernier.daemon.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open daemon lock at {}", lock_path.display()))?;
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if r == 0 {
+        return Ok(Some(f));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(None),
+        _ => Err(anyhow::anyhow!("flock {}: {err}", lock_path.display())),
+    }
+}
+
+/// Block SIGTERM/SIGINT for the calling thread so freshly-spawned
+/// threads inherit the block. A dedicated `vernier-signal` thread
+/// (see `spawn_signal_quit_thread`) then accepts these signals via
+/// `sigwait` and converts them into `IpcCmd::Quit`. Without this,
+/// SIGTERM would default-kill the daemon mid-screencast — xdg-desktop-
+/// portal never gets to flush the restore token to its GVariant DB,
+/// and the next launch re-prompts the user.
+fn block_quit_signals() -> Result<()> {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(anyhow::anyhow!(
+                "pthread_sigmask: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Spawn the signal-handler thread that turns SIGTERM/SIGINT into a
+/// graceful `IpcCmd::Quit` on the main event channel. Must be called
+/// after `block_quit_signals` so this thread is the only one that
+/// receives the signals.
+fn spawn_signal_quit_thread(combined_tx: std::sync::mpsc::Sender<MainEvent>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("vernier-signal".into())
+        .spawn(move || {
+            let mut sig: libc::c_int = 0;
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTERM);
+                libc::sigaddset(&mut set, libc::SIGINT);
+                let _ = libc::sigwait(&set, &mut sig);
+            }
+            log::info!("received signal {sig}; shutting down cleanly");
+            let _ = combined_tx.send(MainEvent::Ipc(IpcCmd::Quit));
+        })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("spawn signal thread: {e}"))
 }

@@ -415,7 +415,10 @@ pub(crate) fn open_session_blocking() -> Result<SessionState> {
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("tokio runtime: {e}")))?;
     let result = runtime.block_on(open_session_async(prev_token))?;
 
-    if let Some(token) = result.restore_token.as_deref() {
+    // Guard against empty strings so we don't blow away a previously
+    // good token if xdph or ashpd hands back `Some("")` on a degenerate
+    // path. `load_token()` already treats empty as None.
+    if let Some(token) = result.restore_token.as_deref().filter(|t| !t.is_empty()) {
         if let Err(e) = save_token(token) {
             log::warn!("screencast: could not persist restore token: {e}");
         } else {

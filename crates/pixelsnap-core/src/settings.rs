@@ -32,10 +32,27 @@ pub struct GeneralSettings {
     /// Hide the system-tray icon. The daemon still runs; the user
     /// drives it through the global hotkey + `vernier toggle`.
     pub hide_tray_icon: bool,
-    /// Save the on-screen content (held rects, guides, stuck
-    /// measurements) on Esc-exit so a follow-up `Shift+R` restores
-    /// it. Disable to always start with a blank overlay.
-    pub session_persistence: bool,
+    /// Append the unit suffix (`px` / `pt`) to dimension pills.
+    /// When false, pills show bare numbers — useful when the user
+    /// wants the screen to stay clean and already knows the unit.
+    pub display_units: bool,
+    /// Prefix area-pill values with `W:` and `H:` labels:
+    /// `W: 1024 × H: 768` instead of `1024 × 768`.
+    pub display_wh_indicators: bool,
+    /// Aspect-ratio reporting style for the area tool.
+    pub aspect_mode: crate::AspectMode,
+    /// Show the aspect-ratio readout in the distance / single-axis
+    /// HUD. (No-op until single-axis aspect rendering ships.)
+    pub aspect_in_distance_tool: bool,
+    /// Show the aspect-ratio pill underneath area-tool rectangles.
+    pub aspect_in_area_tool: bool,
+    /// Snap distance / area drags to placed reference guides.
+    /// Disable for free-cursor measurement near guides.
+    pub snap_to_guides: bool,
+    /// Freeze the captured frame at measurement-mode entry. When
+    /// false, the daemon refreshes the frame on every pointer move
+    /// so edge detection follows live content.
+    pub freeze_screen: bool,
 }
 
 impl Default for GeneralSettings {
@@ -43,7 +60,13 @@ impl Default for GeneralSettings {
         Self {
             launch_at_login: false,
             hide_tray_icon: false,
-            session_persistence: true,
+            display_units: true,
+            display_wh_indicators: false,
+            aspect_mode: crate::AspectMode::Automatic,
+            aspect_in_distance_tool: false,
+            aspect_in_area_tool: true,
+            snap_to_guides: true,
+            freeze_screen: true,
         }
     }
 }
@@ -72,6 +95,16 @@ pub struct ScreenshotSettings {
     /// Run the post-capture notify-send notification with an "Edit"
     /// action that opens the file in `satty`.
     pub satty_edit_action: bool,
+    /// When true, the daemon hands every screenshot directly to
+    /// `satty` (writing to a temp PNG and spawning satty with
+    /// `--filename`). Satty owns the file save / clipboard / share
+    /// flow, so `output_dir`, `filename_template`, `copy_to_clipboard`,
+    /// and `satty_edit_action` are skipped. `padding_px`,
+    /// `retina_downscale`, and `capture_sound` still apply because
+    /// they shape the image bytes (or the local audio feedback)
+    /// regardless of who saves the file. Mirrors macOS macOS
+    /// CleanShot X integration.
+    pub satty_integration: bool,
 }
 
 impl Default for ScreenshotSettings {
@@ -84,6 +117,7 @@ impl Default for ScreenshotSettings {
             capture_sound: true,
             copy_to_clipboard: true,
             satty_edit_action: true,
+            satty_integration: true,
         }
     }
 }
@@ -94,12 +128,37 @@ pub struct ToleranceSettings {
     /// Default tolerance level applied each time the daemon enters
     /// measure mode. Live `+`/`-` keys still cycle within a session.
     pub default_level: ToleranceLevel,
+    /// Per-level numeric values (sum-of-channel difference,
+    /// 0..=255 in the prefs UI). The active level's value is what
+    /// the edge detector compares against.
+    pub zero_value: u32,
+    pub low_value: u32,
+    pub medium_value: u32,
+    pub high_value: u32,
 }
 
 impl Default for ToleranceSettings {
     fn default() -> Self {
         Self {
-            default_level: ToleranceLevel::Low,
+            default_level: ToleranceLevel::Medium,
+            zero_value: 0,
+            low_value: 14,
+            medium_value: 26,
+            high_value: 52,
+        }
+    }
+}
+
+impl ToleranceSettings {
+    /// Look up the configured value for `level`. Used by the edge
+    /// detector and the HUD readouts so the user's slider changes
+    /// take effect on the next reload-settings.
+    pub fn value_for(&self, level: ToleranceLevel) -> u32 {
+        match level {
+            ToleranceLevel::Zero => self.zero_value,
+            ToleranceLevel::Low => self.low_value,
+            ToleranceLevel::Medium => self.medium_value,
+            ToleranceLevel::High => self.high_value,
         }
     }
 }
@@ -113,18 +172,6 @@ pub enum ToleranceLevel {
 }
 
 impl ToleranceLevel {
-    /// Numeric value used by [`crate::Tolerance`] (sum-of-channel
-    /// difference, 0..=765). Tuned alongside the daemon's
-    /// edge-detection so the on-screen labels align with the
-    /// cycle-via-`+`/`-` UX.
-    pub fn value(self) -> u32 {
-        match self {
-            Self::Zero => 0,
-            Self::Low => 16,
-            Self::Medium => 48,
-            Self::High => 96,
-        }
-    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Zero => "Zero",
@@ -282,13 +329,63 @@ pub struct ShortcutSettings {
     /// Toggle measure mode. Stored as a textual accelerator
     /// (`SUPER+CTRL+SHIFT+F`); the platform layer parses on init.
     pub toggle: String,
-    /// Activate background mode (toggles measure mode off without
-    /// clearing held content).
-    pub background_mode: String,
+    /// Clear all held content and hide the overlay.
+    /// (For just-hide-and-keep behavior, use the toggle measure
+    /// mode hotkey: it preserves content so a follow-up toggle
+    /// brings everything back exactly as it was.)
+    #[serde(alias = "background_mode")]
+    pub clear_and_hide: String,
+    /// When true (default), `clear_and_hide` requires a double
+    /// tap within `clear_and_hide_double_press_window_ms` to fire
+    /// — first press shows a "Press X again to clear and exit"
+    /// toast. Useful for users whose physical key for this
+    /// shortcut overlaps with a modifier (e.g. Caps mapped to
+    /// both Ctrl and Esc) and who'd otherwise wipe their session
+    /// by accident. Untick for instant single-press behavior.
+    pub clear_and_hide_double_press: bool,
+    /// Window (milliseconds) within which the second press has
+    /// to land for the action to fire. Only meaningful when
+    /// `clear_and_hide_double_press` is true. Bounds: clamped to
+    /// 100..=3000ms at runtime.
+    pub clear_and_hide_double_press_window_ms: u32,
     /// Restore last saved session.
     pub restore_session: String,
     /// Capture the held rect (the menu Camera item).
     pub capture: String,
+    /// Modifier whose held state activates Crosshair (alignment)
+    /// mode — full-screen axis lines with measurements suppressed
+    /// for visual alignment work. Stored as one of "SHIFT" /
+    /// "CTRL" / "ALT" / "SUPER" (or empty to disable).
+    pub crosshair_mode: String,
+    /// Place a horizontal reference guide (click the next mouse
+    /// button to commit it at the cursor's y).
+    pub guide_horizontal: String,
+    /// Place a vertical reference guide.
+    pub guide_vertical: String,
+    /// Toggle the HUD foreground between primary and alternate
+    /// color (coral red ↔ black by default).
+    pub color_toggle: String,
+    /// Freeze the current crosshair's horizontal extent as a
+    /// stuck measurement.
+    pub stuck_horizontal: String,
+    /// Freeze the current crosshair's vertical extent as a stuck
+    /// measurement.
+    pub stuck_vertical: String,
+    /// Recapture the screen so subsequent edge-detection sees the
+    /// latest content.
+    pub refresh_capture: String,
+    /// Bump tolerance up one level (more aggressive edge merging).
+    pub tolerance_up: String,
+    /// Bump tolerance down one level.
+    pub tolerance_down: String,
+    /// Nudge the hovered held rect 1 px left (10 px with Shift).
+    pub nudge_left: String,
+    /// Nudge the hovered held rect 1 px right (10 px with Shift).
+    pub nudge_right: String,
+    /// Nudge the hovered held rect 1 px up (10 px with Shift).
+    pub nudge_up: String,
+    /// Nudge the hovered held rect 1 px down (10 px with Shift).
+    pub nudge_down: String,
 }
 
 impl Default for ShortcutSettings {
@@ -297,9 +394,24 @@ impl Default for ShortcutSettings {
             // Hyprland's binding-line wraps SUPER around this; the
             // GlobalShortcuts portal sees CTRL+SHIFT+F.
             toggle: "CTRL+SHIFT+F".to_string(),
-            background_mode: "ESC".to_string(),
+            clear_and_hide: "ESC".to_string(),
+            clear_and_hide_double_press: true,
+            clear_and_hide_double_press_window_ms: 1000,
             restore_session: "SHIFT+R".to_string(),
             capture: "ENTER".to_string(),
+            crosshair_mode: "SHIFT".to_string(),
+            guide_horizontal: "SHIFT+H".to_string(),
+            guide_vertical: "SHIFT+V".to_string(),
+            color_toggle: "X".to_string(),
+            stuck_horizontal: "H".to_string(),
+            stuck_vertical: "V".to_string(),
+            refresh_capture: "R".to_string(),
+            tolerance_up: "PLUS".to_string(),
+            tolerance_down: "MINUS".to_string(),
+            nudge_left: "LEFT".to_string(),
+            nudge_right: "RIGHT".to_string(),
+            nudge_up: "UP".to_string(),
+            nudge_down: "DOWN".to_string(),
         }
     }
 }
@@ -341,7 +453,7 @@ impl Settings {
 /// Default-supplying types for Tolerance so `#[serde(default)]` works.
 impl Default for ToleranceLevel {
     fn default() -> Self {
-        Self::Low
+        Self::Medium
     }
 }
 impl Default for Units {
