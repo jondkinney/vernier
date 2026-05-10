@@ -86,11 +86,19 @@ struct PrefsApp {
     last_status: Option<String>,
     logo: Option<egui::TextureHandle>,
     /// Cached icon texture for the configured handoff app, keyed on
-    /// the `handoff_icon_path` it was loaded from. Reloaded by
-    /// [`PrefsApp::sync_handoff_icon`] when the path changes (e.g.
-    /// after the user browses to a different binary). `None` when
-    /// no icon was resolvable for the chosen app.
+    /// the `handoff_icon_path` it was loaded from. Reloaded when the
+    /// path changes (e.g. after the user browses to a different
+    /// binary). `None` when no icon was resolvable for the chosen
+    /// app — the card draws a placeholder square instead.
     handoff_icon: Option<(String, egui::TextureHandle)>,
+    /// Installed common screenshot/annotation apps detected on
+    /// `$PATH` at prefs startup, paired with pre-rasterized icon
+    /// textures for the dropdown rows. Populated once in
+    /// [`PrefsApp::new`] since the set won't change while the
+    /// window is open. Empty when none of [`vernier_core::KNOWN_HANDOFF_APPS`]
+    /// is installed — the dropdown then shows a hint pointing at
+    /// the Browse… button.
+    installed_handoff_apps: Vec<(HandoffApp, Option<egui::TextureHandle>)>,
     /// Receives the path the user picked from the folder dialog.
     /// `Some(rx)` while the dialog is open; cleared once the user
     /// either picks a folder or cancels.
@@ -128,6 +136,25 @@ impl PrefsApp {
         apply_style(&cc.egui_ctx);
         let logo = load_logo_texture(&cc.egui_ctx);
         let initial = Settings::load().unwrap_or_default();
+        // One-shot PATH scan for the curated handoff-app list, with
+        // each app's icon SVG pre-rasterized into a TextureHandle so
+        // the dropdown rows draw without filesystem I/O on hover.
+        // The set is fixed for the lifetime of the prefs window —
+        // a user installing a new tool while prefs is open is rare
+        // enough that we don't re-scan.
+        let installed_handoff_apps: Vec<(HandoffApp, Option<egui::TextureHandle>)> =
+            vernier_core::find_installed_handoff_apps()
+                .into_iter()
+                .map(|app| {
+                    let tex_name = format!("handoff_dropdown_{}", app.command);
+                    let tex = load_handoff_icon_texture(
+                        &cc.egui_ctx,
+                        &tex_name,
+                        &app.icon_path,
+                    );
+                    (app, tex)
+                })
+                .collect();
         let now = Instant::now();
         Self {
             section: Section::General,
@@ -138,6 +165,7 @@ impl PrefsApp {
             last_status: None,
             logo,
             handoff_icon: None,
+            installed_handoff_apps,
             folder_pick: None,
             handoff_pick: None,
             capturing_shortcut: None,
@@ -300,6 +328,11 @@ impl App for PrefsApp {
                         }
                     });
                     apply_handoff_app(&mut self.edited.screenshots, info);
+                    // Browsing is the user's "I want this" gesture
+                    // — enable handoff so they don't have to also
+                    // click the Enable checkbox. Same behavior as
+                    // picking from the dropdown.
+                    self.edited.screenshots.handoff_enabled = true;
                     self.handoff_pick = None;
                 }
                 Ok(None) => {
@@ -313,30 +346,20 @@ impl App for PrefsApp {
         }
 
         // Keep the cached handoff icon in sync with the configured
-        // path. We compute the *effective* icon path for display:
-        // when nothing is configured yet, fall back to the auto-
-        // detected default's icon (so the card paints with Satty
-        // on a fresh install without persisting it). Reload only on
-        // path change to avoid rasterizing every frame.
-        let effective_icon_path = if self.edited.screenshots.handoff_icon_path.is_empty()
-            && self.edited.screenshots.handoff_command.is_empty()
-        {
-            vernier_core::detect_default_handoff()
-                .map(|d| d.icon_path)
-                .unwrap_or_default()
-        } else {
-            self.edited.screenshots.handoff_icon_path.clone()
-        };
+        // path. No auto-detect fallback — when nothing is picked,
+        // the card paints a placeholder square instead. Reload only
+        // on path change to avoid rasterizing every frame.
+        let icon_path = self.edited.screenshots.handoff_icon_path.clone();
         let needs_reload = match &self.handoff_icon {
-            Some((cached, _)) => cached.as_str() != effective_icon_path,
-            None => !effective_icon_path.is_empty(),
+            Some((cached, _)) => cached.as_str() != icon_path,
+            None => !icon_path.is_empty(),
         };
         if needs_reload {
-            self.handoff_icon = if effective_icon_path.is_empty() {
+            self.handoff_icon = if icon_path.is_empty() {
                 None
             } else {
-                load_handoff_icon_texture(ctx, &effective_icon_path)
-                    .map(|tex| (effective_icon_path.clone(), tex))
+                load_handoff_icon_texture(ctx, "handoff_card_icon", &icon_path)
+                    .map(|tex| (icon_path.clone(), tex))
             };
         }
 
@@ -452,6 +475,7 @@ impl App for PrefsApp {
                             &mut self.folder_pick,
                             &mut self.handoff_pick,
                             self.handoff_icon.as_ref().map(|(_, tex)| tex),
+                            &self.installed_handoff_apps,
                         ),
                         Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
                         Section::Appearance => {
@@ -749,8 +773,13 @@ fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 /// bolted on later by routing through the `image` crate. Returns
 /// `None` for non-SVG paths or anything that fails to parse —
 /// callers fall back to a placeholder rect.
+///
+/// `name` is the egui texture identifier — pass a unique string per
+/// app when loading many at once (e.g. the dropdown's row icons)
+/// so the loader doesn't collide on the same key.
 fn load_handoff_icon_texture(
     ctx: &egui::Context,
+    name: &str,
     path: &str,
 ) -> Option<egui::TextureHandle> {
     if path.is_empty() {
@@ -771,7 +800,7 @@ fn load_handoff_icon_texture(
         return None;
     }
     let image = egui::ColorImage::from_rgba_unmultiplied([size as usize, size as usize], &rgba);
-    Some(ctx.load_texture("handoff_icon", image, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
 }
 
 /// Copy a [`HandoffApp`]'s fields into `s`. Used both when the user
@@ -873,8 +902,9 @@ fn screenshots_section(
     folder_pick: &mut Option<Receiver<Option<PathBuf>>>,
     handoff_pick: &mut Option<Receiver<Option<PathBuf>>>,
     handoff_icon: Option<&egui::TextureHandle>,
+    installed_apps: &[(HandoffApp, Option<egui::TextureHandle>)],
 ) {
-    paint_handoff_card(ui, s, handoff_icon, handoff_pick);
+    paint_handoff_card(ui, s, handoff_icon, handoff_pick, installed_apps);
     ui.add_space(18.0);
 
     // Always-active settings — these affect the image bytes (or the
@@ -976,18 +1006,29 @@ fn screenshots_section(
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.copy_to_clipboard, "Copy image to clipboard");
+        // The notification's Edit action only fires if there's an
+        // app to launch — grey it out (with a hint) when nothing is
+        // picked. The bound value still flips on click but has no
+        // effect at capture time.
+        let has_pick = !s.handoff_command.is_empty();
         let app_name = handoff_label_for(s);
-        ui.checkbox(
-            &mut s.handoff_edit_action,
-            format!("Show \"Edit\" action in notification (opens in {app_name})"),
-        );
+        let label = if has_pick {
+            format!("Show \"Edit\" action in notification (opens in {app_name})")
+        } else {
+            "Show \"Edit\" action in notification (pick a handoff app first)"
+                .to_string()
+        };
+        ui.add_enabled_ui(has_pick, |ui| {
+            ui.checkbox(&mut s.handoff_edit_action, label);
+        });
     });
     });
 }
 
-/// Display name for the configured (or auto-detected) handoff app.
-/// Used in inline labels like "opens in Satty". Falls back to a
-/// generic phrase when no app is resolvable.
+/// Display name for the configured handoff app. Used in inline
+/// labels like "opens in Satty". Returns a generic phrase when no
+/// app is configured (the checkbox using this label is greyed out
+/// in that case anyway).
 fn handoff_label_for(s: &ScreenshotSettings) -> String {
     if !s.handoff_app_name.is_empty() {
         return s.handoff_app_name.clone();
@@ -997,9 +1038,6 @@ fn handoff_label_for(s: &ScreenshotSettings) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| s.handoff_command.clone());
-    }
-    if let Some(default) = vernier_core::detect_default_handoff() {
-        return default.name;
     }
     "the handoff app".to_string()
 }
@@ -1020,14 +1058,21 @@ fn paint_handoff_card(
     s: &mut ScreenshotSettings,
     icon: Option<&egui::TextureHandle>,
     handoff_pick: &mut Option<Receiver<Option<PathBuf>>>,
+    installed_apps: &[(HandoffApp, Option<egui::TextureHandle>)],
 ) {
-    let app_name = handoff_label_for(s);
-    let command_display = if !s.handoff_command.is_empty() {
-        s.handoff_command.clone()
+    // Two states the card paints:
+    //   - Picked: app icon + name + path, Browse… and Remove
+    //     buttons, full description, Enable toggle.
+    //   - Empty: placeholder square + "No app selected", a "Choose
+    //     app" dropdown of installed annotators (Browse… as escape
+    //     hatch), generic copy, Enable greyed out.
+    // No auto-detect fallback — Remove takes the user back to the
+    // empty state and stays there until they pick again.
+    let has_pick = !s.handoff_command.is_empty();
+    let app_name = if has_pick {
+        handoff_label_for(s)
     } else {
-        vernier_core::detect_default_handoff()
-            .map(|d| d.command)
-            .unwrap_or_default()
+        String::new()
     };
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_gray(34))
@@ -1043,8 +1088,8 @@ fn paint_handoff_card(
                     ui.add_space(14.0);
                 } else {
                     // Placeholder square so the layout stays consistent
-                    // when no app is configured or its icon couldn't
-                    // be resolved.
+                    // in the empty state (and when a picked app's
+                    // icon couldn't be resolved).
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(72.0, 72.0),
                         egui::Sense::hover(),
@@ -1064,21 +1109,35 @@ fn paint_handoff_card(
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("App: {app_name}"))
-                                .color(egui::Color32::from_gray(220))
-                                .size(13.0),
-                        );
+                        if has_pick {
+                            ui.label(
+                                egui::RichText::new(format!("App: {app_name}"))
+                                    .color(egui::Color32::from_gray(220))
+                                    .size(13.0),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("No app selected")
+                                    .color(egui::Color32::from_gray(190))
+                                    .italics()
+                                    .size(13.0),
+                            );
+                        }
                         ui.add_space(8.0);
-                        // Disabled while a previous picker is open
-                        // (rfd doesn't gate concurrent calls and
-                        // we'd get stacked dialogs).
+                        paint_handoff_dropdown(ui, s, installed_apps);
+                        ui.add_space(4.0);
+                        // Disabled while a previous picker is open —
+                        // rfd doesn't gate concurrent calls and we'd
+                        // get stacked dialogs otherwise.
                         let pick_enabled = handoff_pick.is_none();
                         if ui
                             .add_enabled(pick_enabled, egui::Button::new("Browse…"))
+                            .on_hover_text(
+                                "Pick a binary that isn't in the dropdown list",
+                            )
                             .clicked()
                         {
-                            let starting = if !s.handoff_command.is_empty() {
+                            let starting = if has_pick {
                                 PathBuf::from(&s.handoff_command)
                                     .parent()
                                     .map(|p| p.to_path_buf())
@@ -1099,40 +1158,129 @@ fn paint_handoff_card(
                             });
                             *handoff_pick = Some(rx);
                         }
-                        if !s.handoff_command.is_empty()
-                            && ui.button("Reset").clicked()
+                        // Remove only when there's actually a pick to
+                        // delete; goes back to the empty state.
+                        if has_pick
+                            && ui
+                                .button("Remove")
+                                .on_hover_text("Clear the picked app and turn handoff off")
+                                .clicked()
                         {
-                            // Clear back to "auto-detect default" so
-                            // the user can reset without remembering
-                            // which app they wanted; the card then
-                            // falls back to Satty (if installed).
                             s.handoff_command.clear();
                             s.handoff_app_name.clear();
                             s.handoff_args.clear();
                             s.handoff_icon_path.clear();
+                            s.handoff_enabled = false;
                         }
                     });
-                    if !command_display.is_empty() {
+                    if has_pick && !s.handoff_command.is_empty() {
                         ui.label(
-                            egui::RichText::new(&command_display)
+                            egui::RichText::new(&s.handoff_command)
                                 .color(egui::Color32::from_gray(160))
                                 .size(11.5),
                         );
                     }
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!(
+                    let description = if has_pick {
+                        format!(
                             "Hand the captured region straight to {app_name} \
                              for annotation, save, and share. While enabled, \
                              the options below are managed by {app_name}."
-                        ))
-                        .color(egui::Color32::from_gray(190))
-                        .size(12.5),
+                        )
+                    } else {
+                        "Pick a screenshot app from the dropdown — or browse to \
+                         a custom binary — and macOS will hand captures \
+                         off for annotation, save, and share."
+                            .to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(description)
+                            .color(egui::Color32::from_gray(190))
+                            .size(12.5),
                     );
                     ui.add_space(8.0);
-                    ui.checkbox(&mut s.handoff_enabled, "Enable");
+                    // Enable is meaningless without an app to spawn,
+                    // so we grey it out in the empty state. The
+                    // bound value still flips on toggle — it just
+                    // has no effect until an app is picked.
+                    ui.add_enabled_ui(has_pick, |ui| {
+                        let resp = ui.checkbox(&mut s.handoff_enabled, "Enable");
+                        if !has_pick {
+                            resp.on_hover_text("Pick an app first");
+                        }
+                    });
                 });
             });
+        });
+}
+
+/// Dropdown that lists every installed app from
+/// [`vernier_core::KNOWN_HANDOFF_APPS`] with its icon and display
+/// name. Picking a row populates the handoff settings and switches
+/// the Enable toggle on — same effect as a Browse… result.
+fn paint_handoff_dropdown(
+    ui: &mut egui::Ui,
+    s: &mut ScreenshotSettings,
+    installed_apps: &[(HandoffApp, Option<egui::TextureHandle>)],
+) {
+    // The closed-state label depends on whether the user's current
+    // pick matches a known app: matching → "Satty", non-matching
+    // (Browsed) → the user's app name so the dropdown still reads
+    // sensibly, empty → "Choose app".
+    let selected_text = if !s.handoff_command.is_empty() {
+        if !s.handoff_app_name.is_empty() {
+            s.handoff_app_name.clone()
+        } else {
+            "Custom".to_string()
+        }
+    } else {
+        "Choose app".to_string()
+    };
+    egui::ComboBox::from_id_salt("handoff_app_picker")
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            if installed_apps.is_empty() {
+                ui.label(
+                    egui::RichText::new("No known apps on $PATH")
+                        .color(egui::Color32::from_gray(190))
+                        .italics(),
+                );
+                ui.label(
+                    egui::RichText::new("Use Browse… for a custom binary.")
+                        .color(egui::Color32::from_gray(150))
+                        .size(11.5),
+                );
+                return;
+            }
+            for (app, tex) in installed_apps {
+                let selected = s.handoff_command == app.command;
+                // One clickable row containing the icon + name.
+                // ui.horizontal() returns the inner response; using
+                // selectable_label gives us the highlighted selected
+                // appearance.
+                let row = ui.horizontal(|ui| {
+                    if let Some(t) = tex {
+                        ui.add(
+                            egui::Image::new(t)
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                        );
+                        ui.add_space(6.0);
+                    } else {
+                        // Reserve the same horizontal slot when no
+                        // icon resolved so the labels still line up.
+                        ui.add_space(26.0);
+                    }
+                    ui.selectable_label(selected, &app.name)
+                });
+                if row.inner.clicked() {
+                    apply_handoff_app(s, app.clone());
+                    // Picking from the list is the user's "I want
+                    // this integration" gesture — enable as well so
+                    // they don't have to also click the checkbox.
+                    s.handoff_enabled = true;
+                    ui.close();
+                }
+            }
         });
 }
 

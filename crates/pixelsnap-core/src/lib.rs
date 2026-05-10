@@ -19,7 +19,10 @@ pub use edge::{
 };
 pub use frame::FrameView;
 pub use geometry::{Px, PxRect};
-pub use handoff::{detect_default as detect_default_handoff, lookup_for_binary, render_args, resolve_icon, HandoffApp};
+pub use handoff::{
+    find_installed_apps as find_installed_handoff_apps, lookup_for_binary, render_args,
+    resolve_icon, HandoffApp, KNOWN_HANDOFF_APPS,
+};
 pub use measurement::{
     axis_biased_snap, best_snap, Axis, Measurement, Mode as InteractionMode, SnapPoint,
 };

@@ -143,7 +143,10 @@ impl Default for ScreenshotSettings {
             capture_sound: true,
             copy_to_clipboard: true,
             handoff_edit_action: true,
-            handoff_enabled: true,
+            // Off by default — the user opts in by picking an app
+            // from the prefs dropdown (or browsing to a custom
+            // binary). No auto-selection of Satty / etc.
+            handoff_enabled: false,
             handoff_command: String::new(),
             handoff_app_name: String::new(),
             handoff_args: String::new(),

@@ -1,21 +1,27 @@
 //! Discovery + invocation helpers for the post-capture handoff app.
 //!
 //! The daemon hands every screenshot off to a single user-chosen
-//! annotation tool (Satty by default; Swappy, Krita, GIMP, … if the
-//! user browses). This module exposes:
+//! annotation tool (Satty, Swappy, Flameshot, …). Selection is
+//! explicit — the prefs UI surfaces a dropdown of installed common
+//! apps and lets the user Browse to a custom binary; nothing is
+//! auto-selected. This module exposes:
 //!
 //! - [`HandoffApp`] — name, command, arg template, and icon path.
-//! - [`detect_default`] — return Satty's metadata when it's installed,
-//!   so a fresh install can hand off without any user configuration.
+//! - [`KNOWN_HANDOFF_APPS`] — curated list of binary names the
+//!   prefs dropdown looks for.
+//! - [`find_installed_apps`] — return [`HandoffApp`] metadata for
+//!   every entry in [`KNOWN_HANDOFF_APPS`] that's actually on
+//!   `$PATH`.
 //! - [`lookup_for_binary`] — resolve a binary the user picked from
 //!   disk to its display name, args, and icon by parsing its
-//!   `.desktop` file (falling back to a positional `{file}` arg when
-//!   nothing matches).
+//!   `.desktop` file (falling back to a positional `{file}` arg
+//!   when nothing matches).
 //! - [`render_args`] — split an arg template on whitespace and
 //!   substitute `{file}`, producing the runtime argv.
 //!
-//! Lives in `vernier-core` so both the daemon (`vernier-app`) and
-//! the prefs UI (`vernier-ui`) can share one canonical resolver.
+//! Lives in `vernier-core` so both the daemon (`vernier-app`)
+//! and the prefs UI (`vernier-ui`) can share one canonical
+//! resolver.
 
 use std::path::{Path, PathBuf};
 
@@ -37,10 +43,33 @@ pub struct HandoffApp {
     pub icon_path: String,
 }
 
-/// Best-effort default. Currently looks up Satty; returns `None`
-/// when satty isn't installed.
-pub fn detect_default() -> Option<HandoffApp> {
-    lookup_for_binary(Path::new("satty"))
+/// Curated list of binary names the prefs UI scans `$PATH` for to
+/// populate its handoff-app dropdown. Annotation-first tools come
+/// before heavier editors; order here drives the dropdown order.
+///
+/// Heavy image editors (GIMP, Krita) are intentionally omitted —
+/// users who want them can still pick them via Browse… The list
+/// stays focused on tools that take a single PNG path on the
+/// command line and open straight into an annotate-and-save view.
+pub const KNOWN_HANDOFF_APPS: &[&str] = &[
+    "satty",     // Wayland-native, modern annotate-and-save
+    "swappy",    // Sway/wlroots annotation companion
+    "flameshot", // Cross-platform, popular X11 tool
+    "ksnip",     // Cross-platform annotation
+    "shutter",   // Long-standing Perl/Gtk tool
+    "pinta",     // Light Paint.NET-style raster editor
+    "drawing",   // GNOME annotation app
+];
+
+/// Return [`HandoffApp`] metadata for every entry in
+/// [`KNOWN_HANDOFF_APPS`] that's installed on `$PATH`. Order matches
+/// the constant. The prefs UI uses this to drive the picker
+/// dropdown.
+pub fn find_installed_apps() -> Vec<HandoffApp> {
+    KNOWN_HANDOFF_APPS
+        .iter()
+        .filter_map(|name| lookup_for_binary(Path::new(name)))
+        .collect()
 }
 
 /// Resolve `bin` (absolute path or PATH-relative name) to a

@@ -5033,29 +5033,23 @@ fn take_held_screenshot(
     // Padding, retina downscale, and the shutter sound have already
     // been applied above.
     //
-    // When `handoff_command` is empty (fresh install, user hasn't
-    // touched prefs yet), fall back to the auto-detected default
-    // (currently Satty if it's on PATH) so the experience matches
-    // the old hardcoded Satty integration.
-    if prefs.handoff_enabled {
-        let (cmd, args_template, app_label) = if !prefs.handoff_command.is_empty() {
-            let label = if !prefs.handoff_app_name.is_empty() {
-                prefs.handoff_app_name.clone()
-            } else {
-                prefs.handoff_command.clone()
-            };
-            let args = if prefs.handoff_args.is_empty() {
-                "{file}".to_string()
-            } else {
-                prefs.handoff_args.clone()
-            };
-            (prefs.handoff_command.clone(), args, label)
-        } else if let Some(default) = vernier_core::detect_default_handoff() {
-            (default.command, default.args, default.name)
+    // Both flags have to be set: `handoff_enabled` is the master
+    // toggle, `handoff_command` is the app the user picked in
+    // prefs. No auto-detect fallback — if either is missing we
+    // fall through to the vernier-managed save below.
+    if prefs.handoff_enabled && !prefs.handoff_command.is_empty() {
+        let app_label = if !prefs.handoff_app_name.is_empty() {
+            prefs.handoff_app_name.clone()
         } else {
-            (String::new(), String::new(), String::new())
+            prefs.handoff_command.clone()
         };
-        if !cmd.is_empty() {
+        let args_template = if prefs.handoff_args.is_empty() {
+            "{file}".to_string()
+        } else {
+            prefs.handoff_args.clone()
+        };
+        let cmd = prefs.handoff_command.clone();
+        {
             let temp_path = std::env::temp_dir()
                 .join(format!("vernier-handoff-{}.png", current_timestamp()));
             img.save(&temp_path)
@@ -5083,11 +5077,6 @@ fn take_held_screenshot(
                     return Ok(CaptureOutcome::SavedLocal);
                 }
             }
-        } else {
-            log::warn!(
-                "handoff enabled but no app configured and no default detected — \
-                 falling back to vernier-managed save"
-            );
         }
     }
 
@@ -5130,27 +5119,24 @@ fn take_held_screenshot(
     }
 
     let path_str = path.to_string_lossy().into_owned();
-    let edit_action = prefs.handoff_edit_action;
     // Resolve the handoff app once, on the daemon thread, so the
     // notification thread closure owns simple Strings — no Settings
-    // borrow held across the notify-send wait.
-    let handoff_for_action = if edit_action {
-        if !prefs.handoff_command.is_empty() {
-            let label = if !prefs.handoff_app_name.is_empty() {
-                prefs.handoff_app_name.clone()
-            } else {
-                prefs.handoff_command.clone()
-            };
-            let args = if prefs.handoff_args.is_empty() {
-                "{file}".to_string()
-            } else {
-                prefs.handoff_args.clone()
-            };
-            Some((prefs.handoff_command.clone(), args, label))
+    // borrow held across the notify-send wait. Only fires when both
+    // edit_action is on AND the user actually picked an app.
+    let handoff_for_action = if prefs.handoff_edit_action
+        && !prefs.handoff_command.is_empty()
+    {
+        let label = if !prefs.handoff_app_name.is_empty() {
+            prefs.handoff_app_name.clone()
         } else {
-            vernier_core::detect_default_handoff()
-                .map(|d| (d.command, d.args, d.name))
-        }
+            prefs.handoff_command.clone()
+        };
+        let args = if prefs.handoff_args.is_empty() {
+            "{file}".to_string()
+        } else {
+            prefs.handoff_args.clone()
+        };
+        Some((prefs.handoff_command.clone(), args, label))
     } else {
         None
     };
