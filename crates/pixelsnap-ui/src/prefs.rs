@@ -165,6 +165,11 @@ impl PrefsApp {
 
     fn revert_now(&mut self) {
         self.edited = self.saved.clone();
+        // Pressing Revert from a shortcut row also exits capture
+        // mode, so the user can use Revert as an "escape" path
+        // when they accidentally clicked into a shortcut chip or
+        // its X button and want the original binding back.
+        self.capturing_shortcut = None;
         self.last_status = Some("Reverted to last save.".to_string());
     }
 }
@@ -315,11 +320,16 @@ impl App for PrefsApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
+                        // Revert is also active while a shortcut row is in
+                        // capture mode (even before the user has changed
+                        // anything) so it can serve as an "escape" out of
+                        // an accidental capture click or X press.
+                        let revertable = dirty || self.capturing_shortcut.is_some();
                         if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
                             self.save_now();
                         }
                         ui.add_space(4.0);
-                        if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
+                        if ui.add_enabled(revertable, egui::Button::new("Revert")).clicked() {
                             self.revert_now();
                         }
                         if dirty {
