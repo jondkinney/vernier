@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8" /></head>
+  <body>
+    <script>
+      const URL = "ws://127.0.0.1:8765";
+      const RECONNECT_MS = 2000;
+
+      let ws = null;
+      let pendingReconnect = null;
+      let lastZoom = -1;
+
+      function send(zoom) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: "zoom", value: zoom }));
+        } catch (e) {
+          // ignore — onclose will follow
+        }
+      }
+
+      function connect() {
+        try {
+          ws = new WebSocket(URL);
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        ws.onopen = () => {
+          if (lastZoom >= 0) send(lastZoom);
+        };
+        ws.onclose = () => {
+          ws = null;
+          scheduleReconnect();
+        };
+        ws.onerror = () => {
+          // onclose follows.
+        };
+      }
+
+      function scheduleReconnect() {
+        if (pendingReconnect != null) return;
+        pendingReconnect = setTimeout(() => {
+          pendingReconnect = null;
+          connect();
+        }, RECONNECT_MS);
+      }
+
+      window.onmessage = (event) => {
+        const msg = event.data && event.data.pluginMessage;
+        if (!msg || msg.type !== "zoom") return;
+        lastZoom = msg.value;
+        send(msg.value);
+      };
+
+      connect();
+    </script>
+  </body>
+</html>

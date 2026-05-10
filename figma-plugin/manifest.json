@@ -1,0 +1,16 @@
+{
+  "name": "macOS Bridge",
+  "id": "vernier-bridge-dev",
+  "api": "1.0.0",
+  "main": "main.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "http://127.0.0.1:8765",
+      "ws://127.0.0.1:8765"
+    ],
+    "reasoning": "Reports the current viewport zoom to the local vernier daemon so on-screen measurements are reported in canvas pixels rather than zoomed screen pixels."
+  }
+}
