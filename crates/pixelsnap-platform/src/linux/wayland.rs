@@ -41,9 +41,9 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use wayland_client::{
-    Connection, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::{
@@ -442,6 +442,15 @@ struct OverlayInst {
     input_capturing: bool,
     /// Optional HUD to draw on top of the background tint.
     hud: Option<Hud>,
+    /// True after we've requested a `wl_surface.frame()` callback and
+    /// committed; cleared when the compositor signals `Done`. While
+    /// set, additional `draw_overlay` calls flip `redraw_pending`
+    /// instead of committing — Hyprland disconnects clients that
+    /// commit faster than the display refresh rate.
+    frame_pending: bool,
+    /// State changed while `frame_pending` was set; on the next
+    /// callback we'll redraw with the latest state.
+    redraw_pending: bool,
 }
 
 fn run_event_loop(
@@ -641,6 +650,8 @@ impl WaylandState {
                 visible_atomic: visible_atomic.clone(),
                 input_capturing: false,
                 hud: None,
+                frame_pending: false,
+                redraw_pending: false,
             },
         );
 
@@ -743,10 +754,18 @@ impl WaylandState {
             return;
         };
         log::debug!(
-            "draw_overlay key={:?} configured={} {}x{} visible={}",
-            key, inst.configured, inst.width, inst.height, inst.visible_intent
+            "draw_overlay key={:?} configured={} {}x{} visible={} frame_pending={}",
+            key, inst.configured, inst.width, inst.height, inst.visible_intent,
+            inst.frame_pending,
         );
         if !inst.configured || inst.width == 0 || inst.height == 0 {
+            return;
+        }
+        // The compositor hasn't released the previous frame yet —
+        // remember that we have new state and bail; the wl_callback
+        // Done handler will pick up the redraw.
+        if inst.frame_pending {
+            inst.redraw_pending = true;
             return;
         }
         let scale = inst.buffer_scale.max(1);
@@ -790,6 +809,12 @@ impl WaylandState {
         }
         // damage_buffer is in BUFFER coords — match the buffer dims.
         surface.damage_buffer(0, 0, buf_w, buf_h);
+        // Frame callback throttles us to the compositor's display
+        // refresh. The Done handler clears `frame_pending` and
+        // re-issues `draw_overlay` if state changed in the meantime.
+        surface.frame(&self.qh, key);
+        inst.frame_pending = true;
+        inst.redraw_pending = false;
         surface.commit();
     }
 
@@ -1227,6 +1252,36 @@ impl KeyboardHandler for WaylandState {
         _: &wl_keyboard::WlKeyboard,
         _: smithay_client_toolkit::seat::keyboard::RepeatInfo,
     ) {
+    }
+}
+
+/// Frame-callback Done means "the previous commit landed; you can
+/// commit the next one." If state changed while we were waiting, draw
+/// the latest immediately — otherwise we'll redraw the next time the
+/// app pushes a HUD update.
+impl Dispatch<wl_callback::WlCallback, OverlayKey> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        data: &OverlayKey,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if !matches!(event, wl_callback::Event::Done { .. }) {
+            return;
+        }
+        let mut redraw_now = false;
+        if let Some(inst) = state.overlays.get_mut(data) {
+            inst.frame_pending = false;
+            if inst.redraw_pending {
+                inst.redraw_pending = false;
+                redraw_now = true;
+            }
+        }
+        if redraw_now {
+            state.draw_overlay(*data);
+        }
     }
 }
 

@@ -20,7 +20,13 @@ use std::time::{Duration, Instant};
 /// compositor always has a fresh frame, but not so high that we
 /// flood the Wayland connection. Used by both the live cursor
 /// redraws and the nudge auto-repeat throttle.
-const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(8);
+// 16ms (~60 Hz) caps surface commits at a rate Hyprland tolerates
+// without `wl_surface.frame()` callback backpressure. Sustained
+// commits faster than this (we used to throttle at 8ms / 125 Hz)
+// caused the compositor to close the wayland socket — surfacing as
+// "Broken pipe (os error 32)" and a dead overlay — when the user
+// held an arrow key long enough for nudge auto-repeat to accumulate.
+const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
@@ -489,7 +495,7 @@ fn run_daemon() -> Result<()> {
     // previous thread without an explicit cancel signal.
     let nudge_active_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     const NUDGE_INITIAL_DELAY_MS: u64 = 225;
-    const NUDGE_INTERVAL_MS: u64 = 4; // ~250 Hz
+    const NUDGE_INTERVAL_MS: u64 = 16; // ~60 Hz — matches HUD_REDRAW_INTERVAL
     // Live resize op against a held rect — set on press over an
     // edge/corner, cleared on release.
     let mut resizing: Option<ResizeOp> = None;
@@ -3022,11 +3028,11 @@ fn apply_nudge_step(
         rect.rect_end.0 += dx;
         rect.rect_end.1 += dy;
     }
-    // Rate-limit buffer commits to display refresh. The auto-
-    // repeat timer drives this at ~250Hz which would otherwise
-    // flood the compositor's wayland queue and break the pipe.
-    // Position math still applies every tick; only the redraw
-    // is throttled.
+    // Rate-limit buffer commits to ~60 Hz. Hyprland disconnects
+    // clients that sustain faster commit rates without
+    // `wl_surface.frame()` callback backpressure (broken pipe →
+    // dead overlay). Position math still applies every tick; only
+    // the redraw is throttled.
     if last_hud_redraw.elapsed() < HUD_REDRAW_INTERVAL {
         return;
     }
