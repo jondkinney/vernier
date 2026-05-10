@@ -1253,43 +1253,85 @@ fn run_daemon() -> Result<()> {
                         super_held,
                     );
                     last_hud_redraw = Instant::now();
-                    if let ButtonOutcome::ScreenshotTaken = outcome {
-                        // Stay in measure mode after a screenshot —
-                        // the held rect remains hoverable so the user
-                        // can re-shoot the same region (or any other
-                        // held rect) without re-toggling. Toast just
-                        // confirms the capture; it elapses without
-                        // exiting measure mode.
-                        let toast = HudToast { text: "Screenshot taken".into() };
-                        active_toast = Some(toast.clone());
-                        toast_until =
-                            Some(Instant::now() + Duration::from_millis(TOAST_SCREENSHOT_MS));
-                        spawn_toast_timer(
-                            &combined_tx,
-                            Duration::from_millis(TOAST_SCREENSHOT_MS),
-                            false,
-                        );
-                        let toast_ref = current_toast(&active_toast, toast_until);
-                        refresh_hud(
-                            &mode,
-                            &mut overlay,
-                            frozen_frame.as_ref(),
-                            x,
-                            y,
-                            current_tol_value(tol_level),
-                            toast_ref,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            super_held,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
-                        );
+                    if let ButtonOutcome::ScreenshotTaken { handed_off } = outcome {
+                        if handed_off {
+                            // Handoff path: the external annotation app
+                            // (Satty etc.) is now opening with the
+                            // captured PNG. Persist the session, wipe
+                            // every held rect / guide / stuck so a
+                            // later toggle-on starts clean, and drop
+                            // out of measure mode so the user can
+                            // focus on the annotator without our
+                            // overlay's content lingering on screen.
+                            // Mirrors the Esc clear-and-hide path.
+                            log::info!(
+                                "handoff complete — clearing {} rect(s), {} guide(s), {} stuck",
+                                held_rects.len(),
+                                guides.len(),
+                                stuck_measurements.len(),
+                            );
+                            if let Err(e) =
+                                save_session(&held_rects, &guides, &stuck_measurements)
+                            {
+                                log::warn!("save session: {e:#}");
+                            }
+                            held_rects.clear();
+                            nudge_selection = None;
+                            guides.clear();
+                            stuck_measurements.clear();
+                            pending_guide = None;
+                            active_toast = None;
+                            toast_until = None;
+                            last_esc_at = None;
+                            toggle_measurement(
+                                &mut mode,
+                                &mut overlay,
+                                &*platform,
+                                primary.id,
+                                &mut frozen_frame,
+                                &held_rects,
+                                &guides,
+                                &stuck_measurements,
+                                color_alternate,
+                            );
+                        } else {
+                            // Local-save path: stay in measure mode so
+                            // the user can re-shoot the same region
+                            // (or any other held rect) without
+                            // re-toggling. Toast just confirms the
+                            // capture; it elapses without exiting
+                            // measure mode.
+                            let toast = HudToast { text: "Screenshot taken".into() };
+                            active_toast = Some(toast.clone());
+                            toast_until =
+                                Some(Instant::now() + Duration::from_millis(TOAST_SCREENSHOT_MS));
+                            spawn_toast_timer(
+                                &combined_tx,
+                                Duration::from_millis(TOAST_SCREENSHOT_MS),
+                                false,
+                            );
+                            let toast_ref = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                x,
+                                y,
+                                current_tol_value(tol_level),
+                                toast_ref,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                align_mode,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                                context_menu.as_ref(),
+                            );
+                        }
                     } else {
                         // Push the latest HUD now so removals (held
                         // rect / guide / stuck) and other state
@@ -3289,10 +3331,30 @@ enum MainEvent {
 #[derive(Debug, Clone, Copy)]
 enum ButtonOutcome {
     None,
-    /// The user clicked the camera pill on the held rect — caller
-    /// should pop a "Screenshot taken" toast and exit measurement
-    /// mode after a short delay.
-    ScreenshotTaken,
+    /// The user clicked the camera pill on the held rect.
+    /// `handed_off` is true when the daemon successfully spawned
+    /// the configured handoff app (Satty etc.) — in that case the
+    /// caller wipes session state and hides the overlay so the
+    /// external app can take focus. When false, the screenshot
+    /// landed in a local PNG; the caller pops a confirmation toast
+    /// and stays in measure mode so the user can re-shoot.
+    ScreenshotTaken { handed_off: bool },
+}
+
+/// Result of [`take_held_screenshot`]. Propagated through
+/// [`ButtonOutcome::ScreenshotTaken`] so the main loop knows
+/// whether to clear-and-hide (handoff: user has moved on to the
+/// external annotation app) or stay in measure mode for follow-up
+/// shots (local save: file already on disk, nothing else to do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureOutcome {
+    /// The image was written to `output_dir` (or printed) and
+    /// vernier retains control.
+    SavedLocal,
+    /// The image was written to a temp PNG and spawned in the
+    /// configured handoff app. Vernier should get out of the
+    /// way.
+    HandedOff,
 }
 
 #[derive(Debug)]
@@ -4593,7 +4655,11 @@ fn handle_pointer_button(
             if cursor_over_pill(cursor_px, rs, re) {
                 if let Some(frame) = frozen_frame {
                     match take_held_screenshot(frame, rs, re) {
-                        Ok(()) => return ButtonOutcome::ScreenshotTaken,
+                        Ok(outcome) => {
+                            return ButtonOutcome::ScreenshotTaken {
+                                handed_off: matches!(outcome, CaptureOutcome::HandedOff),
+                            };
+                        }
                         Err(e) => log::error!("screenshot failed: {e:#}"),
                     }
                 } else {
@@ -4880,7 +4946,7 @@ fn take_held_screenshot(
     frame: &vernier_platform::NativeFrame,
     rect_start: Px,
     rect_end: Px,
-) -> Result<()> {
+) -> Result<CaptureOutcome> {
     use vernier_platform::PixelFormat;
     let s = current_settings();
     let prefs = s.screenshots.clone();
@@ -4998,16 +5064,25 @@ fn take_held_screenshot(
             let argv = vernier_core::render_args(&args_template, &path_str);
             let spawned = std::process::Command::new(&cmd).args(&argv).spawn();
             match spawned {
-                Ok(_) => log::info!(
-                    "screenshot handed off to {}: {} ({}×{})",
-                    app_label, path_str, final_w, final_h
-                ),
-                Err(e) => log::warn!(
-                    "handoff spawn failed (cmd={cmd:?}, file={path_str}): {e:#} — \
-                     temp file kept for inspection"
-                ),
+                Ok(_) => {
+                    log::info!(
+                        "screenshot handed off to {}: {} ({}×{})",
+                        app_label, path_str, final_w, final_h
+                    );
+                    return Ok(CaptureOutcome::HandedOff);
+                }
+                Err(e) => {
+                    // Spawn failed (binary missing, exec bit off, etc.) —
+                    // don't hide vernier on the user since the handoff
+                    // didn't actually happen. The temp PNG stays around
+                    // for inspection.
+                    log::warn!(
+                        "handoff spawn failed (cmd={cmd:?}, file={path_str}): {e:#} — \
+                         temp file kept for inspection"
+                    );
+                    return Ok(CaptureOutcome::SavedLocal);
+                }
             }
-            return Ok(());
         } else {
             log::warn!(
                 "handoff enabled but no app configured and no default detected — \
@@ -5109,7 +5184,7 @@ fn take_held_screenshot(
         }
     });
 
-    Ok(())
+    Ok(CaptureOutcome::SavedLocal)
 }
 
 /// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
