@@ -1,0 +1,60 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#313244"/>
+      <stop offset="1" stop-color="#11111b"/>
+    </linearGradient>
+    <clipPath id="rounded">
+      <rect width="256" height="256" rx="56"/>
+    </clipPath>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <!-- V silhouette behind the measurement composition -->
+  <g clip-path="url(#rounded)">
+    <path d="M 52 48 L 128 220 L 204 48"
+          stroke="#45475a"
+          stroke-width="24"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          fill="none"/>
+  </g>
+
+  <!-- Subtle inner rim -->
+  <rect x="1" y="1" width="254" height="254" rx="55" fill="none" stroke="#45475a" stroke-width="1" opacity="0.6"/>
+
+  <!-- Main scale (top): 16px spacing, 11 ticks — dense -->
+  <g stroke="#cdd6f4" stroke-width="3" stroke-linecap="round">
+    <line x1="48" y1="104" x2="208" y2="104"/>
+    <line x1="48" y1="72" x2="48" y2="104"/>
+    <line x1="128" y1="72" x2="128" y2="104"/>
+    <line x1="208" y1="72" x2="208" y2="104"/>
+    <line x1="64" y1="88" x2="64" y2="104"/>
+    <line x1="80" y1="88" x2="80" y2="104"/>
+    <line x1="96" y1="88" x2="96" y2="104"/>
+    <line x1="112" y1="88" x2="112" y2="104"/>
+    <line x1="144" y1="88" x2="144" y2="104"/>
+    <line x1="160" y1="88" x2="160" y2="104"/>
+    <line x1="176" y1="88" x2="176" y2="104"/>
+    <line x1="192" y1="88" x2="192" y2="104"/>
+  </g>
+
+  <!-- Vernier scale (bottom): 24px spacing, 7 ticks — sparse -->
+  <g stroke="#cdd6f4" stroke-width="3" stroke-linecap="round">
+    <line x1="56" y1="152" x2="200" y2="152"/>
+    <line x1="56" y1="152" x2="56" y2="184"/>
+    <line x1="128" y1="152" x2="128" y2="184"/>
+    <line x1="200" y1="152" x2="200" y2="184"/>
+    <line x1="80" y1="152" x2="80" y2="168"/>
+    <line x1="104" y1="152" x2="104" y2="168"/>
+    <line x1="152" y1="152" x2="152" y2="168"/>
+    <line x1="176" y1="152" x2="176" y2="168"/>
+  </g>
+
+  <!-- Alignment indicator -->
+  <line x1="128" y1="68" x2="128" y2="188" stroke="#89dceb" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="128" cy="128" r="6" fill="#89dceb"/>
+  <circle cx="128" cy="128" r="2.5" fill="#11111b"/>
+</svg>

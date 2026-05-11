@@ -1,0 +1,38 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#313244"/>
+      <stop offset="1" stop-color="#11111b"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="1" y="1" width="254" height="254" rx="55" fill="none" stroke="#45475a" stroke-width="1" opacity="0.6"/>
+
+  <!-- V body: caliper arms meeting at the apex -->
+  <path d="M 64 60 L 128 196 L 192 60"
+        stroke="#cdd6f4" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+  <!-- Tick marks pointing inward — left arm is denser (5 ticks), right arm is sparser (3 ticks) -->
+  <!-- Left arm: from (64,60) to (128,196). Inward unit vector ≈ (0.905, -0.426) -->
+  <g stroke="#cdd6f4" stroke-width="5" stroke-linecap="round">
+    <!-- 5 evenly spaced ticks at 16.7%, 33.3%, 50%, 66.7%, 83.3% -->
+    <line x1="74.7" y1="82.7" x2="86.4" y2="77.2"/>
+    <line x1="85.3" y1="105.3" x2="97.0" y2="99.8"/>
+    <line x1="96.0" y1="128.0" x2="107.7" y2="122.5"/>
+    <line x1="106.7" y1="150.7" x2="118.4" y2="145.2"/>
+    <line x1="117.3" y1="173.3" x2="129.0" y2="167.8"/>
+  </g>
+
+  <!-- Right arm: from (192,60) to (128,196). Inward unit vector ≈ (-0.905, -0.426) -->
+  <g stroke="#cdd6f4" stroke-width="5" stroke-linecap="round">
+    <!-- 3 evenly spaced ticks at 25%, 50%, 75% -->
+    <line x1="176.0" y1="94.0" x2="164.3" y2="88.5"/>
+    <line x1="160.0" y1="128.0" x2="148.3" y2="122.5"/>
+    <line x1="144.0" y1="162.0" x2="132.3" y2="156.5"/>
+  </g>
+
+  <!-- Apex accent: the measurement convergence point -->
+  <circle cx="128" cy="196" r="9" fill="#89dceb"/>
+  <circle cx="128" cy="196" r="3.5" fill="#11111b"/>
+</svg>
