@@ -1253,7 +1253,31 @@ fn run_daemon() -> Result<()> {
                         super_held,
                     );
                     last_hud_redraw = Instant::now();
-                    if let ButtonOutcome::ScreenshotTaken { handed_off } = outcome {
+                    if let ButtonOutcome::ScreenshotPillClicked { rs, re } = outcome {
+                        // Hide Vernier's overlay before capture. grim
+                        // reads layer-shell surfaces too, so the
+                        // camera-pill icon AND the surface's background
+                        // tint (a subtle blue) would otherwise show up
+                        // in the output. `overlay.hide()` paints fully
+                        // transparent (vs. `set_hud(None)` which falls
+                        // through to drawing the bare tint and causes
+                        // the blue flash). Surface stays mapped so we
+                        // can re-show it after the capture without a
+                        // full reconfig round-trip.
+                        overlay.hide();
+                        // Wait long enough for the compositor to commit
+                        // the transparent surface before grim samples
+                        // the framebuffer. ~150ms is a safe single-
+                        // vsync margin on Hyprland.
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let shot_outcome = take_held_screenshot_via_grim(rs, re);
+                        let handed_off = match shot_outcome {
+                            Ok(o) => matches!(o, CaptureOutcome::HandedOff),
+                            Err(e) => {
+                                log::error!("screenshot failed: {e:#}");
+                                false
+                            }
+                        };
                         if handed_off {
                             // Handoff path: the external annotation app
                             // (Satty etc.) is now opening with the
@@ -1311,6 +1335,16 @@ fn run_daemon() -> Result<()> {
                                 false,
                             );
                             let toast_ref = current_toast(&active_toast, toast_until);
+                            // Re-set the HUD first, *then* show the
+                            // overlay. `set_hud` is a no-op redraw while
+                            // visible_intent is false (set by our
+                            // earlier `overlay.hide()`); calling `show`
+                            // after that flips visible_intent back on
+                            // and paints the new HUD in one frame.
+                            // Doing it the other way around would
+                            // briefly repaint the *old* HUD (camera
+                            // pill still over the rect) before the
+                            // toast version lands.
                             refresh_hud(
                                 &mode,
                                 &mut overlay,
@@ -1331,6 +1365,7 @@ fn run_daemon() -> Result<()> {
                                 None,
                                 context_menu.as_ref(),
                             );
+                            overlay.show();
                         }
                     } else {
                         // Push the latest HUD now so removals (held
@@ -3331,14 +3366,14 @@ enum MainEvent {
 #[derive(Debug, Clone, Copy)]
 enum ButtonOutcome {
     None,
-    /// The user clicked the camera pill on the held rect.
-    /// `handed_off` is true when the daemon successfully spawned
-    /// the configured handoff app (Satty etc.) — in that case the
-    /// caller wipes session state and hides the overlay so the
-    /// external app can take focus. When false, the screenshot
-    /// landed in a local PNG; the caller pops a confirmation toast
-    /// and stays in measure mode so the user can re-shoot.
-    ScreenshotTaken { handed_off: bool },
+    /// User clicked the camera pill on a held rect. The handler
+    /// itself can't safely capture: in live (`freeze_screen = false`)
+    /// mode the most recent PipeWire frame includes Vernier's own
+    /// HUD (camera icon, custom crosshair), so cropping it directly
+    /// bakes those decorations into the saved PNG. The caller does
+    /// the clean-capture dance: blank the HUD, wait for a fresh
+    /// PipeWire frame, capture, save, restore.
+    ScreenshotPillClicked { rs: Px, re: Px },
 }
 
 /// Result of [`take_held_screenshot`]. Propagated through
@@ -3639,6 +3674,188 @@ fn menu_contains(origin: (f64, f64), items: &[MenuItemDef], cursor: (f64, f64)) 
 }
 
 /// Convert the static items table to the renderer-friendly form.
+/// Capture the held rect using `grim` (wlr-screencopy). PipeWire's
+/// frames include the OS cursor on Hyprland regardless of the
+/// portal's `CursorMode::Hidden` setting; grim reads the surface
+/// buffer directly, which excludes the cursor by default. Vernier's
+/// own overlay is hidden by the caller (overlay.set_hud(None) + a
+/// brief wait) before this fires, so grim sees a clean desktop too.
+fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<CaptureOutcome> {
+    let s = current_settings();
+    let prefs = s.screenshots.clone();
+    let pad = prefs.padding_px as i32;
+    let lo_x = rect_start.x.min(rect_end.x) - pad;
+    let lo_y = rect_start.y.min(rect_end.y) - pad;
+    let hi_x = rect_start.x.max(rect_end.x) + pad;
+    let hi_y = rect_start.y.max(rect_end.y) + pad;
+    let w = hi_x - lo_x;
+    let h = hi_y - lo_y;
+    if w <= 0 || h <= 0 {
+        anyhow::bail!("empty screenshot region");
+    }
+    let region = format!("{},{} {}x{}", lo_x, lo_y, w, h);
+    let tmp_path = std::env::temp_dir()
+        .join(format!("vernier-grim-{}.png", current_timestamp()));
+    let mut cmd = std::process::Command::new("grim");
+    cmd.args(["-g", &region]);
+    // grim -s downscales the output by the given factor. retina_downscale
+    // wants the PNG at logical px rather than the raw HiDPI buffer.
+    if prefs.retina_downscale {
+        cmd.args(["-s", "1"]);
+    }
+    cmd.arg(&tmp_path);
+    let status = cmd
+        .status()
+        .with_context(|| "grim spawn failed (is grim installed?)")?;
+    if !status.success() {
+        anyhow::bail!("grim exited with status {status}");
+    }
+    let img = image::open(&tmp_path)
+        .with_context(|| format!("decode grim output {}", tmp_path.display()))?
+        .to_rgba8();
+    finish_held_screenshot(img, &prefs)
+}
+
+/// Post-capture pipeline: shutter sound, handoff to external editor
+/// (Satty etc.) OR save to disk + clipboard + notification. Shared
+/// between the PipeWire-frame path (legacy, currently unused for
+/// the camera-pill click but still wired for tests) and the
+/// grim-based path.
+fn finish_held_screenshot(
+    img: image::RgbaImage,
+    prefs: &vernier_core::ScreenshotSettings,
+) -> Result<CaptureOutcome> {
+    let final_w = img.width();
+    let final_h = img.height();
+    if prefs.capture_sound {
+        play_shutter_sound();
+    }
+    if prefs.handoff_enabled && !prefs.handoff_command.is_empty() {
+        let app_label = if !prefs.handoff_app_name.is_empty() {
+            prefs.handoff_app_name.clone()
+        } else {
+            prefs.handoff_command.clone()
+        };
+        let args_template = if prefs.handoff_args.is_empty() {
+            "{file}".to_string()
+        } else {
+            prefs.handoff_args.clone()
+        };
+        let cmd = prefs.handoff_command.clone();
+        let temp_path = std::env::temp_dir()
+            .join(format!("vernier-handoff-{}.png", current_timestamp()));
+        img.save(&temp_path)
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        let path_str = temp_path.to_string_lossy().into_owned();
+        let argv = vernier_core::render_args(&args_template, &path_str);
+        let spawned = std::process::Command::new(&cmd).args(&argv).spawn();
+        match spawned {
+            Ok(_) => {
+                log::info!(
+                    "screenshot handed off to {}: {} ({}×{})",
+                    app_label, path_str, final_w, final_h
+                );
+                return Ok(CaptureOutcome::HandedOff);
+            }
+            Err(e) => {
+                log::warn!(
+                    "handoff spawn failed (cmd={cmd:?}, file={path_str}): {e:#} — \
+                     temp file kept for inspection"
+                );
+                return Ok(CaptureOutcome::SavedLocal);
+            }
+        }
+    }
+    let dir = prefs
+        .output_dir
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(pictures_dir);
+    let dir = expand_user_path(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let timestamp = current_timestamp();
+    let template = if prefs.filename_template.trim().is_empty() {
+        "screenshot-{ts}.png".to_string()
+    } else {
+        prefs.filename_template.clone()
+    };
+    let filename = template
+        .replace("{ts}", &timestamp)
+        .replace("{w}", &final_w.to_string())
+        .replace("{h}", &final_h.to_string());
+    let path = dir.join(filename);
+    img.save(&path)
+        .with_context(|| format!("write {}", path.display()))?;
+    log::info!(
+        "screenshot saved: {} ({}×{}) padding={} retina_downscale={}",
+        path.display(),
+        final_w,
+        final_h,
+        prefs.padding_px,
+        prefs.retina_downscale,
+    );
+    if prefs.copy_to_clipboard {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let _ = std::process::Command::new("wl-copy")
+                .args(["-t", "image/png"])
+                .stdin(file)
+                .spawn();
+        }
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    // Resolve the handoff app once, on the daemon thread, so the
+    // notification thread closure owns simple Strings — no Settings
+    // borrow held across the notify-send wait. Only fires when both
+    // edit_action is on AND the user actually picked an app.
+    let handoff_for_action = if prefs.handoff_edit_action
+        && !prefs.handoff_command.is_empty()
+    {
+        let label = if !prefs.handoff_app_name.is_empty() {
+            prefs.handoff_app_name.clone()
+        } else {
+            prefs.handoff_command.clone()
+        };
+        let args = if prefs.handoff_args.is_empty() {
+            "{file}".to_string()
+        } else {
+            prefs.handoff_args.clone()
+        };
+        Some((prefs.handoff_command.clone(), args, label))
+    } else {
+        None
+    };
+    std::thread::spawn(move || {
+        let edit_label;
+        let mut args: Vec<&str> = vec![
+            "-i",
+            &path_str,
+            "-t",
+            "10000",
+            "Screenshot saved",
+        ];
+        if let Some((_, _, ref name)) = handoff_for_action {
+            edit_label = format!("Click to edit with {name}");
+            args.insert(0, "default=Edit");
+            args.insert(0, "-A");
+            args.push(&edit_label);
+        } else {
+            args.push(&path_str);
+        }
+        let result = std::process::Command::new("notify-send").args(&args).output();
+        let Some((cmd, args_template, _)) = handoff_for_action else {
+            return;
+        };
+        if let Ok(out) = result {
+            let action = String::from_utf8_lossy(&out.stdout);
+            if action.trim() == "default" {
+                let argv = vernier_core::render_args(&args_template, &path_str);
+                let _ = std::process::Command::new(&cmd).args(&argv).spawn();
+            }
+        }
+    });
+    Ok(CaptureOutcome::SavedLocal)
+}
+
 fn build_hud_menu_items() -> Vec<HudContextMenuItem> {
     MENU_ITEMS
         .iter()
@@ -4653,19 +4870,7 @@ fn handle_pointer_button(
             let rs = Px::new(rect.rect_start.0 as i32, rect.rect_start.1 as i32);
             let re = Px::new(rect.rect_end.0 as i32, rect.rect_end.1 as i32);
             if cursor_over_pill(cursor_px, rs, re) {
-                if let Some(frame) = frozen_frame {
-                    match take_held_screenshot(frame, rs, re) {
-                        Ok(outcome) => {
-                            return ButtonOutcome::ScreenshotTaken {
-                                handed_off: matches!(outcome, CaptureOutcome::HandedOff),
-                            };
-                        }
-                        Err(e) => log::error!("screenshot failed: {e:#}"),
-                    }
-                } else {
-                    log::warn!("screenshot requested but no frozen frame is available");
-                }
-                return ButtonOutcome::None;
+                return ButtonOutcome::ScreenshotPillClicked { rs, re };
             }
         }
         // Click inside a held rect (but NOT on its pill) → remove
@@ -4936,241 +5141,6 @@ fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
         })?;
     img.save(path).with_context(|| format!("write {}", path.display()))?;
     Ok(())
-}
-
-/// Crop the held region out of the frozen capture and save / copy /
-/// notify per the user's screenshot prefs. The notification handler
-/// runs on a detached thread because `notify-send -A` blocks until
-/// the user acts on or dismisses the notification.
-fn take_held_screenshot(
-    frame: &vernier_platform::NativeFrame,
-    rect_start: Px,
-    rect_end: Px,
-) -> Result<CaptureOutcome> {
-    use vernier_platform::PixelFormat;
-    let s = current_settings();
-    let prefs = s.screenshots.clone();
-    let surface_w = frame.bounds.w as f64;
-    let surface_h = frame.bounds.h as f64;
-    if surface_w <= 0.0 || surface_h <= 0.0 {
-        anyhow::bail!("monitor has zero dimensions");
-    }
-    let scale_x = frame.width as f64 / surface_w;
-    let scale_y = frame.height as f64 / surface_h;
-    let pad_logical = prefs.padding_px as f64;
-    let lo_x_l = rect_start.x.min(rect_end.x) as f64 - pad_logical;
-    let lo_y_l = rect_start.y.min(rect_end.y) as f64 - pad_logical;
-    let hi_x_l = rect_start.x.max(rect_end.x) as f64 + pad_logical;
-    let hi_y_l = rect_start.y.max(rect_end.y) as f64 + pad_logical;
-    let fx0 = (lo_x_l * scale_x).round() as i32;
-    let fy0 = (lo_y_l * scale_y).round() as i32;
-    let fx1 = (hi_x_l * scale_x).round() as i32;
-    let fy1 = (hi_y_l * scale_y).round() as i32;
-    let cx0 = fx0.max(0).min(frame.width as i32) as u32;
-    let cy0 = fy0.max(0).min(frame.height as i32) as u32;
-    let cx1 = fx1.max(0).min(frame.width as i32) as u32;
-    let cy1 = fy1.max(0).min(frame.height as i32) as u32;
-    let w = cx1.saturating_sub(cx0);
-    let h = cy1.saturating_sub(cy0);
-    if w == 0 || h == 0 {
-        anyhow::bail!("empty screenshot region");
-    }
-
-    // Crop + convert to packed RGBA8.
-    let mut pixels = Vec::with_capacity((w as usize) * (h as usize) * 4);
-    let stride = frame.stride as usize;
-    for y in cy0..cy1 {
-        let row_off = (y as usize) * stride;
-        for x in cx0..cx1 {
-            let i = row_off + (x as usize) * 4;
-            let chunk = &frame.pixels[i..i + 4];
-            match frame.format {
-                PixelFormat::Bgra8 => pixels.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]),
-                PixelFormat::Bgrx8 => pixels.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 0xFF]),
-                PixelFormat::Rgba8 => pixels.extend_from_slice(chunk),
-                PixelFormat::Rgbx8 => pixels.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]),
-                PixelFormat::Xrgb8 => pixels.extend_from_slice(&[chunk[1], chunk[2], chunk[3], 0xFF]),
-                PixelFormat::Xbgr8 => pixels.extend_from_slice(&[chunk[3], chunk[2], chunk[1], 0xFF]),
-            }
-        }
-    }
-
-    let img = image::RgbaImage::from_raw(w, h, pixels)
-        .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw"))?;
-    // Retina downscale: physical px → logical px so the file ends up
-    // at the on-screen size rather than the raw HiDPI buffer size.
-    let img = if prefs.retina_downscale && (scale_x > 1.0 || scale_y > 1.0) {
-        let target_w = (w as f64 / scale_x).round() as u32;
-        let target_h = (h as f64 / scale_y).round() as u32;
-        if target_w > 0 && target_h > 0 {
-            image::imageops::resize(
-                &img,
-                target_w,
-                target_h,
-                image::imageops::FilterType::Lanczos3,
-            )
-        } else {
-            img
-        }
-    } else {
-        img
-    };
-    let final_w = img.width();
-    let final_h = img.height();
-
-    // Always-on capture feedback: padding, retina downscale, and
-    // the shutter sound apply regardless of who handles the file.
-    // Sound fires here so it plays both for the handoff path and
-    // the vernier-managed save path.
-    if prefs.capture_sound {
-        play_shutter_sound();
-    }
-
-    // Handoff integration short-circuit: write the cropped frame to
-    // a temp PNG and hand it off to the configured app. The handoff
-    // app owns post-capture file save / clipboard / notification;
-    // those vernier settings are intentionally skipped here.
-    // Padding, retina downscale, and the shutter sound have already
-    // been applied above.
-    //
-    // Both flags have to be set: `handoff_enabled` is the master
-    // toggle, `handoff_command` is the app the user picked in
-    // prefs. No auto-detect fallback — if either is missing we
-    // fall through to the vernier-managed save below.
-    if prefs.handoff_enabled && !prefs.handoff_command.is_empty() {
-        let app_label = if !prefs.handoff_app_name.is_empty() {
-            prefs.handoff_app_name.clone()
-        } else {
-            prefs.handoff_command.clone()
-        };
-        let args_template = if prefs.handoff_args.is_empty() {
-            "{file}".to_string()
-        } else {
-            prefs.handoff_args.clone()
-        };
-        let cmd = prefs.handoff_command.clone();
-        {
-            let temp_path = std::env::temp_dir()
-                .join(format!("vernier-handoff-{}.png", current_timestamp()));
-            img.save(&temp_path)
-                .with_context(|| format!("write {}", temp_path.display()))?;
-            let path_str = temp_path.to_string_lossy().into_owned();
-            let argv = vernier_core::render_args(&args_template, &path_str);
-            let spawned = std::process::Command::new(&cmd).args(&argv).spawn();
-            match spawned {
-                Ok(_) => {
-                    log::info!(
-                        "screenshot handed off to {}: {} ({}×{})",
-                        app_label, path_str, final_w, final_h
-                    );
-                    return Ok(CaptureOutcome::HandedOff);
-                }
-                Err(e) => {
-                    // Spawn failed (binary missing, exec bit off, etc.) —
-                    // don't hide vernier on the user since the handoff
-                    // didn't actually happen. The temp PNG stays around
-                    // for inspection.
-                    log::warn!(
-                        "handoff spawn failed (cmd={cmd:?}, file={path_str}): {e:#} — \
-                         temp file kept for inspection"
-                    );
-                    return Ok(CaptureOutcome::SavedLocal);
-                }
-            }
-        }
-    }
-
-    let dir = prefs
-        .output_dir
-        .clone()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(pictures_dir);
-    let dir = expand_user_path(&dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let timestamp = current_timestamp();
-    let template = if prefs.filename_template.trim().is_empty() {
-        "screenshot-{ts}.png".to_string()
-    } else {
-        prefs.filename_template.clone()
-    };
-    let filename = template
-        .replace("{ts}", &timestamp)
-        .replace("{w}", &final_w.to_string())
-        .replace("{h}", &final_h.to_string());
-    let path = dir.join(filename);
-    img.save(&path)
-        .with_context(|| format!("write {}", path.display()))?;
-    log::info!(
-        "screenshot saved: {} ({}×{}) padding={} retina_downscale={}",
-        path.display(),
-        final_w,
-        final_h,
-        prefs.padding_px,
-        prefs.retina_downscale,
-    );
-
-    if prefs.copy_to_clipboard {
-        if let Ok(file) = std::fs::File::open(&path) {
-            let _ = std::process::Command::new("wl-copy")
-                .args(["-t", "image/png"])
-                .stdin(file)
-                .spawn();
-        }
-    }
-
-    let path_str = path.to_string_lossy().into_owned();
-    // Resolve the handoff app once, on the daemon thread, so the
-    // notification thread closure owns simple Strings — no Settings
-    // borrow held across the notify-send wait. Only fires when both
-    // edit_action is on AND the user actually picked an app.
-    let handoff_for_action = if prefs.handoff_edit_action
-        && !prefs.handoff_command.is_empty()
-    {
-        let label = if !prefs.handoff_app_name.is_empty() {
-            prefs.handoff_app_name.clone()
-        } else {
-            prefs.handoff_command.clone()
-        };
-        let args = if prefs.handoff_args.is_empty() {
-            "{file}".to_string()
-        } else {
-            prefs.handoff_args.clone()
-        };
-        Some((prefs.handoff_command.clone(), args, label))
-    } else {
-        None
-    };
-    std::thread::spawn(move || {
-        let edit_label;
-        let mut args: Vec<&str> = vec![
-            "-i",
-            &path_str,
-            "-t",
-            "10000",
-            "Screenshot saved",
-        ];
-        if let Some((_, _, ref name)) = handoff_for_action {
-            edit_label = format!("Click to edit with {name}");
-            args.insert(0, "default=Edit");
-            args.insert(0, "-A");
-            args.push(&edit_label);
-        } else {
-            args.push(&path_str);
-        }
-        let result = std::process::Command::new("notify-send").args(&args).output();
-        let Some((cmd, args_template, _)) = handoff_for_action else {
-            return;
-        };
-        if let Ok(out) = result {
-            let action = String::from_utf8_lossy(&out.stdout);
-            if action.trim() == "default" {
-                let argv = vernier_core::render_args(&args_template, &path_str);
-                let _ = std::process::Command::new(&cmd).args(&argv).spawn();
-            }
-        }
-    });
-
-    Ok(CaptureOutcome::SavedLocal)
 }
 
 /// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
