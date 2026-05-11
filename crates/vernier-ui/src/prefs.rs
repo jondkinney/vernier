@@ -895,7 +895,8 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
         ui.checkbox(&mut s.show_cursor, "Show cursor");
         ui.label(caption(
             "Show the white-outlined `+` marker over the cursor while measuring. \
-             Off: the marker is hidden — the measurement guides themselves (axis lines, tick caps, W×H pill) keep rendering, and so do the move/resize cursors for guides and held-rect handles.",
+             Off: the marker is hidden — the measurement guides themselves (axis lines, tick caps, W×H pill) keep rendering, and so do the move/resize cursors for guides and held-rect handles. \
+             Hold SUPER at any time to momentarily hide both Vernier's `+` and the system pointer for a clean read of the pixels underneath; releasing SUPER restores whichever cursor this toggle is set to.",
         ));
     });
 }

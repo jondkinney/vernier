@@ -665,6 +665,7 @@ fn run_daemon() -> Result<()> {
                         resizing,
                         active_handle,
                         context_menu.is_some(),
+                        super_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                     );
@@ -1407,6 +1408,7 @@ fn run_daemon() -> Result<()> {
                 let is_ctrl = keysym == 0xffe3 || keysym == 0xffe4;
                 let is_alt = keysym == 0xffe9 || keysym == 0xffea;
                 if is_shift || is_ctrl || is_alt || is_super {
+                    let super_was = super_held;
                     if is_shift { shift_held = pressed; }
                     if is_ctrl { ctrl_held = pressed; }
                     if is_alt { alt_held = pressed; }
@@ -1415,33 +1417,84 @@ fn run_daemon() -> Result<()> {
                         .crosshair
                         .map(|m| modifier_held(m, shift_held, ctrl_held, alt_held, super_held))
                         .unwrap_or(false);
-                    if new_align != align_mode {
+                    let align_changed = new_align != align_mode;
+                    // Repaint as soon as SUPER toggles so the
+                    // momentary cursor-hide kicks in / clears without
+                    // waiting for the next PointerMove. Also flip the
+                    // system pointer right here, since
+                    // `want_system_pointer` is otherwise only
+                    // re-evaluated on pointer events.
+                    let super_changed = super_was != super_held;
+                    if align_changed {
                         align_mode = new_align;
-                        if !matches!(mode, InteractionMode::Idle) {
-                            if let Some((x, y)) = last_pointer_xy {
-                                last_hud_redraw = Instant::now();
-                                let toast = current_toast(&active_toast, toast_until);
-                                refresh_hud(
-                                    &mode,
-                                    &mut overlay,
-                                    frozen_frame.as_ref(),
-                                    x,
-                                    y,
-                                    current_tol_value(tol_level),
-                                    toast,
-                                    &guides,
-                                    pending_guide,
-                                    &stuck_measurements,
+                    }
+                    if (align_changed || super_changed)
+                        && !matches!(mode, InteractionMode::Idle)
+                    {
+                        if let Some((px_x, px_y)) = last_pointer_xy {
+                            if super_changed {
+                                let cursor_px = Px::new(px_x as i32, px_y as i32);
+                                let active_handle =
+                                    resizing.map(|op| op.handle).or_else(|| {
+                                        held_rects.iter().find_map(|r| {
+                                            let rs = Px::new(
+                                                r.rect_start.0 as i32,
+                                                r.rect_start.1 as i32,
+                                            );
+                                            let re = Px::new(
+                                                r.rect_end.0 as i32,
+                                                r.rect_end.1 as i32,
+                                            );
+                                            if cursor_over_pill(cursor_px, rs, re) {
+                                                None
+                                            } else {
+                                                cursor_over_rect_handle(
+                                                    cursor_px, rs, re,
+                                                )
+                                            }
+                                        })
+                                    });
+                                let want = want_system_pointer(
+                                    cursor_px,
                                     &held_rects,
-                                    color_alternate,
-                                    align_mode,
+                                    &guides,
+                                    &stuck_measurements,
+                                    pending_guide,
+                                    dragging_guide,
+                                    resizing,
+                                    active_handle,
+                                    context_menu.is_some(),
                                     super_held,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
-                                    None,
-                                    context_menu.as_ref(),
                                 );
+                                if want != system_pointer_visible {
+                                    overlay.set_system_pointer_visible(want);
+                                    system_pointer_visible = want;
+                                }
                             }
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                px_x,
+                                px_y,
+                                current_tol_value(tol_level),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                align_mode,
+                                super_held,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                                context_menu.as_ref(),
+                            );
                         }
                     }
                     continue;
@@ -2447,7 +2500,7 @@ fn refresh_frame_if_live(
 /// from settings and write them into a freshly-built `Hud`. Called
 /// at every refresh_hud branch so the live HUD reflects prefs
 /// changes the moment the daemon's IPC reload finishes.
-fn populate_hud_appearance(hud: &mut Hud) {
+fn populate_hud_appearance(hud: &mut Hud, super_held: bool) {
     let s = current_settings();
     let g = s.appearance.guide_color;
     hud.guide_color = PlatColor::rgba(g.r, g.g, g.b, g.a);
@@ -2473,7 +2526,12 @@ fn populate_hud_appearance(hud: &mut Hud) {
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
     };
-    hud.show_cursor = s.general.show_cursor;
+    // Momentary cursor-hide: holding SUPER suppresses Vernier's own
+    // crosshair so the user can read the pixels under it when
+    // measuring very small things. The system pointer hide is
+    // handled separately (see `want_system_pointer` in the pointer
+    // handler so the OS cursor goes away too).
+    hud.show_cursor = s.general.show_cursor && !super_held;
     hud.corner_indicator = corner_indicator;
 }
 
@@ -4053,7 +4111,9 @@ fn toggle_measurement(
         overlay.set_input_capturing(true);
         let mut hud = Hud::hover((-100.0, -100.0));
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud);
+        // `toggle_measurement` runs at mode transitions only; Super's
+        // momentary cursor-hide kicks in on the next PointerMove redraw.
+        populate_hud_appearance(&mut hud, false);
         hud.held_rects = held_rects.to_vec();
         hud.guides = guides.to_vec();
         hud.stuck_measurements = stuck_measurements.to_vec();
@@ -4081,7 +4141,7 @@ fn toggle_measurement(
         let mut hud = Hud::hover((-1000.0, -1000.0));
         hud.kind = HudKind::None;
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud);
+        populate_hud_appearance(&mut hud, false);
         hud.held_rects = held_rects.to_vec();
         hud.guides = guides.to_vec();
         hud.stuck_measurements = stuck_measurements.to_vec();
@@ -4263,7 +4323,7 @@ fn refresh_hud(
         let mut hud = Hud::hover((x, y));
         hud.kind = HudKind::None;
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud);
+        populate_hud_appearance(&mut hud, super_held);
         hud.toast = toast.cloned();
         hud.guides = composed_guides;
         hud.stuck_measurements = composed_stuck;
@@ -4290,7 +4350,7 @@ fn refresh_hud(
                 let mut hud = Hud::hover((x, y));
                 hud.kind = HudKind::None;
                 hud.foreground = fg;
-                populate_hud_appearance(&mut hud);
+                populate_hud_appearance(&mut hud, super_held);
                 hud.toast = toast.cloned();
                 hud.guides = composed_guides;
                 hud.stuck_measurements = composed_stuck;
@@ -4314,7 +4374,7 @@ fn refresh_hud(
                 ..Hud::hover((x, y))
             };
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud);
+            populate_hud_appearance(&mut hud, super_held);
             hud.toast = toast.cloned();
             hud.guides = composed_guides.clone();
             hud.stuck_measurements = composed_stuck.clone();
@@ -4336,7 +4396,7 @@ fn refresh_hud(
         InteractionMode::Drawing { start, .. } => {
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud);
+            populate_hud_appearance(&mut hud, super_held);
             if has_drag_distance(start.pixel, cursor_px) {
                 let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
                 // Snap the moving end of the rect to nearby guides on
@@ -4792,6 +4852,13 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// overlay — i.e. the user is hovering a clickable element (X badge,
 /// pill, rect interior) and we're NOT in a state that demands a
 /// custom cursor (guide line drag, rect resize, guide placement).
+/// Whether the compositor should draw its theme pointer over the
+/// overlay. Returns `true` when the cursor sits on an interactive
+/// affordance (held rect, guide badge, stuck pill, menu) and `false`
+/// when Vernier draws its own custom cursor instead. Holding SUPER
+/// also returns `false` so the OS pointer hides momentarily for
+/// precise reads (paired with `populate_hud_appearance` suppressing
+/// Vernier's own crosshair).
 #[allow(clippy::too_many_arguments)]
 fn want_system_pointer(
     cursor_px: Px,
@@ -4803,6 +4870,7 @@ fn want_system_pointer(
     resizing: Option<ResizeOp>,
     resize_handle: Option<ResizeHandle>,
     menu_open: bool,
+    super_held: bool,
     screen_w: i32,
     screen_h: i32,
 ) -> bool {
@@ -4810,6 +4878,12 @@ fn want_system_pointer(
     // overlaps clickable elements underneath.
     if menu_open {
         return true;
+    }
+    // Holding SUPER hides everything cursor-related so the user can
+    // read the pixels under their cursor. The menu still gets the
+    // pointer (the row hover otherwise becomes invisible).
+    if super_held && !menu_open {
+        return false;
     }
     if pending_guide.is_some()
         || dragging_guide.is_some()
@@ -5047,7 +5121,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud);
+            populate_hud_appearance(&mut hud, super_held);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -5062,7 +5136,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud);
+            populate_hud_appearance(&mut hud, super_held);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -5112,7 +5186,7 @@ fn handle_pointer_button(
         *mode = InteractionMode::Hover { cursor: cursor_px };
         let mut hud = Hud::hover((x, y));
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud);
+        populate_hud_appearance(&mut hud, super_held);
         hud.kind = HudKind::Hover {
             cursor: (x, y),
             edges: [None; 4],
