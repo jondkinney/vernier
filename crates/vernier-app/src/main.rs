@@ -1910,6 +1910,29 @@ fn run_daemon() -> Result<()> {
                         Err(e) => log::warn!("refresh capture failed: {e}"),
                     }
                 } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.take_normal_screenshot
+                {
+                    // Configured take-normal-screenshot shortcut
+                    // (default `Ctrl+S`). Same teardown + detached
+                    // spawn as the right-click menu's
+                    // "Take Normal Screenshot" row.
+                    do_take_normal_screenshot(
+                        &mut mode,
+                        &mut overlay,
+                        &*platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut held_rects,
+                        &mut guides,
+                        &mut stuck_measurements,
+                        &mut nudge_selection,
+                        &mut pending_guide,
+                        &mut active_toast,
+                        &mut toast_until,
+                        &mut last_esc_at,
+                        color_alternate,
+                    );
+                } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.restore
                 {
                     // Configured restore-session shortcut (default
@@ -1967,29 +1990,6 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.take_normal_screenshot
-                {
-                    // Configured take-normal-screenshot shortcut
-                    // (default `Ctrl+S`). Same teardown + detached
-                    // spawn as the right-click menu's
-                    // "Take Normal Screenshot" row.
-                    do_take_normal_screenshot(
-                        &mut mode,
-                        &mut overlay,
-                        &*platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut held_rects,
-                        &mut guides,
-                        &mut stuck_measurements,
-                        &mut nudge_selection,
-                        &mut pending_guide,
-                        &mut active_toast,
-                        &mut toast_until,
-                        &mut last_esc_at,
-                        color_alternate,
-                    );
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.capture
                 {
@@ -4852,6 +4852,7 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// overlay — i.e. the user is hovering a clickable element (X badge,
 /// pill, rect interior) and we're NOT in a state that demands a
 /// custom cursor (guide line drag, rect resize, guide placement).
+#[allow(clippy::too_many_arguments)]
 /// Whether the compositor should draw its theme pointer over the
 /// overlay. Returns `true` when the cursor sits on an interactive
 /// affordance (held rect, guide badge, stuck pill, menu) and `false`
@@ -4859,7 +4860,6 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// also returns `false` so the OS pointer hides momentarily for
 /// precise reads (paired with `populate_hud_appearance` suppressing
 /// Vernier's own crosshair).
-#[allow(clippy::too_many_arguments)]
 fn want_system_pointer(
     cursor_px: Px,
     held_rects: &[HeldRect],
@@ -4874,16 +4874,16 @@ fn want_system_pointer(
     screen_w: i32,
     screen_h: i32,
 ) -> bool {
-    // The context menu always wants the system arrow, even when it
-    // overlaps clickable elements underneath.
-    if menu_open {
-        return true;
-    }
     // Holding SUPER hides everything cursor-related so the user can
     // read the pixels under their cursor. The menu still gets the
     // pointer (the row hover otherwise becomes invisible).
     if super_held && !menu_open {
         return false;
+    }
+    // The context menu always wants the system arrow, even when it
+    // overlaps clickable elements underneath.
+    if menu_open {
+        return true;
     }
     if pending_guide.is_some()
         || dragging_guide.is_some()
@@ -5366,6 +5366,7 @@ fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
     img.save(path).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
+
 
 /// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
 /// path; the screenshot capture has its own image-mode call.

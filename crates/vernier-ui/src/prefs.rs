@@ -2800,7 +2800,7 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
         ui.add_space(20.0);
         ui.label(
             egui::RichText::new(
-                "A cross-platform Rust measurement overlay targeting Hyprland on Omarchy.",
+                "A cross-platform Rust measurement overlay, targeting Hyprland on Omarchy.",
             )
             .size(14.0),
         );
