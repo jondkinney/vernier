@@ -1948,7 +1948,7 @@ fn shortcuts_section(
     ));
     ui.add_space(12.0);
     ui.with_layout(
-        egui::Layout::right_to_left(egui::Align::Center),
+        egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             if ui.button("Restore Defaults").clicked() {
                 *s = ShortcutSettings::default();
