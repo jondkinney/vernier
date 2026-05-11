@@ -135,6 +135,21 @@ impl PrefsApp {
         static_bind_warning: Option<PathBuf>,
     ) -> Self {
         apply_style(&cc.egui_ctx);
+        // Heartbeat thread that pokes the egui context every 500ms
+        // regardless of whether the window has focus or input. On
+        // Hyprland, switching away from prefs' workspace stops frame
+        // callbacks and input events; without a poke the main loop
+        // sits idle and the compositor's xdg_wm_base ping goes
+        // unanswered, triggering "Application Not Responding".
+        // request_repaint_after() inside update() isn't enough on
+        // its own because it depends on update() running.
+        {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                ctx.request_repaint();
+            });
+        }
         let logo = load_logo_texture(&cc.egui_ctx);
         let initial = Settings::load().unwrap_or_default();
         // One-shot PATH scan for the curated handoff-app list, with
@@ -2900,6 +2915,15 @@ pub fn run_prefs(
         .with_inner_size([720.0, 520.0]);
     let options = NativeOptions {
         viewport,
+        // Disable vsync: on Wayland the GL swap blocks on a frame
+        // callback that never arrives while the prefs window is on
+        // another workspace, leaving the loop stuck and the
+        // compositor's xdg_wm_base ping unanswered → "Application
+        // Not Responding". With vsync off, glow returns immediately
+        // and the wayland event queue keeps pumping. Paired with the
+        // heartbeat thread in PrefsApp::new this keeps the window
+        // responsive across workspace switches.
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native(
