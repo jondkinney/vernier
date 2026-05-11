@@ -833,25 +833,20 @@ fn run_daemon() -> Result<()> {
                                 }
                             }
                             MenuAction::OpenScreenshotTool => {
-                                let cmd = current_settings()
-                                    .integrations
-                                    .external_screenshot_command
-                                    .clone();
-                                log::info!("opening external screenshot tool: {cmd}");
-                                if let Err(e) = std::process::Command::new(&cmd).spawn() {
-                                    log::warn!("spawn screenshot tool {cmd:?}: {e}");
-                                }
-                                // Step out of measure mode so the
-                                // screenshot tool gets a clean desktop.
-                                toggle_measurement(
+                                do_take_normal_screenshot(
                                     &mut mode,
                                     &mut overlay,
                                     &*platform,
                                     primary.id,
                                     &mut frozen_frame,
-                                    &held_rects,
-                                    &guides,
-                                    &stuck_measurements,
+                                    &mut held_rects,
+                                    &mut guides,
+                                    &mut stuck_measurements,
+                                    &mut nudge_selection,
+                                    &mut pending_guide,
+                                    &mut active_toast,
+                                    &mut toast_until,
+                                    &mut last_esc_at,
                                     color_alternate,
                                 );
                             }
@@ -1919,6 +1914,29 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.take_normal_screenshot
+                {
+                    // Configured take-normal-screenshot shortcut
+                    // (default `Ctrl+S`). Same teardown + detached
+                    // spawn as the right-click menu's
+                    // "Take Normal Screenshot" row.
+                    do_take_normal_screenshot(
+                        &mut mode,
+                        &mut overlay,
+                        &*platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut held_rects,
+                        &mut guides,
+                        &mut stuck_measurements,
+                        &mut nudge_selection,
+                        &mut pending_guide,
+                        &mut active_toast,
+                        &mut toast_until,
+                        &mut last_esc_at,
+                        color_alternate,
+                    );
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.capture
                 {
@@ -2995,6 +3013,7 @@ struct ParsedShortcuts {
     nudge_right: Option<Accelerator>,
     nudge_up: Option<Accelerator>,
     nudge_down: Option<Accelerator>,
+    take_normal_screenshot: Option<Accelerator>,
 }
 
 fn parse_modifier_only(s: &str) -> Option<vernier_platform::Modifiers> {
@@ -3158,7 +3177,8 @@ fn log_shortcut_accels(p: &ParsedShortcuts) {
     log::info!(
         "shortcuts reloaded — clear_and_hide={} restore={} capture={} crosshair={} \
          guide_h={} guide_v={} color_toggle={} stuck_h={} stuck_v={} \
-         refresh={} tol_up={} tol_down={} nudge_l={} nudge_r={} nudge_u={} nudge_d={}",
+         refresh={} tol_up={} tol_down={} nudge_l={} nudge_r={} nudge_u={} nudge_d={} \
+         screenshot={}",
         fmt(&p.clear_and_hide),
         fmt(&p.restore),
         fmt(&p.capture),
@@ -3175,6 +3195,7 @@ fn log_shortcut_accels(p: &ParsedShortcuts) {
         fmt(&p.nudge_right),
         fmt(&p.nudge_up),
         fmt(&p.nudge_down),
+        fmt(&p.take_normal_screenshot),
     );
 }
 
@@ -3196,6 +3217,7 @@ fn parse_shortcut_accels(s: &Settings) -> ParsedShortcuts {
         nudge_right: Accelerator::parse(&s.shortcuts.nudge_right),
         nudge_up: Accelerator::parse(&s.shortcuts.nudge_up),
         nudge_down: Accelerator::parse(&s.shortcuts.nudge_down),
+        take_normal_screenshot: Accelerator::parse(&s.shortcuts.take_normal_screenshot),
     }
 }
 
@@ -3579,8 +3601,8 @@ const MENU_ITEMS: &[MenuItemDef] = &[
         divider_after: true,
     },
     MenuItemDef {
-        label: "Open Screenshot Tool",
-        shortcut: Some("\u{2318}S"),
+        label: "Take Normal Screenshot",
+        shortcut: Some("\u{2303}S"),
         icon: HudContextMenuIcon::Camera,
         action: MenuAction::OpenScreenshotTool,
         divider_after: false,
@@ -3854,6 +3876,86 @@ fn finish_held_screenshot(
         }
     });
     Ok(CaptureOutcome::SavedLocal)
+}
+
+/// Shared body for the "Take Normal Screenshot" action — fires from
+/// both the right-click menu and the `CTRL+S` shortcut. Runs the
+/// same teardown as Esc clear-and-hide, then spawns the user's
+/// `external_screenshot_command` detached on a 250ms timer (so the
+/// overlay-hide commit lands first) and a watchdog that SIGKILLs
+/// `hyprpicker` once `slurp` closes.
+fn do_take_normal_screenshot(
+    mode: &mut InteractionMode,
+    overlay: &mut vernier_platform::OverlayHandle,
+    platform: &dyn Platform,
+    monitor: MonitorId,
+    frozen_frame: &mut Option<NativeFrame>,
+    held_rects: &mut Vec<HeldRect>,
+    guides: &mut Vec<Guide>,
+    stuck_measurements: &mut Vec<StuckMeasurement>,
+    nudge_selection: &mut Option<NudgeSelection>,
+    pending_guide: &mut Option<GuideAxis>,
+    active_toast: &mut Option<HudToast>,
+    toast_until: &mut Option<Instant>,
+    last_esc_at: &mut Option<Instant>,
+    color_alternate: bool,
+) {
+    let cmd = current_settings()
+        .screenshots
+        .external_screenshot_command
+        .clone();
+    log::info!(
+        "external screenshot: running clear-and-hide, then spawning {cmd:?}"
+    );
+    if let Err(e) = save_session(held_rects, guides, stuck_measurements) {
+        log::warn!("save session: {e:#}");
+    }
+    *last_esc_at = None;
+    held_rects.clear();
+    *nudge_selection = None;
+    guides.clear();
+    stuck_measurements.clear();
+    *pending_guide = None;
+    *active_toast = None;
+    *toast_until = None;
+    toggle_measurement(
+        mode,
+        overlay,
+        platform,
+        monitor,
+        frozen_frame,
+        held_rects,
+        guides,
+        stuck_measurements,
+        color_alternate,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let _ = std::process::Command::new("setsid")
+        .arg("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let watchdog = r#"
+for _ in $(seq 1 100); do
+  pgrep -x slurp >/dev/null 2>&1 && break
+  sleep 0.05
+done
+while pgrep -x slurp >/dev/null 2>&1; do
+  sleep 0.02
+done
+pkill -KILL -x hyprpicker 2>/dev/null
+"#;
+    let _ = std::process::Command::new("setsid")
+        .arg("sh")
+        .arg("-c")
+        .arg(watchdog)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn build_hud_menu_items() -> Vec<HudContextMenuItem> {

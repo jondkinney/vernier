@@ -131,6 +131,14 @@ pub struct ScreenshotSettings {
     /// from the chosen app's `.desktop` `Icon=` field at pick time;
     /// the prefs UI rasterizes it for the integration card.
     pub handoff_icon_path: String,
+    /// Escape-hatch shell command for the right-click menu's "Take
+    /// normal screenshot" action. Runs *outside* the measurement
+    /// pipeline — Vernier exits measure mode and hides the overlay,
+    /// then spawns this command, which is expected to do its own
+    /// full-screen grab via grim/spectacle/etc. Independent of
+    /// `handoff_*` (which controls where Vernier's own measurement
+    /// captures get routed).
+    pub external_screenshot_command: String,
 }
 
 impl Default for ScreenshotSettings {
@@ -151,6 +159,7 @@ impl Default for ScreenshotSettings {
             handoff_app_name: String::new(),
             handoff_args: String::new(),
             handoff_icon_path: String::new(),
+            external_screenshot_command: "omarchy-capture-screenshot".to_string(),
         }
     }
 }
@@ -303,9 +312,6 @@ pub enum RoundingMode {
 pub struct IntegrationSettings {
     /// Which clipboard format `Enter` (copy-dimensions) uses.
     pub copy_dimensions_format: CopyFormat,
-    /// External tool spawned by the right-click menu's "Open
-    /// Screenshot Tool" action.
-    pub external_screenshot_command: String,
     /// Divide on-screen measurements by the current Figma viewport
     /// zoom so dimensions reflect canvas pixels at any zoom level.
     /// Requires the companion Figma plugin (`figma-plugin/`) to be
@@ -327,7 +333,6 @@ impl Default for IntegrationSettings {
     fn default() -> Self {
         Self {
             copy_dimensions_format: CopyFormat::WidthCommaHeight,
-            external_screenshot_command: "omarchy-cmd-screenshot".to_string(),
             figma_zoom_correction: true,
             figma_bridge_port: 8765,
             figma_browser_classes: vec![
@@ -451,6 +456,12 @@ pub struct ShortcutSettings {
     pub nudge_up: String,
     /// Nudge the hovered held rect 1 px down (10 px with Shift).
     pub nudge_down: String,
+    /// Run the External Screenshot Tool action (the right-click
+    /// menu's "Take Normal Screenshot"). Triggers the same ESC
+    /// clear-and-hide sequence + detached spawn of
+    /// `screenshots.external_screenshot_command` while in measure
+    /// mode.
+    pub take_normal_screenshot: String,
 }
 
 impl Default for ShortcutSettings {
@@ -475,6 +486,7 @@ impl Default for ShortcutSettings {
             nudge_right: "RIGHT".to_string(),
             nudge_up: "UP".to_string(),
             nudge_down: "DOWN".to_string(),
+            take_normal_screenshot: "CTRL+S".to_string(),
         }
     }
 }

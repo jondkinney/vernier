@@ -46,6 +46,7 @@ enum ShortcutId {
     NudgeRight,
     NudgeUp,
     NudgeDown,
+    TakeNormalScreenshot,
 }
 
 impl Section {
@@ -274,6 +275,9 @@ impl App for PrefsApp {
                             ShortcutId::NudgeRight => self.edited.shortcuts.nudge_right = s,
                             ShortcutId::NudgeUp => self.edited.shortcuts.nudge_up = s,
                             ShortcutId::NudgeDown => self.edited.shortcuts.nudge_down = s,
+                            ShortcutId::TakeNormalScreenshot => {
+                                self.edited.shortcuts.take_normal_screenshot = s
+                            }
                         }
                         self.capturing_shortcut = None;
                     }
@@ -945,6 +949,25 @@ fn screenshots_section(
         ));
     });
 
+    setting(ui, |ui| {
+        field_label(ui, "Take normal screenshot (right-click menu)");
+        padded_text_edit(ui, &mut s.external_screenshot_command);
+        ui.label(caption(
+            "Escape hatch from measure mode. Picking \"Take Normal \
+             Screenshot\" from Vernier's right-click menu runs the \
+             same clear-and-hide as Esc (saving the session, \
+             dropping every rect/guide/measurement, hiding the \
+             overlay), then spawns this command detached. Vernier \
+             stays running in the background so you can re-enter \
+             measure mode after. Run \
+             through `sh -c`, so args and pipelines work (e.g. \
+             `grim -g \"$(slurp)\" - | wl-copy`). Independent of \
+             the handoff app above: handoff routes Vernier's own \
+             region captures; this is for taking a plain \
+             screenshot when you don't want to measure.",
+        ));
+    });
+
     ui.separator();
     ui.add_space(8.0);
 
@@ -1524,11 +1547,6 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
         }
     });
 
-    setting(ui, |ui| {
-        field_label(ui, "External screenshot tool (run by the right-click menu)");
-        padded_text_edit(ui, &mut s.external_screenshot_command);
-        ui.label(caption("Spawned via the shell, with no arguments."));
-    });
 }
 
 /// Top card on the Integrations pane: heading, description, live
@@ -1902,6 +1920,16 @@ fn shortcuts_section(
         "Move the hovered held rect 1 px down. Hold Shift for 10 px.",
         &mut s.nudge_down,
         ShortcutId::NudgeDown,
+        capturing,
+    );
+    shortcut_row(
+        ui,
+        "Take normal screenshot",
+        "Run the External Screenshot Tool action (also available \
+         from the right-click menu). Same teardown as Esc, then \
+         detached spawn of the command in the Screenshots pane.",
+        &mut s.take_normal_screenshot,
+        ShortcutId::TakeNormalScreenshot,
         capturing,
     );
     ui.add_space(4.0);
