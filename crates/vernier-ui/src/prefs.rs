@@ -1485,7 +1485,6 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
     setting(ui, |ui| {
         field_label(ui, "Primary color");
         color_picker(ui, &mut s.primary_color);
-        ui.label(caption("Coral by default — matches macOS conventions."));
     });
 
     setting(ui, |ui| {
@@ -1525,6 +1524,16 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
             "Screen pixels (multiplied by display scale)",
         );
     });
+
+    ui.add_space(12.0);
+    ui.with_layout(
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            if ui.button("Restore Defaults").clicked() {
+                *s = AppearanceSettings::default();
+            }
+        },
+    );
 }
 
 fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
