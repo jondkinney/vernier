@@ -1,9 +1,7 @@
-# vernier
+# Vernier
 
-Cross-platform macOS measurement tools clone in Rust. macOS, Windows, Linux X11 + Wayland.
+Cross-platform pixel-measurement overlay in Rust. Runs on macOS, Windows, Linux X11 + Wayland.
 Linux/Wayland (Hyprland on Omarchy) is the primary development target.
-
-See [PLAN.md](./PLAN.md) for goals, milestones, and stack rationale.
 
 ## Status
 

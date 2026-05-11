@@ -61,14 +61,14 @@ impl Drop for TrayBackend {
 
 /// Snapshot of the menu items + tray identity that the ksni Tray
 /// trait reads on every property/menu refresh.
-struct macOSTray {
+struct VernierTray {
     title: String,
     items: Vec<TrayMenuItem>,
     active: bool,
     events_tx: EventSender,
 }
 
-impl ksni::Tray for macOSTray {
+impl ksni::Tray for VernierTray {
     fn id(&self) -> String {
         "vernier".to_string()
     }
@@ -120,7 +120,7 @@ impl ksni::Tray for macOSTray {
     }
 }
 
-fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<macOSTray>> {
+fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<VernierTray>> {
     use ksni::menu::*;
     match item {
         TrayMenuItem::Action {
@@ -131,7 +131,7 @@ fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<macOSTray>> {
                 StandardItem {
                     label: label.clone(),
                     enabled: *enabled,
-                    activate: Box::new(move |this: &mut macOSTray| {
+                    activate: Box::new(move |this: &mut VernierTray| {
                         let _ = this
                             .events_tx
                             .send(PlatformEvent::TrayMenuActivated { id: id.clone() });
@@ -153,7 +153,7 @@ fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<macOSTray>> {
                     label: label.clone(),
                     enabled: *enabled,
                     checked: *checked,
-                    activate: Box::new(move |this: &mut macOSTray| {
+                    activate: Box::new(move |this: &mut VernierTray| {
                         let _ = this
                             .events_tx
                             .send(PlatformEvent::TrayMenuActivated { id: id.clone() });
@@ -165,7 +165,7 @@ fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<macOSTray>> {
         }
         TrayMenuItem::Separator => Some(MenuItem::Separator),
         TrayMenuItem::Submenu { id: _, label, items } => {
-            let children: Vec<ksni::MenuItem<macOSTray>> =
+            let children: Vec<ksni::MenuItem<VernierTray>> =
                 items.iter().filter_map(build_menu_item).collect();
             Some(
                 SubMenu {
@@ -204,7 +204,7 @@ fn run_ksni_tray(
     ready_tx: &SyncSender<Result<()>>,
 ) -> Result<()> {
     use ksni::blocking::TrayMethods;
-    let tray = macOSTray {
+    let tray = VernierTray {
         title: initial.tooltip.clone(),
         items: initial.items.clone(),
         active: true,
@@ -218,13 +218,13 @@ fn run_ksni_tray(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             TrayCmd::UpdateMenu(new_menu) => {
-                handle.update(|tray: &mut macOSTray| {
+                handle.update(|tray: &mut VernierTray| {
                     tray.title = new_menu.tooltip.clone();
                     tray.items = new_menu.items.clone();
                 });
             }
             TrayCmd::SetActive(active) => {
-                handle.update(|tray: &mut macOSTray| {
+                handle.update(|tray: &mut VernierTray| {
                     tray.active = active;
                 });
             }

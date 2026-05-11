@@ -1,4 +1,4 @@
-//! Localhost WebSocket bridge for the macOS Figma plugin.
+//! Localhost WebSocket bridge for the Vernier Figma plugin.
 //!
 //! The Figma plugin (in `figma-plugin/`) runs inside the user's
 //! Figma tab and pushes the current viewport zoom over a WebSocket

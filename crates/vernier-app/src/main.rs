@@ -907,7 +907,7 @@ fn run_daemon() -> Result<()> {
                                 held_rects.clear();
                                 nudge_selection = None;
                             }
-                            MenuAction::ClosemacOS => {
+                            MenuAction::CloseVernier => {
                                 log::info!("close requested via context menu");
                                 break;
                             }
@@ -2472,9 +2472,9 @@ fn ensure_application_desktop_file(icon_path: Option<&Path>) -> Result<()> {
     let body = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=macOS\n\
+         Name=Vernier\n\
          GenericName=Measurement Overlay\n\
-         Comment=Cross-platform measurement overlay (macOS clone)\n\
+         Comment=Cross-platform measurement overlay\n\
          Icon={icon}\n\
          Exec={exe} prefs\n\
          Terminal=false\n\
@@ -2514,7 +2514,7 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "vernier".into());
         let body = format!(
-            "[Desktop Entry]\nType=Application\nName=macOS\n\
+            "[Desktop Entry]\nType=Application\nName=Vernier\n\
              Comment=Measurement overlay\n\
              Icon={icon}\n\
              Exec={exe}\nTerminal=false\n\
@@ -3503,7 +3503,7 @@ enum MenuAction {
     EnterBackgroundMode,
     RestoreLastSession,
     ClearAll,
-    ClosemacOS,
+    CloseVernier,
 }
 
 struct MenuItemDef {
@@ -3572,10 +3572,10 @@ const MENU_ITEMS: &[MenuItemDef] = &[
         divider_after: false,
     },
     MenuItemDef {
-        label: "Close macOS",
+        label: "Close Vernier",
         shortcut: None,
         icon: HudContextMenuIcon::Close,
-        action: MenuAction::ClosemacOS,
+        action: MenuAction::CloseVernier,
         divider_after: false,
     },
 ];

@@ -377,7 +377,7 @@ impl App for PrefsApp {
                         );
                         ui.add_space(8.0);
                     }
-                    ui.heading("macOS");
+                    ui.heading("Vernier");
                 });
                 ui.add_space(14.0);
                 ui.separator();
@@ -557,7 +557,7 @@ fn paint_daemon_dead_modal(ctx: &egui::Context, last_probe: &mut Instant) {
                     ui.set_max_width(360.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            egui::RichText::new("macOS daemon stopped")
+                            egui::RichText::new("Vernier daemon stopped")
                                 .size(16.0)
                                 .strong(),
                         );
@@ -1189,7 +1189,7 @@ fn paint_handoff_card(
                         )
                     } else {
                         "Pick a screenshot app from the dropdown — or browse to \
-                         a custom binary — and macOS will hand captures \
+                         a custom binary — and Vernier will hand captures \
                          off for annotation, save, and share."
                             .to_string()
                     };
@@ -2761,7 +2761,7 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
             ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(112.0, 112.0)));
         }
         ui.add_space(18.0);
-        ui.label(egui::RichText::new("macOS").size(28.0).strong());
+        ui.label(egui::RichText::new("Vernier").size(28.0).strong());
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
@@ -2771,7 +2771,7 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
         ui.add_space(20.0);
         ui.label(
             egui::RichText::new(
-                "A cross-platform Rust port of macOS measurement tools targeting Hyprland on Omarchy.",
+                "A cross-platform Rust measurement overlay targeting Hyprland on Omarchy.",
             )
             .size(14.0),
         );
@@ -2856,7 +2856,7 @@ pub fn run_prefs(
     static_bind_warning: Option<PathBuf>,
 ) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
-        .with_title("macOS Preferences")
+        .with_title("Vernier Preferences")
         .with_app_id("vernier-prefs")
         .with_min_inner_size([520.0, 360.0])
         .with_inner_size([720.0, 520.0]);
@@ -2865,7 +2865,7 @@ pub fn run_prefs(
         ..Default::default()
     };
     eframe::run_native(
-        "macOS Preferences",
+        "Vernier Preferences",
         options,
         Box::new(move |cc| {
             Ok(Box::new(PrefsApp::new(

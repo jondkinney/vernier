@@ -1,4 +1,4 @@
-# macOS Bridge — Figma plugin
+# Vernier Bridge — Figma plugin
 
 Reports the current viewport zoom to the local vernier daemon so on-screen
 measurements come back in canvas pixels rather than zoomed screen pixels.
@@ -8,12 +8,12 @@ measurements come back in canvas pixels rather than zoomed screen pixels.
 1. Open Figma in your browser.
 2. Click the menu (≡) → **Plugins** → **Development** → **Import plugin from manifest…**
 3. Select `figma-plugin/manifest.json` from this repository.
-4. The plugin is now available under **Plugins → Development → macOS Bridge**.
+4. The plugin is now available under **Plugins → Development → Vernier Bridge**.
 
 ## Use
 
 1. Open any Figma file.
-2. **Plugins → Development → macOS Bridge → Run** once per file.
+2. **Plugins → Development → Vernier Bridge → Run** once per file.
 3. The hidden UI iframe stays alive until you close the file. As long as it's
    running and the vernier daemon is up, your measurements will reflect
    canvas pixels at any zoom level.
