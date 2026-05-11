@@ -3565,7 +3565,14 @@ enum MenuAction {
 
 struct MenuItemDef {
     label: &'static str,
-    shortcut: Option<&'static str>,
+    /// Shortcut hint as a list of segments (modifiers + key). Joined
+    /// with a single space at render time so each modifier sits
+    /// uniformly apart from the next one and from the trailing key —
+    /// regardless of whether the SUPER token resolves to a single
+    /// glyph (⌘ / Omarchy logo) or a multi-char word ("Super" /
+    /// "Win"). Use the literal `"SUPER"` sentinel here; it gets
+    /// substituted by `super_glyph_for_menu()` per-platform.
+    shortcut: Option<&'static [&'static str]>,
     icon: HudContextMenuIcon,
     action: MenuAction,
     divider_after: bool,
@@ -3574,49 +3581,49 @@ struct MenuItemDef {
 const MENU_ITEMS: &[MenuItemDef] = &[
     MenuItemDef {
         label: "Add Horizontal Guide",
-        shortcut: Some("\u{21E7}H"),
+        shortcut: Some(&["\u{21E7}", "H"]),
         icon: HudContextMenuIcon::GuideH,
         action: MenuAction::AddHorizontalGuide,
         divider_after: false,
     },
     MenuItemDef {
         label: "Add Vertical Guide",
-        shortcut: Some("\u{21E7}V"),
+        shortcut: Some(&["\u{21E7}", "V"]),
         icon: HudContextMenuIcon::GuideV,
         action: MenuAction::AddVerticalGuide,
         divider_after: true,
     },
     MenuItemDef {
         label: "Hold Horizontal Distance",
-        shortcut: Some("H"),
+        shortcut: Some(&["H"]),
         icon: HudContextMenuIcon::StuckH,
         action: MenuAction::HoldHorizontalDistance,
         divider_after: false,
     },
     MenuItemDef {
         label: "Hold Vertical Distance",
-        shortcut: Some("V"),
+        shortcut: Some(&["V"]),
         icon: HudContextMenuIcon::StuckV,
         action: MenuAction::HoldVerticalDistance,
         divider_after: true,
     },
     MenuItemDef {
         label: "Take Normal Screenshot",
-        shortcut: Some("\u{2303}S"),
+        shortcut: Some(&["\u{2303}", "S"]),
         icon: HudContextMenuIcon::Camera,
         action: MenuAction::OpenScreenshotTool,
         divider_after: false,
     },
     MenuItemDef {
         label: "Enter Background Mode",
-        shortcut: Some("\u{2303}\u{21E7}\u{2318}F"),
+        shortcut: Some(&["\u{2303}", "\u{21E7}", "SUPER", "F"]),
         icon: HudContextMenuIcon::Background,
         action: MenuAction::EnterBackgroundMode,
         divider_after: false,
     },
     MenuItemDef {
         label: "Restore Last Session",
-        shortcut: Some("\u{21E7}R"),
+        shortcut: Some(&["\u{21E7}", "R"]),
         icon: HudContextMenuIcon::Restore,
         action: MenuAction::RestoreLastSession,
         divider_after: true,
@@ -3959,15 +3966,56 @@ pkill -KILL -x hyprpicker 2>/dev/null
 }
 
 fn build_hud_menu_items() -> Vec<HudContextMenuItem> {
+    let sup = super_glyph_for_menu();
     MENU_ITEMS
         .iter()
         .map(|it| HudContextMenuItem {
             label: it.label.into(),
-            shortcut: it.shortcut.map(|s| s.into()),
+            shortcut: it.shortcut.map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|t| if *t == "SUPER" { sup } else { *t })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
             icon: it.icon,
             divider_after: it.divider_after,
         })
         .collect()
+}
+
+/// Glyph (or short text) used for the SUPER / META / "command" key in
+/// context-menu shortcut hints. Computed once per process:
+/// - macOS: `\u{2318}` (⌘)
+/// - Omarchy (Linux with `~/.local/share/fonts/omarchy.ttf`): `\u{e900}`,
+///   the Omarchy logo glyph the prefs Shortcuts pane already uses for SUPER.
+/// - Other Linux: `Super`
+/// - Windows: `Win`
+fn super_glyph_for_menu() -> &'static str {
+    use std::sync::OnceLock;
+    static GLYPH: OnceLock<&'static str> = OnceLock::new();
+    GLYPH.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            "\u{2318}"
+        } else if cfg!(target_os = "windows") {
+            "Win"
+        } else if cfg!(target_os = "linux") {
+            if omarchy_font_present() {
+                "\u{e900}"
+            } else {
+                "Super"
+            }
+        } else {
+            "Super"
+        }
+    })
+}
+
+fn omarchy_font_present() -> bool {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".local/share/fonts/omarchy.ttf"))
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 fn toggle_measurement(

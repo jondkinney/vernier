@@ -1425,8 +1425,10 @@ fn hud_symbol_font() -> Option<&'static fontdue::Font> {
 }
 
 /// Pick the best font for `c`: primary if it carries the glyph,
-/// otherwise the symbol fallback. Used so per-glyph rendering can
-/// substitute for missing characters without leaving tofu boxes.
+/// otherwise the symbol fallback, otherwise the Omarchy font (carries
+/// the U+E900 SUPER logo the right-click menu uses on Omarchy hosts).
+/// Used so per-glyph rendering can substitute for missing characters
+/// without leaving tofu boxes.
 fn font_for_char<'a>(primary: &'a fontdue::Font, c: char) -> &'a fontdue::Font {
     if primary.lookup_glyph_index(c) != 0 {
         return primary;
@@ -1436,7 +1438,34 @@ fn font_for_char<'a>(primary: &'a fontdue::Font, c: char) -> &'a fontdue::Font {
             return symbol;
         }
     }
+    if let Some(omarchy) = omarchy_font() {
+        if omarchy.lookup_glyph_index(c) != 0 {
+            return omarchy;
+        }
+    }
     primary
+}
+
+/// Lazily load `~/.local/share/fonts/omarchy.ttf` so the right-click
+/// menu can render the U+E900 SUPER glyph on Omarchy hosts. Returns
+/// `None` if the font isn't installed or fails to parse — in which
+/// case the SUPER hint falls back to the literal text "Super".
+fn omarchy_font() -> Option<&'static fontdue::Font> {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<Option<fontdue::Font>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        let home = std::env::var_os("HOME")?;
+        let path = std::path::PathBuf::from(home).join(".local/share/fonts/omarchy.ttf");
+        let bytes = std::fs::read(&path).ok()?;
+        let font = fontdue::Font::from_bytes(
+            bytes.as_slice(),
+            fontdue::FontSettings::default(),
+        )
+        .ok()?;
+        log::info!("hud omarchy font: {}", path.display());
+        Some(font)
+    })
+    .as_ref()
 }
 
 fn measure_text_width(font: &fontdue::Font, text: &str, px_size: f32) -> f32 {
@@ -2808,7 +2837,19 @@ fn render_pill_text(
         let active = font_for_char(font, ch);
         let (metrics, bitmap) = active.rasterize(ch, layout.px_size);
         let glyph_origin_x = pen_x + metrics.xmin as f32;
-        let glyph_origin_y = baseline - metrics.ymin as f32 - metrics.height as f32;
+        // The Omarchy SUPER logo (U+E900) is drawn to the top of the em
+        // box rather than the cap height, so at the same baseline it
+        // floats noticeably above neighbouring letters. Nudge it down
+        // ~1 logical px (≈ 10% of the px size, scale-aware via the
+        // font size already being in physical px) so it sits on the
+        // shared visual baseline of the shortcut row.
+        let y_bias = if ch == '\u{e900}' {
+            layout.px_size * 0.10
+        } else {
+            0.0
+        };
+        let glyph_origin_y =
+            baseline - metrics.ymin as f32 - metrics.height as f32 + y_bias;
         composite_glyph(
             canvas,
             buf_w,
