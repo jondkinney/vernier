@@ -26,7 +26,7 @@ optdepends=(
     'xdg-desktop-portal-hyprland: global hotkey via the GlobalShortcuts portal'
 )
 source=("$pkgname-$pkgver.tar.gz::https://github.com/jondkinney/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # replace with `makepkg -g` output once the v0.1.0 tag exists on GitHub
+sha256sums=('f032713778aedd1bdefe78135694d8f07304d2b0b3572407e0e2ac769567778a')
 
 prepare() {
     cd "$pkgname-$pkgver"
