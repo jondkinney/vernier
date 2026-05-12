@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "log",
@@ -3596,7 +3596,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3622,7 +3622,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "eframe",
