@@ -264,7 +264,7 @@ fn run_daemon() -> Result<()> {
     set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
     let _tray = if !initial_settings.general.hide_tray_icon {
-        match platform.create_tray(TrayMenu::minimal("vernier")) {
+        match platform.create_tray(TrayMenu::minimal("Vernier")) {
             Ok(t) => Some(t),
             Err(e) => {
                 log::warn!(
@@ -339,7 +339,7 @@ fn run_daemon() -> Result<()> {
             // edits are picked up automatically.
             spawn_hyprland_bind_watcher();
         } else {
-            current_hotkey = match platform.register_hotkey(accel, "Toggle vernier") {
+            current_hotkey = match platform.register_hotkey(accel, "Toggle Vernier") {
                 Ok(id) => {
                     log::info!(
                         "global hotkey registered (the user may be prompted by xdg-desktop-portal-hyprland to confirm the binding)"
@@ -2261,7 +2261,7 @@ fn run_daemon() -> Result<()> {
                                         );
                                     }
                                 } else {
-                                    match platform.register_hotkey(accel, "Toggle vernier") {
+                                    match platform.register_hotkey(accel, "Toggle Vernier") {
                                         Ok(id) => {
                                             log::info!(
                                                 "toggle hotkey changed to {}",

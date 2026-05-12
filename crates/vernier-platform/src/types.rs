@@ -621,7 +621,7 @@ impl TrayMenu {
                 TrayMenuItem::Separator,
                 TrayMenuItem::Action {
                     id: "quit".into(),
-                    label: "Quit vernier".into(),
+                    label: "Quit Vernier".into(),
                     enabled: true,
                     accelerator: None,
                 },

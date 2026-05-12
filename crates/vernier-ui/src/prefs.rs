@@ -81,7 +81,7 @@ struct PrefsApp {
     /// and reverts.
     saved: Settings,
     on_saved: Box<dyn FnMut() + Send>,
-    /// Invoked when the user clicks "Quit vernier" — the caller
+    /// Invoked when the user clicks "Quit Vernier" — the caller
     /// is responsible for telling the running daemon to exit.
     on_quit: Box<dyn FnMut() + Send>,
     last_status: Option<String>,
@@ -416,7 +416,7 @@ impl App for PrefsApp {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    let quit_label = egui::RichText::new("Quit vernier")
+                    let quit_label = egui::RichText::new("Quit Vernier")
                         .color(egui::Color32::from_rgb(220, 90, 90));
                     if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
@@ -2901,7 +2901,7 @@ fn color_picker(ui: &mut egui::Ui, c: &mut ColorRgba) {
 /// Open the prefs window. Returns when the user closes it.
 /// `on_saved` runs synchronously after each successful save (the
 /// caller plugs in an IPC reload ping). `on_quit` runs when the
-/// user clicks the "Quit vernier" button so the caller can send
+/// user clicks the "Quit Vernier" button so the caller can send
 /// the daemon-shutdown IPC.
 pub fn run_prefs(
     on_saved: Box<dyn FnMut() + Send>,
