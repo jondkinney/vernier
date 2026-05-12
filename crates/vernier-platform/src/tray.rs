@@ -86,7 +86,11 @@ impl ksni::Tray for VernierTray {
         }
     }
     fn icon_name(&self) -> String {
-        "vernier".to_string()
+        // Point waybar and other StatusNotifier consumers at the
+        // monochrome variant so it inherits the bar's `currentColor`
+        // rather than displaying as a tiny colored badge. `icon_pixmap`
+        // below also renders the symbolic SVG.
+        "vernier-symbolic".to_string()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let rgba = render_tray_icon_rgba(64);
