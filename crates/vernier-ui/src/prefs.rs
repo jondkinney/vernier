@@ -4,14 +4,14 @@
 //! the daemon via the supplied callback so it can reload without
 //! restart.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
 use vernier_core::{
-    AppearanceSettings, ColorRgba, CopyFormat, GeneralSettings, HandoffApp, IntegrationSettings,
+    AppearanceSettings, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
     ToleranceSettings, Units,
 };
@@ -1805,7 +1805,7 @@ fn shortcuts_section(
     static_bind_warning: Option<&std::path::Path>,
 ) {
     if let Some(path) = static_bind_warning {
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(egui::Color32::from_rgb(60, 48, 16))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 140, 50)))
             .corner_radius(egui::CornerRadius::same(8))
@@ -2976,7 +2976,7 @@ fn caption(ui: &mut egui::Ui, text: &str) {
     job.wrap.max_width = ui.available_width();
     let mut in_code = false;
     let mut buf = String::new();
-    let mut flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
+    let flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
         if buf.is_empty() {
             return;
         }
@@ -3024,7 +3024,7 @@ fn caption(ui: &mut egui::Ui, text: &str) {
     for row in &galley.rows {
         let row_rect = row.rect();
         let mut run: Option<CodeRun> = None;
-        let mut flush_run = |run: &mut Option<CodeRun>| {
+        let flush_run = |run: &mut Option<CodeRun>| {
             if let Some((x0, x1, y_min, y_max)) = run.take() {
                 // y bounds may still be sentinel infinities if the
                 // run was only made of NBSP glyphs (e.g. a wrapped

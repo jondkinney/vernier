@@ -18,13 +18,11 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat, delegate_shm,
-    globals::GlobalData,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     reexports::protocols::wp::cursor_shape::v1::client::{
         wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
-        wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
     },
     seat::{
         Capability, SeatHandler, SeatState,
@@ -1580,7 +1578,6 @@ fn render_hud_strokes(
     let Some(mut pixmap) = PixmapMut::from_bytes(canvas, buf_w, buf_h) else {
         return Vec::new();
     };
-    let scale_f = scale as f32;
 
     let fg = hud.foreground;
     let mut paint = Paint::default();
@@ -1734,11 +1731,9 @@ fn render_hud_strokes(
                 buf_w as f32,
                 buf_h as f32,
                 scale,
-                fg,
                 &paint,
                 &stroke,
                 &tick_stroke,
-                true,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
                 hud.measurement_format.dimension_divisor,
@@ -1760,11 +1755,9 @@ fn render_hud_strokes(
                 buf_w as f32,
                 buf_h as f32,
                 scale,
-                fg,
                 &paint,
                 &stroke,
                 &tick_stroke,
-                true,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
                 hud.measurement_format.dimension_divisor,
@@ -1795,11 +1788,9 @@ fn render_hud_strokes(
                 buf_w as f32,
                 buf_h as f32,
                 scale,
-                fg,
                 &paint,
                 &stroke,
                 &tick_stroke,
-                false,
                 hud.measurement_format.wh_indicators,
                 &hud.measurement_format.unit_suffix,
                 hud.measurement_format.dimension_divisor,
@@ -2346,9 +2337,7 @@ fn draw_remove_x_badge(
 
 /// Draw the live measure crosshair: axis lines through the cursor with
 /// tick caps where edges were detected, plus the white `+` cursor
-/// marker on top. When `show_dim_pill` is true, also emits a W×H pill
-/// in the lower-right of the cursor (Hover mode); Held mode passes
-/// false because the held rectangle has its own central pill.
+/// marker on top, and a W×H pill in the lower-right of the cursor.
 #[allow(clippy::too_many_arguments)]
 fn draw_hover_indicators(
     pixmap: &mut tiny_skia::PixmapMut,
@@ -2358,11 +2347,9 @@ fn draw_hover_indicators(
     buf_w: f32,
     buf_h: f32,
     scale: u32,
-    fg: Color,
     paint: &tiny_skia::Paint,
     stroke: &tiny_skia::Stroke,
     tick_stroke: &tiny_skia::Stroke,
-    show_dim_pill: bool,
     wh_indicators: bool,
     unit_suffix: &str,
     dimension_divisor: f64,
@@ -3483,30 +3470,6 @@ fn pill_path(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
     pb.cubic_to(x, cy - k, x + r - k, y, x + r, y);
     pb.close();
     pb.finish()
-}
-
-fn stroke_circle(
-    pixmap: &mut tiny_skia::PixmapMut,
-    cx: f32,
-    cy: f32,
-    radius: f32,
-    paint: &tiny_skia::Paint,
-) {
-    use tiny_skia::*;
-    let mut pb = PathBuilder::new();
-    pb.push_circle(cx, cy, radius);
-    if let Some(path) = pb.finish() {
-        pixmap.stroke_path(
-            &path,
-            paint,
-            &Stroke {
-                width: 1.5,
-                ..Default::default()
-            },
-            Transform::identity(),
-            None,
-        );
-    }
 }
 
 fn video_format_to_pixel_format(
