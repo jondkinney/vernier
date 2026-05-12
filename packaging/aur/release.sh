@@ -179,6 +179,10 @@ say "prebuilt sha256 = $BIN_SHA"
 
 #--- create/refresh the GitHub Release with the prebuilt tarball ---------------
 
+# Publishing the Release triggers .github/workflows/release-aarch64.yml,
+# which cross-builds the aarch64 binary on an ARM runner and uploads
+# vernier-$ver-aarch64.tar.gz to the same Release. We wait for that
+# asset to land below before pinning its sha into the PKGBUILD.
 say "publishing prebuilt tarball to GitHub Release $TAG"
 if (( ! DRY_RUN )); then
     if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
@@ -190,6 +194,29 @@ if (( ! DRY_RUN )); then
             --generate-notes
     fi
 fi
+
+#--- wait for the aarch64 asset to land (uploaded by the GHA workflow) --------
+
+ARM_NAME="$PKGNAME-$NEW_VER-aarch64.tar.gz"
+ARM_URL="https://github.com/$GH_REPO/releases/download/${TAG}/${ARM_NAME}"
+say "waiting for the GHA workflow to upload $ARM_NAME (up to 20 min)"
+ARM_SHA=""
+# 40 × 30s = 20 minutes; ARM cross-build typically lands within ~10 min.
+for attempt in $(seq 1 40); do
+    if (( DRY_RUN )); then ARM_SHA="dryrun$(printf '%064x' 0 | head -c 64)"; break; fi
+    if curl -sfL "$ARM_URL" -o "/tmp/$ARM_NAME" 2>/dev/null; then
+        ARM_SHA="$(sha256sum "/tmp/$ARM_NAME" | awk '{print $1}')"
+        break
+    fi
+    sleep 30
+done
+if [[ -z "$ARM_SHA" ]]; then
+    warn "aarch64 asset never showed up — check"
+    warn "  gh run list --workflow release-aarch64.yml --repo $GH_REPO"
+    warn "  https://github.com/$GH_REPO/actions/workflows/release-aarch64.yml"
+    die "aborting before AUR push so aur-bin doesn't ship a stale aarch64 sha"
+fi
+say "aarch64 sha256  = $ARM_SHA"
 
 #--- rewrite all three in-repo PKGBUILDs --------------------------------------
 
@@ -206,6 +233,7 @@ if (( ! DRY_RUN )); then
         -e "s/^pkgver=.*/pkgver=$NEW_VER/" \
         -e "s/^pkgrel=.*/pkgrel=1/" \
         -e "s/^sha256sums_x86_64=\\(.*\\)$/sha256sums_x86_64=('$BIN_SHA')/" \
+        -e "s/^sha256sums_aarch64=\\(.*\\)$/sha256sums_aarch64=('$ARM_SHA')/" \
         "$PKGBUILD_BIN"
 
     sed -i -E \
