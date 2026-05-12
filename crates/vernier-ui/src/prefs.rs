@@ -125,6 +125,14 @@ struct PrefsApp {
     daemon_alive: bool,
     last_daemon_probe: Instant,
     prefs_started_at: Instant,
+    /// `vernier_core::build_id()` snapshot for the prefs binary itself.
+    /// Captured once at startup so a later rebuild of the on-disk
+    /// binary doesn't change it.
+    my_build_id: String,
+    /// Build id reported by the running daemon over the `version`
+    /// IPC. `None` if the probe failed or the daemon is older than
+    /// the `version` command. Refreshed alongside `daemon_alive`.
+    daemon_build_id: Option<String>,
 }
 
 impl PrefsApp {
@@ -193,6 +201,8 @@ impl PrefsApp {
             daemon_alive: true,
             last_daemon_probe: now,
             prefs_started_at: now,
+            my_build_id: vernier_core::build_id(),
+            daemon_build_id: None,
         }
     }
 
@@ -237,6 +247,7 @@ impl App for PrefsApp {
             && self.last_daemon_probe.elapsed() > probe_interval
         {
             self.daemon_alive = is_daemon_responsive();
+            self.daemon_build_id = query_daemon_build_id();
             self.last_daemon_probe = Instant::now();
         }
         ctx.request_repaint_after(probe_interval);
@@ -420,6 +431,29 @@ impl App for PrefsApp {
                     if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
                     }
+                    // Show "Relaunch daemon" only when the running
+                    // daemon's build_id differs from this prefs
+                    // binary's — i.e. the on-disk binary has been
+                    // rebuilt since the daemon was started.
+                    if let Some(daemon_id) = self.daemon_build_id.as_ref() {
+                        if daemon_id != &self.my_build_id {
+                            ui.add_space(8.0);
+                            let label = egui::RichText::new("Relaunch daemon (new build)")
+                                .color(egui::Color32::from_rgb(220, 160, 50));
+                            let resp = ui.add(egui::Button::new(label)).on_hover_text(format!(
+                                "Daemon is running build {daemon_id}; prefs is on {}. \
+                                 Click to quit the old daemon and spawn the new one.",
+                                self.my_build_id
+                            ));
+                            if resp.clicked() {
+                                relaunch_daemon_now();
+                                // Force the next probe to fire immediately so the
+                                // banner clears as soon as the new daemon binds.
+                                self.last_daemon_probe =
+                                    Instant::now() - Duration::from_secs(60);
+                            }
+                        }
+                    }
                     ui.add_space(12.0);
                     let dirty = self.dirty();
                     // The right-to-left layout below renders an
@@ -527,6 +561,64 @@ fn is_daemon_responsive() -> bool {
         return false;
     }
     std::os::unix::net::UnixStream::connect(&path).is_ok()
+}
+
+/// Ask the running daemon for its `vernier_core::build_id()` over
+/// the `version` IPC. Returns `None` if the socket can't be reached
+/// or the daemon's response is empty / malformed — including the
+/// case where the daemon is from a pre-`version`-command build.
+fn query_daemon_build_id() -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Duration;
+    let path = daemon_socket_path();
+    if !path.exists() {
+        return None;
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    stream.write_all(b"version\n").ok()?;
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let reader = BufReader::new(stream);
+    let line = reader.lines().next()?.ok()?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Tell the running daemon to quit, wait briefly for it to release
+/// the IPC socket, then spawn `current_exe` to launch a fresh
+/// daemon from the new on-disk binary. Used by the "Relaunch
+/// daemon" button shown when the daemon's build_id falls out of
+/// sync with the prefs binary's.
+fn relaunch_daemon_now() {
+    use std::io::Write;
+    use std::time::Duration;
+    let path = daemon_socket_path();
+    if path.exists() {
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+            let _ = stream.write_all(b"quit\n");
+            let _ = stream.flush();
+        }
+        // Wait up to 1s for the daemon to release the socket.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if !path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        match std::process::Command::new(&exe).spawn() {
+            Ok(c) => log::info!("daemon relaunched from prefs (pid {})", c.id()),
+            Err(e) => log::warn!("relaunch daemon spawn failed: {e:#}"),
+        }
+    }
 }
 
 fn daemon_socket_path() -> PathBuf {

@@ -31,3 +31,31 @@ pub use settings::{
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
     ToleranceSettings, Units, settings_path,
 };
+
+/// Stable per-process build identifier — the mtime (in seconds since
+/// the epoch, hex-encoded) of the executable that launched this
+/// process. Captured the first time it's called, so a later rebuild
+/// of the on-disk binary doesn't invalidate the value for an
+/// already-running process. Used by the prefs window's daemon-probe
+/// to detect when the daemon is from an older build than itself.
+pub fn build_id() -> String {
+    use std::sync::OnceLock;
+    use std::time::UNIX_EPOCH;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return "unknown".to_string();
+        };
+        let Ok(meta) = std::fs::metadata(&exe) else {
+            return "unknown".to_string();
+        };
+        let secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{secs:x}")
+    })
+    .clone()
+}

@@ -203,7 +203,16 @@ fn run_client_command(cmd: &str) -> Result<()> {
 }
 
 fn run_daemon() -> Result<()> {
-    log::info!("vernier {} — daemon", env!("CARGO_PKG_VERSION"));
+    // Capture build_id NOW, before anything else might rebuild the
+    // on-disk binary. Stored inside vernier_core via OnceLock; the
+    // `version` IPC handler reads the cached value rather than
+    // re-stat'ing the path.
+    let _ = vernier_core::build_id();
+    log::info!(
+        "vernier {} — daemon (build {})",
+        env!("CARGO_PKG_VERSION"),
+        vernier_core::build_id()
+    );
 
     // Race-free singleton claim via flock — must happen before any
     // portal work. If two daemons start simultaneously (e.g. the
@@ -3575,6 +3584,13 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                     if sender.send(MainEvent::Ipc(IpcCmd::OpenPrefs)).is_err() {
                         return;
                     }
+                }
+                "version" => {
+                    // Answered directly here — no main-loop roundtrip
+                    // needed since the build_id is a process-lifetime
+                    // constant captured at daemon startup.
+                    let _ = writer
+                        .write_all(format!("{}\n", vernier_core::build_id()).as_bytes());
                 }
                 other => log::debug!("ipc unknown command: {other:?}"),
             }
