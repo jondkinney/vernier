@@ -113,6 +113,8 @@ fn handle(stream: TcpStream) {
 ///    FHS install (`/usr/bin/vernier` → `/usr/share/vernier/...`).
 /// 4. `<workspace>/figma-plugin/manifest.json` resolved at compile
 ///    time via `CARGO_MANIFEST_DIR` — convenience for `cargo run`.
+///    Debug builds only, so release binaries don't bake in the
+///    builder's source path.
 pub fn manifest_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VERNIER_FIGMA_PLUGIN_DIR") {
         let p = PathBuf::from(dir).join("manifest.json");
@@ -132,10 +134,13 @@ pub fn manifest_path() -> Option<PathBuf> {
             }
         }
     }
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../figma-plugin/manifest.json");
-    if dev.exists() {
-        return canonicalize(dev);
+    #[cfg(debug_assertions)]
+    {
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../figma-plugin/manifest.json");
+        if dev.exists() {
+            return canonicalize(dev);
+        }
     }
     None
 }
