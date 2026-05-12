@@ -926,33 +926,33 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     let s = &mut settings.general;
     setting(ui, |ui| {
         ui.checkbox(&mut s.launch_at_login, "Launch at login");
-        ui.label(caption(
+        caption(ui, 
             "Adds an autostart entry. Uncheck to remove it on save.",
-        ));
+        );
     });
     setting(ui, |ui| {
         let mut show_tray = !s.hide_tray_icon;
         if ui.checkbox(&mut show_tray, "Show tray icon").changed() {
             s.hide_tray_icon = !show_tray;
         }
-        ui.label(caption(
+        caption(ui, 
             "Off keeps the daemon running but hides the tray menu. Drive it via the global hotkey or `vernier toggle`.",
-        ));
+        );
     });
     ui.separator();
     ui.add_space(10.0);
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.display_units, "Display units (px / pt)");
-        ui.label(caption(
+        caption(ui, 
             "Append the unit suffix configured under Appearance to dimension pills. Off shows bare numbers.",
-        ));
+        );
     });
     setting(ui, |ui| {
         ui.checkbox(&mut s.display_wh_indicators, "Display W/H indicators");
-        ui.label(caption(
+        caption(ui, 
             "Prefix area pills with `W:` and `H:` labels (e.g. `W: 1024 \u{00D7} H: 768`).",
-        ));
+        );
     });
 
     setting(ui, |ui| {
@@ -983,26 +983,26 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     setting(ui, |ui| {
         field_label(ui, "Distance tool");
         ui.checkbox(&mut s.snap_to_guides, "Snap to guides");
-        ui.label(caption(
+        caption(ui, 
             "Edges and drag endpoints magnetize to the nearest reference guide within 8 logical pixels.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.freeze_screen, "Freeze screen");
-        ui.label(caption(
+        caption(ui, 
             "On (default): the captured frame is locked when measure mode opens; press R to refresh manually. \
              Off: edge detection follows live screen content as the cursor moves.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.show_cursor, "Show cursor");
-        ui.label(caption(
+        caption(ui, 
             "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
              leaving the axis lines, ticks, and W×H pill rendering. \
              Hold SUPER to hide the cursor momentarily for a clean read.",
-        ));
+        );
     });
 }
 
@@ -1036,34 +1036,34 @@ fn screenshots_section(
                 s.padding_px = pad.max(0) as u32;
             }
         });
-        ui.label(caption(
+        caption(ui, 
             "Pixels of transparent space added around the captured region.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.retina_downscale, "Retina downscale");
-        ui.label(caption(
+        caption(ui, 
             "Save the captured region at logical (point) pixels rather than the raw HiDPI buffer.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.capture_sound, "Play shutter sound");
-        ui.label(caption(
+        caption(ui, 
             "Plays the system screen-capture sound when a screenshot fires.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         field_label(ui, "Take normal screenshot (right-click menu)");
         padded_text_edit(ui, &mut s.external_screenshot_command);
-        ui.label(caption(
+        caption(ui, 
             "Shell command for \"Take Normal Screenshot\" (right-click menu / `CTRL+S`). \
              Vernier exits measure mode first, then spawns this via `sh -c` so pipelines work, \
              e.g. `grim -g \"$(slurp)\" - | wl-copy`. Distinct from the handoff app above, \
              which routes Vernier's own region captures.",
-        ));
+        );
     });
 
     ui.separator();
@@ -1114,15 +1114,15 @@ fn screenshots_section(
                 *folder_pick = Some(rx);
             }
         });
-        ui.label(caption(
+        caption(ui, 
             "Empty = $XDG_PICTURES_DIR (or ~/Pictures). Non-existent paths are created on capture.",
-        ));
+        );
     });
 
     setting(ui, |ui| {
         field_label(ui, "Filename template");
         padded_text_edit(ui, &mut s.filename_template);
-        ui.label(caption("Tokens: {ts} timestamp, {w} width, {h} height."));
+        caption(ui, "Tokens: {ts} timestamp, {w} width, {h} height.");
     });
 
     setting(ui, |ui| {
@@ -1510,11 +1510,11 @@ fn tick_slider(
 }
 
 fn tolerance_section(ui: &mut egui::Ui, s: &mut ToleranceSettings) {
-    ui.label(caption(
+    caption(ui, 
         "Numeric value (sum-of-channel difference, 0–255) for each tolerance level. \
          Live + / − cycles between levels in a session; the dropdown picks which one \
          is active each time measure mode opens.",
-    ));
+    );
     ui.add_space(14.0);
 
     // Tick marks are decorative — 16 evenly-spaced stops along
@@ -2040,9 +2040,9 @@ fn shortcuts_section(
         capturing,
     );
     ui.add_space(4.0);
-    ui.label(caption(
+    caption(ui, 
         "Nudge shortcuts: hold Shift to step 10 px instead of 1 px (built-in modifier).",
-    ));
+    );
     ui.add_space(12.0);
     ui.with_layout(
         egui::Layout::left_to_right(egui::Align::Center),
@@ -2944,10 +2944,153 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Caption row — the muted explainer text under inputs / checkboxes.
-fn caption(text: &str) -> egui::RichText {
-    egui::RichText::new(text)
-        .color(egui::Color32::from_gray(170))
-        .size(12.0)
+/// Parses backtick-delimited spans as inline "code" pills (monospace
+/// with a subtle dark fill behind them), GitHub-comment style.
+/// Renders directly into `ui` so the wrap width can use the live
+/// available width.
+fn caption(ui: &mut egui::Ui, text: &str) {
+    use egui::text::LayoutJob;
+    const LINE_HEIGHT: f32 = 22.0;
+    // Code sections get NO background here — we paint our own rects
+    // below at a tighter y range so the backdrop sits centered on
+    // the glyphs instead of spanning the full row height.
+    let plain = egui::TextFormat {
+        font_id: egui::FontId::proportional(12.0),
+        color: egui::Color32::from_gray(170),
+        line_height: Some(LINE_HEIGHT),
+        valign: egui::Align::Center,
+        ..Default::default()
+    };
+    let code = egui::TextFormat {
+        font_id: egui::FontId::monospace(11.5),
+        color: egui::Color32::from_gray(225),
+        line_height: Some(LINE_HEIGHT),
+        valign: egui::Align::Center,
+        ..Default::default()
+    };
+    // No-break space inside the pill so the backdrop extends a
+    // glyph-width past the code text on each side without exposing
+    // a wrap opportunity.
+    const NBSP: char = '\u{00A0}';
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let mut in_code = false;
+    let mut buf = String::new();
+    let mut flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
+        if buf.is_empty() {
+            return;
+        }
+        if in_code {
+            job.append(&format!("{NBSP}{buf}{NBSP}"), 0.0, code.clone());
+        } else {
+            job.append(buf, 0.0, plain.clone());
+        }
+        buf.clear();
+    };
+    for c in text.chars() {
+        if c == '`' {
+            flush(&mut job, &mut buf, in_code);
+            in_code = !in_code;
+        } else {
+            buf.push(c);
+        }
+    }
+    flush(&mut job, &mut buf, in_code);
+
+    // Lay out, allocate, then paint code backdrops manually so we
+    // can use a tighter y-range than the full row height.
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let (rect, _resp) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let origin = rect.min;
+    let painter = ui.painter();
+
+    let bg_color = egui::Color32::from_gray(48);
+    let bg_corner_radius: f32 = 3.0;
+    let bg_x_slop: f32 = 1.0;
+    // Pad the backdrop above and below the glyph extent so the cap
+    // line and descenders have a little breathing room inside the
+    // pill instead of touching the rect edges.
+    let bg_y_pad_top: f32 = 2.0;
+    let bg_y_pad_bot: f32 = 1.0;
+    // Identify code spans by the NBSP padding we injected. Plain
+    // text in captions doesn't carry NBSP, so an NBSP toggles us
+    // into / out of a code run. State persists across rows so a
+    // wrapped code span is still a single contiguous bg.
+    let mut in_code_run = false;
+    // A code run carries its own y extent (min/max glyph y) so the
+    // backdrop hugs the actual glyph metrics rather than the full
+    // row line height. Stored as absolute screen y values.
+    type CodeRun = (f32, f32, f32, f32); // (x0, x1, y_min, y_max)
+    for row in &galley.rows {
+        let row_rect = row.rect();
+        let mut run: Option<CodeRun> = None;
+        let mut flush_run = |run: &mut Option<CodeRun>| {
+            if let Some((x0, x1, y_min, y_max)) = run.take() {
+                // y bounds may still be sentinel infinities if the
+                // run was only made of NBSP glyphs (e.g. a wrapped
+                // code span whose closing NBSP landed alone on a
+                // new row). Skip painting in that case — there's
+                // no visible text to wrap a pill around.
+                if y_min.is_finite() && y_max.is_finite() {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0 + bg_x_slop, y_min - bg_y_pad_top),
+                            egui::pos2(x1 - bg_x_slop, y_max + bg_y_pad_bot),
+                        ),
+                        bg_corner_radius,
+                        bg_color,
+                    );
+                }
+            }
+        };
+        for glyph in &row.glyphs {
+            // glyph.pos is row-relative; placed_row.pos (= row_rect.min)
+            // is the row's offset in the galley. Combine to get the
+            // glyph's position in screen space.
+            let x0 = origin.x + row_rect.min.x + glyph.pos.x;
+            let size = glyph.size();
+            let x1 = x0 + size.x;
+            // glyph.pos.y is the BASELINE within the row, not the
+            // top of the row. Build the visible glyph y-extent from
+            // baseline + font metrics so the backdrop hugs
+            // ascender→descender, not the full row line_height.
+            let baseline = origin.y + row_rect.min.y + glyph.pos.y;
+            let gy_min = baseline - glyph.font_ascent;
+            let gy_max = baseline + (glyph.font_height - glyph.font_ascent);
+            if glyph.chr == NBSP {
+                // NBSP marks the start / end of a code span. The
+                // NBSP itself is whitespace so its glyph y extent
+                // tends to be tiny — don't fold it into the run's
+                // y bounds (use the regular code glyphs instead).
+                match run {
+                    Some((_, ref mut x_end, _, _)) => *x_end = x1,
+                    None => run = Some((x0, x1, f32::INFINITY, f32::NEG_INFINITY)),
+                }
+                if in_code_run {
+                    in_code_run = false;
+                    flush_run(&mut run);
+                } else {
+                    in_code_run = true;
+                }
+            } else if in_code_run {
+                match run {
+                    Some((_, ref mut x_end, ref mut y_min, ref mut y_max)) => {
+                        *x_end = x1;
+                        if gy_min < *y_min {
+                            *y_min = gy_min;
+                        }
+                        if gy_max > *y_max {
+                            *y_max = gy_max;
+                        }
+                    }
+                    None => run = Some((x0, x1, gy_min, gy_max)),
+                }
+            }
+        }
+        flush_run(&mut run);
+    }
+
+    painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
 }
 
 /// Single-line text input with consistent inner padding so the
