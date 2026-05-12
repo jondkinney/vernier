@@ -907,9 +907,9 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     setting(ui, |ui| {
         ui.checkbox(&mut s.show_cursor, "Show cursor");
         ui.label(caption(
-            "Show the white-outlined `+` marker over the cursor while measuring. \
-             Off: the marker is hidden — the measurement guides themselves (axis lines, tick caps, W×H pill) keep rendering, and so do the move/resize cursors for guides and held-rect handles. \
-             Hold SUPER at any time to momentarily hide both Vernier's `+` and the system pointer for a clean read of the pixels underneath; releasing SUPER restores whichever cursor this toggle is set to.",
+            "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
+             leaving the axis lines, ticks, and W×H pill rendering. \
+             Hold SUPER to hide the cursor momentarily for a clean read.",
         ));
     });
 }
@@ -967,18 +967,10 @@ fn screenshots_section(
         field_label(ui, "Take normal screenshot (right-click menu)");
         padded_text_edit(ui, &mut s.external_screenshot_command);
         ui.label(caption(
-            "Escape hatch from measure mode. Picking \"Take Normal \
-             Screenshot\" from Vernier's right-click menu runs the \
-             same clear-and-hide as Esc (saving the session, \
-             dropping every rect/guide/measurement, hiding the \
-             overlay), then spawns this command detached. Vernier \
-             stays running in the background so you can re-enter \
-             measure mode after. Run \
-             through `sh -c`, so args and pipelines work (e.g. \
-             `grim -g \"$(slurp)\" - | wl-copy`). Independent of \
-             the handoff app above: handoff routes Vernier's own \
-             region captures; this is for taking a plain \
-             screenshot when you don't want to measure.",
+            "Shell command for \"Take Normal Screenshot\" (right-click menu / `CTRL+S`). \
+             Vernier exits measure mode first, then spawns this via `sh -c` so pipelines work, \
+             e.g. `grim -g \"$(slurp)\" - | wl-copy`. Distinct from the handoff app above, \
+             which routes Vernier's own region captures.",
         ));
     });
 
