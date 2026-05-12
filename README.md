@@ -1,3 +1,5 @@
+<img src="assets/icons/png/vernier-512.png" align="right" width="160" alt="Vernier icon">
+
 # Vernier
 
 Cross-platform pixel-measurement overlay in Rust. Runs on macOS, Windows, Linux X11 + Wayland.

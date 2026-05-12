@@ -2,7 +2,7 @@
 
 ## Contents
 
-- `svg/` — vector sources (vernier, vernier-symbolic for menubar, vernier-v alternate)
+- `svg/` — vector sources (main app icon, symbolic menubar variant)
 - `png/` — rasterized app icon at 16, 22, 24, 32, 48, 64, 128, 256, 512
 - `hicolor/` — Freedesktop hicolor theme structure, ready to drop into
   `/usr/share/icons/hicolor/` or `~/.local/share/icons/hicolor/`
