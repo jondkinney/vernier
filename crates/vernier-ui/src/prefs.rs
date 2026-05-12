@@ -413,8 +413,7 @@ impl App for PrefsApp {
         egui::TopBottomPanel::bottom("prefs_actions")
             .min_height(54.0)
             .show(ctx, |ui| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_centered(|ui| {
                     ui.add_space(8.0);
                     let quit_label = egui::RichText::new("Quit Vernier")
                         .color(egui::Color32::from_rgb(220, 90, 90));
@@ -470,7 +469,6 @@ impl App for PrefsApp {
                         }
                     });
                 });
-                ui.add_space(10.0);
             });
         if quit_requested {
             (self.on_quit)();
