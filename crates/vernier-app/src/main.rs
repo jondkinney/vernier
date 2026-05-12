@@ -431,10 +431,19 @@ fn run_daemon() -> Result<()> {
     const TOAST_TOLERANCE_MS: u64 = 900;
     const TOAST_SCREENSHOT_MS: u64 = 1200;
     // Reference guides accumulate across keypresses. `pending_guide`
-    // is the in-flight axis the next click will stick to the cursor;
-    // `guides` are committed lines.
+    // is the in-flight BASE axis the next click will stick to the
+    // cursor; the effective axis can be flipped by holding SHIFT
+    // post-entry (see `effective_pending_axis`). `guides` are
+    // committed lines. Once entered, pending mode is sticky: clicks
+    // place a guide and stay in pending; ESC exits.
     let mut guides: Vec<Guide> = Vec::new();
     let mut pending_guide: Option<GuideAxis> = None;
+    // Has the user released SHIFT at least once since entering pending
+    // mode? Entry via SHIFT+H / SHIFT+V starts with `false` (the trigger
+    // is still held); the first release flips this to `true`. After
+    // that, holding SHIFT means "flip the axis for the next click".
+    // Entries from a shift-less binding start with `true` immediately.
+    let mut pending_guide_shift_acked: bool = false;
     // Frozen single-axis measurements. Same lifecycle as `guides`:
     // accumulated with lower-h / lower-v key presses, cleared by Esc.
     let mut stuck_measurements: Vec<StuckMeasurement> = Vec::new();
@@ -481,6 +490,13 @@ fn run_daemon() -> Result<()> {
     // configured window (`clear_and_hide_double_press_window_ms`)
     // fires the action. Otherwise the first press fires it.
     let mut last_esc_at: Option<Instant> = None;
+    // True between a 1st ESC press and either: (a) a 2nd ESC within
+    // the close-and-clear window (full clear+exit), or (b) the
+    // window expiring (true freeze via toggle_measurement). While
+    // set, refresh_hud renders as if Idle (no live measurement),
+    // but the layer surface keeps its input grab so the 2nd ESC
+    // can still land.
+    let mut pre_clear_freeze: bool = false;
     // Currently-held nudge direction (if any) and a generation
     // counter that the spawned timer thread checks before firing.
     // Bumping the generation invalidates the timer for that
@@ -542,6 +558,12 @@ fn run_daemon() -> Result<()> {
                 break;
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "toggle_overlay" => {
+                // Wipe transient state so an explicit toggle doesn't
+                // leave us in a half-frozen / pending-guide limbo.
+                pre_clear_freeze = false;
+                pending_guide = None;
+                pending_guide_shift_acked = false;
+                last_esc_at = None;
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
@@ -551,6 +573,12 @@ fn run_daemon() -> Result<()> {
                 log::info!("unhandled tray menu id: {id}");
             }
             MainEvent::Platform(PlatformEvent::HotkeyPressed(_)) => {
+                // Same reset as the tray toggle path — explicit
+                // toggle is the user's "get me out of any sub-mode".
+                pre_clear_freeze = false;
+                pending_guide = None;
+                pending_guide_shift_acked = false;
+                last_esc_at = None;
                 toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
@@ -622,6 +650,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -698,6 +729,9 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         super_held,
+                        shift_held,
+                        pending_guide_shift_acked,
+                        pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         active_handle,
@@ -708,6 +742,13 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::PointerButton {
                 button, pressed, x, y, ..
             }) => {
+                // During the close-and-clear window we look visually
+                // idle — drop pointer events so a stray click during
+                // the freeze doesn't drop a new held rect / context
+                // menu that ghost-appears after the window expires.
+                if pre_clear_freeze {
+                    continue;
+                }
                 // Right-click toggles the floating context menu. An
                 // active drag / resize blocks it (don't disrupt
                 // in-flight gestures).
@@ -725,6 +766,7 @@ fn run_daemon() -> Result<()> {
                         // don't end up with both UI states fighting
                         // for the next click.
                         pending_guide = None;
+                        pending_guide_shift_acked = false;
                         let menu_h = menu_content_height_logical(MENU_ITEMS);
                         // Anchor the menu so it doesn't overlap the
                         // crosshair: 10 logical px right of the
@@ -769,6 +811,9 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         super_held,
+                        shift_held,
+                        pending_guide_shift_acked,
+                        pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -854,6 +899,8 @@ fn run_daemon() -> Result<()> {
                                     &mut stuck_measurements,
                                     &mut nudge_selection,
                                     &mut pending_guide,
+                                    &mut pending_guide_shift_acked,
+                                    &mut pre_clear_freeze,
                                     &mut active_toast,
                                     &mut toast_until,
                                     &mut last_esc_at,
@@ -935,6 +982,9 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         super_held,
+                        shift_held,
+                        pending_guide_shift_acked,
+                        pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -991,6 +1041,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1053,6 +1106,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1089,6 +1145,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1119,6 +1178,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1181,6 +1243,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1191,9 +1256,16 @@ fn run_daemon() -> Result<()> {
                     }
                     // While a guide is pending placement, the next
                     // press sticks it at the cursor instead of
-                    // starting a measurement drag.
+                    // starting a measurement drag. Pending mode is
+                    // sticky — the click places a guide but leaves
+                    // pending_guide set so the user can drop several
+                    // (and toggle axis via SHIFT). ESC exits.
                     if pressed {
-                        if let Some(axis) = pending_guide.take() {
+                        if let Some(axis) = effective_pending_axis(
+                            pending_guide,
+                            pending_guide_shift_acked,
+                            shift_held,
+                        ) {
                             // Use the snapped position (matches what
                             // the user saw under the move cursor),
                             // unless Super is held for free-place.
@@ -1234,6 +1306,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1309,9 +1384,11 @@ fn run_daemon() -> Result<()> {
                             guides.clear();
                             stuck_measurements.clear();
                             pending_guide = None;
+                            pending_guide_shift_acked = false;
                             active_toast = None;
                             toast_until = None;
                             last_esc_at = None;
+                            pre_clear_freeze = false;
                             toggle_measurement(
                                 &mut mode,
                                 &mut overlay,
@@ -1365,6 +1442,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1394,6 +1474,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1418,10 +1501,22 @@ fn run_daemon() -> Result<()> {
                 let is_alt = keysym == 0xffe9 || keysym == 0xffea;
                 if is_shift || is_ctrl || is_alt || is_super {
                     let super_was = super_held;
+                    let shift_was = shift_held;
                     if is_shift { shift_held = pressed; }
                     if is_ctrl { ctrl_held = pressed; }
                     if is_alt { alt_held = pressed; }
                     if is_super { super_held = pressed; }
+                    // First SHIFT release after entering pending guide
+                    // mode "acknowledges" the trigger keypress — from
+                    // here on, holding SHIFT means "flip the axis for
+                    // the next click."
+                    if pending_guide.is_some()
+                        && !pending_guide_shift_acked
+                        && shift_was
+                        && !shift_held
+                    {
+                        pending_guide_shift_acked = true;
+                    }
                     let new_align = shortcut_accels
                         .crosshair
                         .map(|m| modifier_held(m, shift_held, ctrl_held, alt_held, super_held))
@@ -1434,10 +1529,15 @@ fn run_daemon() -> Result<()> {
                     // `want_system_pointer` is otherwise only
                     // re-evaluated on pointer events.
                     let super_changed = super_was != super_held;
+                    let shift_changed = shift_was != shift_held;
+                    // While a guide is pending and the user toggles
+                    // SHIFT, the rendered axis flips — redraw the HUD.
+                    let pending_axis_changed =
+                        pending_guide.is_some() && pending_guide_shift_acked && shift_changed;
                     if align_changed {
                         align_mode = new_align;
                     }
-                    if (align_changed || super_changed)
+                    if (align_changed || super_changed || pending_axis_changed)
                         && !matches!(mode, InteractionMode::Idle)
                     {
                         if let Some((px_x, px_y)) = last_pointer_xy {
@@ -1499,6 +1599,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1562,6 +1665,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1581,13 +1687,52 @@ fn run_daemon() -> Result<()> {
                     ensure_prefs_window(&mut prefs_child);
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.clear_and_hide
+                    && pending_guide.is_some()
+                {
+                    // ESC while a guide is pending: leave guide mode
+                    // (clear the pending axis), but DON'T enter the
+                    // clear-and-hide flow. Guide mode is sticky for
+                    // multi-guide placement; ESC is the single exit.
+                    log::info!("guide pending: exit (Esc)");
+                    pending_guide = None;
+                    pending_guide_shift_acked = false;
+                    if let Some((x, y)) = last_pointer_xy {
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            current_tol_value(tol_level),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            align_mode,
+                            super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                            context_menu.as_ref(),
+                        );
+                    }
+                } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.clear_and_hide
                 {
                     // Configured clear-and-hide shortcut (default
                     // Esc). When `clear_and_hide_double_press` is
                     // on (default), the action requires a second
                     // press within the configured window; the first
-                    // press shows a confirmation toast. When off,
-                    // a single press fires immediately. Either
+                    // press shows a confirmation toast and visually
+                    // freezes the overlay (no live measurement). When
+                    // off, a single press fires immediately. Either
                     // way the action saves session (if persistence
                     // is on), wipes every held rect / guide / stuck
                     // measurement, and toggles measure mode off.
@@ -1614,11 +1759,13 @@ fn run_daemon() -> Result<()> {
                             stuck_measurements.len(),
                         );
                         last_esc_at = None;
+                        pre_clear_freeze = false;
                         held_rects.clear();
                         nudge_selection = None;
                         guides.clear();
                         stuck_measurements.clear();
                         pending_guide = None;
+                        pending_guide_shift_acked = false;
                         active_toast = None;
                         toast_until = None;
                         toggle_measurement(
@@ -1634,6 +1781,15 @@ fn run_daemon() -> Result<()> {
                         );
                     } else {
                         last_esc_at = Some(now);
+                        // Visually freeze immediately: refresh_hud will
+                        // render only persisted content (no live
+                        // measurement crosshair) for the duration of
+                        // the close-and-clear window. Input grab stays
+                        // so the 2nd ESC can land. The
+                        // ClearAndHideWindowExpired event fires after
+                        // `window` to drop the grab if no 2nd press
+                        // arrives.
+                        pre_clear_freeze = true;
                         let key_label = shortcut_accels
                             .clear_and_hide
                             .as_ref()
@@ -1644,6 +1800,7 @@ fn run_daemon() -> Result<()> {
                         });
                         toast_until = Some(now + window);
                         spawn_toast_timer(&combined_tx, window, false);
+                        spawn_clear_and_hide_window_timer(&combined_tx, window, now);
                         if let Some((x, y)) = last_pointer_xy {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
@@ -1662,6 +1819,9 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 super_held,
+                                shift_held,
+                                pending_guide_shift_acked,
+                                pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1676,14 +1836,22 @@ fn run_daemon() -> Result<()> {
                     // Configured guide-placement shortcuts (default
                     // SHIFT+H = horizontal, SHIFT+V = vertical). The
                     // overlay enters "pending guide" mode and sticks
-                    // it on the next click.
+                    // it on each click — sticky, ESC to exit. Holding
+                    // SHIFT (after the trigger is released) flips the
+                    // axis for the next click.
                     let axis = if pressed_accel == shortcut_accels.guide_vertical {
                         GuideAxis::Vertical
                     } else {
                         GuideAxis::Horizontal
                     };
                     pending_guide = Some(axis);
-                    log::info!("guide pending: {:?} (click to stick)", axis);
+                    // If SHIFT was the trigger (the default binds use
+                    // SHIFT+H / SHIFT+V), wait for it to be released
+                    // before treating SHIFT as the axis-flip modifier.
+                    // Otherwise the trigger keypress would immediately
+                    // flip the axis on itself.
+                    pending_guide_shift_acked = !shift_held;
+                    log::info!("guide pending: {:?} (click to stick, Esc to exit)", axis);
                     if let Some((x, y)) = last_pointer_xy {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
@@ -1702,6 +1870,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1738,6 +1909,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1797,6 +1971,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1836,6 +2013,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1875,6 +2055,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1909,6 +2092,9 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     super_held,
+                                    shift_held,
+                                    pending_guide_shift_acked,
+                                    pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -1936,6 +2122,8 @@ fn run_daemon() -> Result<()> {
                         &mut stuck_measurements,
                         &mut nudge_selection,
                         &mut pending_guide,
+                        &mut pending_guide_shift_acked,
+                        &mut pre_clear_freeze,
                         &mut active_toast,
                         &mut toast_until,
                         &mut last_esc_at,
@@ -1993,6 +2181,9 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             super_held,
+                            shift_held,
+                            pending_guide_shift_acked,
+                            pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -2057,6 +2248,9 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     super_held,
+                                    shift_held,
+                                    pending_guide_shift_acked,
+                                    pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -2126,6 +2320,8 @@ fn run_daemon() -> Result<()> {
                         toast_until,
                         &guides,
                         pending_guide,
+                        pending_guide_shift_acked,
+                        pre_clear_freeze,
                         &stuck_measurements,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -2319,6 +2515,9 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     super_held,
+                                    shift_held,
+                                    pending_guide_shift_acked,
+                                    pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -2375,6 +2574,9 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         super_held,
+                        shift_held,
+                        pending_guide_shift_acked,
+                        pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -2414,12 +2616,44 @@ fn run_daemon() -> Result<()> {
                     toast_until,
                     &guides,
                     pending_guide,
+                    pending_guide_shift_acked,
+                    pre_clear_freeze,
                     &stuck_measurements,
                     primary.bounds.w as i32,
                     primary.bounds.h as i32,
                     context_menu.as_ref(),
                     &mut last_hud_redraw,
                 );
+            }
+            MainEvent::ClearAndHideWindowExpired { esc_at } => {
+                // The 2s close-and-clear window from a 1st ESC press
+                // has elapsed without a 2nd ESC. A 2nd ESC would have
+                // cleared `last_esc_at` (and called toggle_measurement
+                // itself for the full clear+exit), so seeing the
+                // original timestamp still set is the cancel-token
+                // signaling "no 2nd press came".
+                if last_esc_at != Some(esc_at) {
+                    continue;
+                }
+                last_esc_at = None;
+                pre_clear_freeze = false;
+                active_toast = None;
+                toast_until = None;
+                if !matches!(mode, InteractionMode::Idle) {
+                    // Drop input capture + transition to true Idle
+                    // with content preserved (or hide if empty).
+                    toggle_measurement(
+                        &mut mode,
+                        &mut overlay,
+                        &*platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &held_rects,
+                        &guides,
+                        &stuck_measurements,
+                        color_alternate,
+                    );
+                }
             }
         }
     }
@@ -3169,6 +3403,8 @@ fn apply_nudge_step(
     toast_until: Option<Instant>,
     guides: &[Guide],
     pending_guide: Option<GuideAxis>,
+    pending_guide_shift_acked: bool,
+    pre_clear_freeze: bool,
     stuck_measurements: &[StuckMeasurement],
     screen_w: i32,
     screen_h: i32,
@@ -3217,6 +3453,9 @@ fn apply_nudge_step(
             color_alternate,
             align_mode,
             super_held,
+            shift_held,
+            pending_guide_shift_acked,
+            pre_clear_freeze,
             screen_w,
             screen_h,
             None,
@@ -3436,6 +3675,26 @@ fn spawn_toast_timer(
         .ok();
 }
 
+/// Spawn a detached thread that sleeps for the close-and-clear window
+/// and then enqueues `MainEvent::ClearAndHideWindowExpired`. The
+/// `esc_at` is the timestamp of the 1st ESC; the handler will compare
+/// it against `last_esc_at` and ignore the event if a 2nd ESC has
+/// already cleared the marker.
+fn spawn_clear_and_hide_window_timer(
+    tx: &std::sync::mpsc::Sender<MainEvent>,
+    delay: Duration,
+    esc_at: Instant,
+) {
+    let tx = tx.clone();
+    std::thread::Builder::new()
+        .name("vernier-clear-window".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            let _ = tx.send(MainEvent::ClearAndHideWindowExpired { esc_at });
+        })
+        .ok();
+}
+
 #[derive(Debug)]
 enum MainEvent {
     Platform(PlatformEvent),
@@ -3450,6 +3709,13 @@ enum MainEvent {
     /// wasn't reliably scheduling on Hyprland, so we drive our
     /// own timer with a generation counter for cancellation.
     NudgeTick { dir: NudgeDir, generation: u64 },
+    /// Internal: the close-and-clear confirmation window has lapsed
+    /// without a 2nd ESC, so the visually-frozen overlay should now
+    /// commit to a true freeze (drop input capture, mode → Idle).
+    /// `esc_at` is the timestamp of the 1st ESC press: the handler
+    /// only acts on this event when `last_esc_at == Some(esc_at)`,
+    /// which doubles as the cancel-token if a 2nd ESC arrived first.
+    ClearAndHideWindowExpired { esc_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3976,6 +4242,8 @@ fn do_take_normal_screenshot(
     stuck_measurements: &mut Vec<StuckMeasurement>,
     nudge_selection: &mut Option<NudgeSelection>,
     pending_guide: &mut Option<GuideAxis>,
+    pending_guide_shift_acked: &mut bool,
+    pre_clear_freeze: &mut bool,
     active_toast: &mut Option<HudToast>,
     toast_until: &mut Option<Instant>,
     last_esc_at: &mut Option<Instant>,
@@ -3992,11 +4260,13 @@ fn do_take_normal_screenshot(
         log::warn!("save session: {e:#}");
     }
     *last_esc_at = None;
+    *pre_clear_freeze = false;
     held_rects.clear();
     *nudge_selection = None;
     guides.clear();
     stuck_measurements.clear();
     *pending_guide = None;
+    *pending_guide_shift_acked = false;
     *active_toast = None;
     *toast_until = None;
     toggle_measurement(
@@ -4207,12 +4477,37 @@ fn refresh_hud(
     color_alternate: bool,
     align_mode: bool,
     super_held: bool,
+    shift_held: bool,
+    pending_guide_shift_acked: bool,
+    pre_clear_freeze: bool,
     screen_w: i32,
     screen_h: i32,
     resize_handle: Option<ResizeHandle>,
     context_menu: Option<&ContextMenuState>,
 ) {
+    // SHIFT held + acknowledged flips the BASE pending axis. Shadow
+    // here so every downstream check uses the effective axis without
+    // needing to thread it separately.
+    let pending_guide = effective_pending_axis(pending_guide, pending_guide_shift_acked, shift_held);
+
     let fg = hud_foreground(color_alternate);
+
+    // 1st ESC has visually frozen the overlay: content stays but the
+    // live measurement crosshair / pills don't draw. Keyboard input is
+    // still captured (so a 2nd ESC can land); the close-and-clear
+    // window timer drops the input grab on expiry.
+    if pre_clear_freeze {
+        let mut hud = Hud::hover((-1000.0, -1000.0));
+        hud.kind = HudKind::None;
+        hud.foreground = fg;
+        populate_hud_appearance(&mut hud, super_held);
+        hud.toast = toast.cloned();
+        hud.guides = guides.to_vec();
+        hud.stuck_measurements = stuck_measurements.to_vec();
+        hud.held_rects = held_rects.to_vec();
+        overlay.set_hud(Some(hud));
+        return;
+    }
     // While the context menu is open, freeze the live measurement at
     // the cursor's position when the menu opened — the crosshair, edge
     // ticks, and any cursor-driven hover state stop tracking the mouse
@@ -4346,12 +4641,16 @@ fn refresh_hud(
         hud.held_rects = composed_rects;
         hud.cursor_in_rect = cursor_in_rect;
         // Resize cursor matching the axis the new guide will move
-        // along — same affordance as dragging an existing guide.
-        hud.move_cursor_at = Some((pending_x, pending_y));
-        hud.cursor_kind = match axis {
-            GuideAxis::Horizontal => CursorKind::ResizeNS,
-            GuideAxis::Vertical => CursorKind::ResizeEW,
-        };
+        // along. Suppressed when SUPER is held so the user can read
+        // pixels under the cursor (matches the cursor-hide in Hover
+        // / Held modes).
+        if !super_held {
+            hud.move_cursor_at = Some((pending_x, pending_y));
+            hud.cursor_kind = match axis {
+                GuideAxis::Horizontal => CursorKind::ResizeNS,
+                GuideAxis::Vertical => CursorKind::ResizeEW,
+            };
+        }
         hud.context_menu = menu_for_hud.clone();
         overlay.set_hud(Some(hud));
         return;
@@ -4444,6 +4743,28 @@ fn refresh_hud(
 /// Combine committed guides with the in-flight pending guide (if any)
 /// into a single list for the renderer. The pending guide tracks the
 /// cursor live until the user clicks to commit it.
+/// Flip a guide axis. Horizontal ↔ Vertical. Used by the SHIFT-flip
+/// behavior in pending guide mode.
+fn flip_axis(axis: GuideAxis) -> GuideAxis {
+    match axis {
+        GuideAxis::Horizontal => GuideAxis::Vertical,
+        GuideAxis::Vertical => GuideAxis::Horizontal,
+    }
+}
+
+/// Resolve the BASE pending axis (what the user originally chose) to
+/// the EFFECTIVE axis for the next click. SHIFT held + acknowledged →
+/// flipped; otherwise base. The acknowledgement gate keeps the
+/// trigger press (typically `SHIFT+H` / `SHIFT+V`) from immediately
+/// flipping itself — the user has to release SHIFT once first.
+fn effective_pending_axis(
+    base: Option<GuideAxis>,
+    shift_acked: bool,
+    shift_held: bool,
+) -> Option<GuideAxis> {
+    base.map(|b| if shift_acked && shift_held { flip_axis(b) } else { b })
+}
+
 fn compose_guides(
     committed: &[Guide],
     pending: Option<GuideAxis>,

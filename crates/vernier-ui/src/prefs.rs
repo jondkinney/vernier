@@ -425,7 +425,11 @@ impl App for PrefsApp {
             .min_height(54.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(8.0);
+                    // 4px on top of the panel's 8px inner margin lands the
+                    // Quit button at 12px from the window edge — matches
+                    // the sidebar (8px margin + 4px) and every other
+                    // left-anchored chunk.
+                    ui.add_space(4.0);
                     let quit_label = egui::RichText::new("Quit Vernier")
                         .color(egui::Color32::from_rgb(220, 90, 90));
                     if ui.add(egui::Button::new(quit_label)).clicked() {
