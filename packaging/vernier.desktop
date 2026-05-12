@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Vernier
+GenericName=Measurement Overlay
+Comment=Cross-platform measurement overlay
+Icon=vernier
+Exec=vernier prefs
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=measure;ruler;pixel;design;screenshot;
+StartupNotify=false
