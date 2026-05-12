@@ -6,6 +6,10 @@ pkgdesc="Cross-platform pixel-measurement overlay in Rust"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jondkinney/vernier"
 license=('MIT' 'Apache-2.0')
+# C-level LTO trips up cc-compiled static archives from libspa-sys /
+# libspa: cc::Build picks up makepkg's -flto=auto and emits LTO IR
+# objects that lld then can't resolve when linking the Rust binary.
+options=(!lto)
 depends=(
     'fontconfig'
     'freetype2'
