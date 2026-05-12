@@ -7,6 +7,10 @@ pkgdesc="Cross-platform pixel-measurement overlay in Rust (prebuilt binary)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jondkinney/vernier"
 license=('MIT' 'Apache-2.0')
+# !debug suppresses the split `vernier-bin-debug` companion package
+# so AUR helpers don't prompt for it on install. The Rust release
+# binary still keeps its panic location info for backtraces.
+options=(!debug)
 depends=(
     'fontconfig'
     'freetype2'
