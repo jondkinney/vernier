@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 #
-# release.sh — cut a new vernier release and publish it to the AUR.
+# release.sh — cut a new vernier release and publish all three AUR
+# variants (vernier, vernier-bin, vernier-git).
 #
-# Run from a clean working tree on `main`. Bumps Cargo.toml, commits,
-# pushes the tag to GitHub, refreshes the PKGBUILD's pkgver + sha256
-# against the new tarball, regenerates .SRCINFO, and pushes the
-# updated package to ssh://aur@aur.archlinux.org/vernier.git.
+# Run from a clean working tree on `main`. The script:
+#   1. Bumps Cargo.toml + Cargo.lock, commits, tags.
+#   2. Pushes the bump commit + tag to GitHub.
+#   3. Bundles a prebuilt x86_64 tarball from `target/release`.
+#   4. Creates/updates the GitHub Release for the tag and uploads the
+#      tarball as an asset.
+#   5. Pins source + prebuilt sha256s into the in-repo PKGBUILDs,
+#      refreshes the -git pkgver placeholder, commits, pushes.
+#   6. Syncs PKGBUILD + .SRCINFO to each of three AUR repos
+#      (ssh://aur@aur.archlinux.org/{vernier,vernier-bin,vernier-git}.git).
 #
 # Usage:
 #   packaging/aur/release.sh 0.2.0
-#   packaging/aur/release.sh 0.2.0 --aur-dir /tmp/aur-vernier
+#   packaging/aur/release.sh 0.2.0 --dry-run
+#   packaging/aur/release.sh 0.2.0 --skip-push
 #
 # Flags:
-#   --aur-dir PATH   local clone of the AUR repo to push from
-#                    (default: $TMPDIR/aur-vernier, cloned fresh)
-#   --dry-run        print every step but don't touch anything
-#   --skip-push      do the bump + tag locally but don't push to
-#                    GitHub or the AUR
+#   --dry-run     print every step but don't touch anything
+#   --skip-push   commit + tag locally, then stop (no GitHub or AUR push)
 
 set -euo pipefail
 
@@ -24,12 +29,10 @@ set -euo pipefail
 
 DRY_RUN=0
 SKIP_PUSH=0
-AUR_DIR=""
 NEW_VER=""
 
 while (($#)); do
     case "$1" in
-        --aur-dir)   AUR_DIR="$2"; shift 2 ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --skip-push) SKIP_PUSH=1; shift ;;
         -h|--help)
@@ -43,7 +46,7 @@ while (($#)); do
 done
 
 if [[ -z "$NEW_VER" ]]; then
-    echo "usage: $0 <new-version> [--aur-dir PATH] [--dry-run] [--skip-push]" >&2
+    echo "usage: $0 <new-version> [--dry-run] [--skip-push]" >&2
     exit 2
 fi
 
@@ -52,14 +55,18 @@ if ! [[ "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
     exit 2
 fi
 
-#--- locate repo + helpers -----------------------------------------------------
+#--- helpers + paths -----------------------------------------------------------
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-PKGBUILD_SRC="$REPO_ROOT/packaging/aur/PKGBUILD"
 PKGNAME="vernier"
+GH_REPO="jondkinney/$PKGNAME"
 TAG="v$NEW_VER"
-AUR_REMOTE="ssh://aur@aur.archlinux.org/${PKGNAME}.git"
-TARBALL_URL="https://github.com/jondkinney/vernier/archive/refs/tags/${TAG}.tar.gz"
+TARBALL_URL="https://github.com/$GH_REPO/archive/refs/tags/${TAG}.tar.gz"
+PREBUILT_NAME="$PKGNAME-$NEW_VER-x86_64.tar.gz"
+
+PKGBUILD_SRC="$REPO_ROOT/packaging/aur/PKGBUILD"
+PKGBUILD_BIN="$REPO_ROOT/packaging/aur-bin/PKGBUILD"
+PKGBUILD_GIT="$REPO_ROOT/packaging/aur-git/PKGBUILD"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
@@ -76,6 +83,13 @@ cd "$REPO_ROOT"
 say "checking preconditions"
 
 [[ -f "$PKGBUILD_SRC" ]] || die "no PKGBUILD at $PKGBUILD_SRC"
+[[ -f "$PKGBUILD_BIN" ]] || die "no PKGBUILD at $PKGBUILD_BIN"
+[[ -f "$PKGBUILD_GIT" ]] || die "no PKGBUILD at $PKGBUILD_GIT"
+command -v gh   >/dev/null || die "gh CLI not installed"
+command -v curl >/dev/null || die "curl not installed"
+if (( ! SKIP_PUSH )) && (( ! DRY_RUN )); then
+    gh auth status >/dev/null 2>&1 || die "gh not authenticated; run 'gh auth login'"
+fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$BRANCH" == "main" ]] || warn "current branch is '$BRANCH', not 'main' — proceeding anyway"
@@ -92,12 +106,17 @@ fi
 CUR_VER="$(awk -F\" '/^version = "/{print $2; exit}' Cargo.toml)"
 say "Cargo.toml currently at $CUR_VER → bumping to $NEW_VER"
 
-#--- bump Cargo.toml + refresh Cargo.lock --------------------------------------
+#--- bump Cargo.toml + refresh Cargo.lock + build the release binary -----------
 
 if (( ! DRY_RUN )); then
     sed -i -E "0,/^version = \"[0-9.]+\"$/{s//version = \"$NEW_VER\"/}" Cargo.toml
 fi
-say "running cargo build to refresh Cargo.lock"
+say "running cargo build to refresh Cargo.lock + produce the release binary"
+# Strip the maintainer's $HOME and the repo path out of the binary so the
+# prebuilt tarball doesn't ship someone's cargo-home leaking into panic
+# backtraces / debug strings. Matches what packaging/aur/PKGBUILD does
+# for the source-built variant via makepkg.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$REPO_ROOT=/build"
 run cargo build --quiet --release
 
 run git add Cargo.toml Cargo.lock
@@ -115,64 +134,115 @@ fi
 run git push origin main
 run git push origin "$TAG"
 
-#--- wait for the GitHub tarball + compute sha256 ------------------------------
+#--- bundle the prebuilt x86_64 tarball ----------------------------------------
 
-say "waiting for GitHub to serve the $TAG tarball"
-SHA=""
+say "assembling prebuilt tarball $PREBUILT_NAME"
+STAGE_ROOT="$(mktemp -d)"
+STAGE="$STAGE_ROOT/$PKGNAME-$NEW_VER-x86_64"
+PREBUILT_PATH="$STAGE_ROOT/$PREBUILT_NAME"
+if (( ! DRY_RUN )); then
+    install -d "$STAGE/icons"
+    install -m755 target/release/vernier      "$STAGE/vernier"
+    install -m644 packaging/vernier.desktop   "$STAGE/vernier.desktop"
+    install -m644 README.md                   "$STAGE/README.md"
+    install -m644 LICENSE-MIT                 "$STAGE/LICENSE-MIT"
+    install -m644 LICENSE-APACHE              "$STAGE/LICENSE-APACHE"
+    cp -r assets/icons/hicolor/.              "$STAGE/icons/"
+    # Mirror the source PKGBUILD: status/ icons stay out so SNI clients
+    # always fall back to the daemon's runtime-rendered icon_pixmap.
+    rm -rf "$STAGE"/icons/*/status
+    tar -C "$STAGE_ROOT" -czf "$PREBUILT_PATH" "$PKGNAME-$NEW_VER-x86_64"
+fi
+say "prebuilt tarball at $PREBUILT_PATH"
+
+#--- wait for the GitHub source tarball + compute sha256 -----------------------
+
+say "waiting for GitHub to serve the $TAG source tarball"
+SRC_SHA=""
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if (( DRY_RUN )); then SHA="dryrun$(printf '%064x' $attempt | head -c 64)"; break; fi
+    if (( DRY_RUN )); then SRC_SHA="dryrun$(printf '%064x' $attempt | head -c 64)"; break; fi
     if curl -sfL "$TARBALL_URL" -o "/tmp/${PKGNAME}-${NEW_VER}.tar.gz"; then
-        SHA="$(sha256sum "/tmp/${PKGNAME}-${NEW_VER}.tar.gz" | awk '{print $1}')"
+        SRC_SHA="$(sha256sum "/tmp/${PKGNAME}-${NEW_VER}.tar.gz" | awk '{print $1}')"
         break
     fi
     sleep 3
 done
-[[ -n "$SHA" ]] || die "couldn't fetch $TARBALL_URL after 10 tries"
-say "sha256 = $SHA"
+[[ -n "$SRC_SHA" ]] || die "couldn't fetch $TARBALL_URL after 10 tries"
+say "source sha256   = $SRC_SHA"
 
-#--- rewrite the in-repo PKGBUILD ----------------------------------------------
+if (( DRY_RUN )); then
+    BIN_SHA="dryrun$(printf '%064x' 0 | head -c 64)"
+else
+    BIN_SHA="$(sha256sum "$PREBUILT_PATH" | awk '{print $1}')"
+fi
+say "prebuilt sha256 = $BIN_SHA"
 
-say "updating $PKGBUILD_SRC"
+#--- create/refresh the GitHub Release with the prebuilt tarball ---------------
+
+say "publishing prebuilt tarball to GitHub Release $TAG"
+if (( ! DRY_RUN )); then
+    if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+        run gh release upload "$TAG" "$PREBUILT_PATH" --repo "$GH_REPO" --clobber
+    else
+        run gh release create "$TAG" "$PREBUILT_PATH" \
+            --repo "$GH_REPO" \
+            --title "$TAG" \
+            --generate-notes
+    fi
+fi
+
+#--- rewrite all three in-repo PKGBUILDs --------------------------------------
+
+GIT_PLACEHOLDER="$NEW_VER.r0.g$(git rev-parse --short=7 HEAD)"
+say "updating PKGBUILDs (src=$NEW_VER, git placeholder=$GIT_PLACEHOLDER)"
 if (( ! DRY_RUN )); then
     sed -i -E \
         -e "s/^pkgver=.*/pkgver=$NEW_VER/" \
         -e "s/^pkgrel=.*/pkgrel=1/" \
-        -e "s/^sha256sums=\\(.*\\)$/sha256sums=('$SHA')/" \
+        -e "s/^sha256sums=\\(.*\\)$/sha256sums=('$SRC_SHA')/" \
         "$PKGBUILD_SRC"
+
+    sed -i -E \
+        -e "s/^pkgver=.*/pkgver=$NEW_VER/" \
+        -e "s/^pkgrel=.*/pkgrel=1/" \
+        -e "s/^sha256sums_x86_64=\\(.*\\)$/sha256sums_x86_64=('$BIN_SHA')/" \
+        "$PKGBUILD_BIN"
+
+    sed -i -E \
+        -e "s/^pkgver=.*/pkgver=$GIT_PLACEHOLDER/" \
+        -e "s/^pkgrel=.*/pkgrel=1/" \
+        "$PKGBUILD_GIT"
 fi
-run git add "$PKGBUILD_SRC"
-run git commit -m "PKGBUILD: pin the $TAG source tarball sha256"
+run git add "$PKGBUILD_SRC" "$PKGBUILD_BIN" "$PKGBUILD_GIT"
+run git commit -m "PKGBUILDs: pin $TAG (source + prebuilt sha256, -git placeholder)"
 run git push origin main
 
-#--- sync into a local AUR clone + push ----------------------------------------
+#--- sync each variant into its AUR repo --------------------------------------
 
-if [[ -z "$AUR_DIR" ]]; then
-    AUR_DIR="${TMPDIR:-/tmp}/aur-${PKGNAME}-$$"
-    say "cloning AUR repo to $AUR_DIR"
-    run git clone "$AUR_REMOTE" "$AUR_DIR"
-else
-    say "using existing AUR clone at $AUR_DIR"
-    [[ -d "$AUR_DIR/.git" ]] || die "$AUR_DIR isn't a git checkout"
-    run git -C "$AUR_DIR" fetch --quiet origin
-    run git -C "$AUR_DIR" checkout master
-    run git -C "$AUR_DIR" reset --hard origin/master
-fi
-
-run cp "$PKGBUILD_SRC" "$AUR_DIR/PKGBUILD"
-if (( ! DRY_RUN )); then
-    ( cd "$AUR_DIR" && makepkg --printsrcinfo > .SRCINFO )
-fi
-say "wrote .SRCINFO"
-
-if (( ! DRY_RUN )); then
-    cd "$AUR_DIR"
-    if [[ -z "$(git status --porcelain)" ]]; then
-        warn "no changes in AUR repo — nothing to push"
-        exit 0
+push_aur() {
+    local aur_pkg="$1" pkgbuild_src="$2"
+    local dir
+    dir="$(mktemp -d)/aur-$aur_pkg"
+    say "syncing $aur_pkg → AUR"
+    run git clone "ssh://aur@aur.archlinux.org/$aur_pkg.git" "$dir"
+    run cp "$pkgbuild_src" "$dir/PKGBUILD"
+    if (( ! DRY_RUN )); then
+        ( cd "$dir" && makepkg --printsrcinfo > .SRCINFO )
+        if [[ -z "$(git -C "$dir" status --porcelain)" ]]; then
+            warn "no changes in $aur_pkg AUR repo — skipping push"
+            return
+        fi
     fi
-fi
-run git -C "$AUR_DIR" add PKGBUILD .SRCINFO
-run git -C "$AUR_DIR" commit -m "Upgrade to ${NEW_VER}-1"
-run git -C "$AUR_DIR" push origin master
+    run git -C "$dir" add PKGBUILD .SRCINFO
+    run git -C "$dir" commit -m "Upgrade to ${NEW_VER}-1"
+    run git -C "$dir" push origin master
+}
 
-say "done. https://aur.archlinux.org/packages/${PKGNAME} should refresh within a few minutes."
+push_aur "$PKGNAME"      "$PKGBUILD_SRC"
+push_aur "$PKGNAME-bin"  "$PKGBUILD_BIN"
+push_aur "$PKGNAME-git"  "$PKGBUILD_GIT"
+
+say "done."
+say "  https://aur.archlinux.org/packages/$PKGNAME"
+say "  https://aur.archlinux.org/packages/$PKGNAME-bin"
+say "  https://aur.archlinux.org/packages/$PKGNAME-git"
