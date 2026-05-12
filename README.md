@@ -52,28 +52,34 @@ If your waybar lacks the tray module, add:
 
 ### Hotkey
 
-Two paths depending on your setup:
+The default toggle is `CTRL+SHIFT+ALT+SUPER+F` (configurable in the
+prefs window's Shortcuts pane).
 
-**Portal (preferred long-term).** The daemon registers a global shortcut
-named `hk_1` with default trigger `CTRL+SHIFT+P` via
-`xdg-desktop-portal-hyprland`. To map an actual key to it, add to
-`~/.config/hypr/hyprland.conf`:
+**On Hyprland: zero setup.** On startup the daemon runs `hyprctl
+keyword bind = …, exec, vernier toggle` itself and re-applies the
+bind on `configreloaded`, so the shortcut Just Works — no edits to
+`~/.config/hypr/hyprland.conf` required. The runtime bind is cleared
+when the daemon exits.
 
-```
-bind = SHIFT CTRL, P, global, vernier:hk_1
-```
-
-`xdg-desktop-portal-hyprland` 1.3+ is required.
-
-**CLI fallback (simpler, no portal config).** Bind directly to the
-`vernier toggle` subcommand:
+**On other wlroots compositors / portal-only setups.** The daemon
+also registers a `GlobalShortcuts` portal entry named `hk_1` via
+`xdg-desktop-portal-hyprland` (1.3+). To map an actual key to it,
+add to `~/.config/hypr/hyprland.conf`:
 
 ```
-bind = SHIFT CTRL, P, exec, vernier toggle
+bind = SHIFT CTRL ALT SUPER, F, global, vernier:hk_1
 ```
 
-This uses a Unix domain socket at `$XDG_RUNTIME_DIR/vernier.sock` to
-talk to the running daemon. Works without the GlobalShortcuts portal.
+**Manual CLI bind.** If you'd rather keep the bind explicit in your
+own config and skip the auto-install, bind directly to the toggle
+subcommand:
+
+```
+bind = SHIFT CTRL ALT SUPER, F, exec, vernier toggle
+```
+
+This talks to the running daemon over a Unix domain socket at
+`$XDG_RUNTIME_DIR/vernier.sock` — no portal required.
 
 ## Layout
 
