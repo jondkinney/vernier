@@ -252,6 +252,11 @@ pub struct AppearanceSettings {
     pub alternative_color: ColorRgba,
     /// Color of reference guide lines (Shift+H / Shift+V).
     pub guide_color: ColorRgba,
+    /// Alternate color a guide can be placed in. The `x` color
+    /// toggle, while a guide is pending, swaps the preview's color
+    /// to this; once committed, that guide keeps the color it was
+    /// placed with regardless of further toggles.
+    pub alternative_guide_color: ColorRgba,
     /// How distance / coordinate values are displayed in pills.
     pub units: Units,
     /// Coordinate rounding mode applied before display.
@@ -264,6 +269,10 @@ impl Default for AppearanceSettings {
             primary_color: ColorRgba::new(0xFF, 0x5C, 0x5C, 0xF5),
             alternative_color: ColorRgba::new(0x10, 0x10, 0x10, 0xF5),
             guide_color: ColorRgba::new(0x78, 0xB4, 0xFF, 0xF0),
+            // Warm coral that contrasts with the default blue guide
+            // and the red HUD primary — easy to distinguish at a
+            // glance which color a given guide was placed in.
+            alternative_guide_color: ColorRgba::new(0xFF, 0xA9, 0x4A, 0xF0),
             units: Units::Px,
             rounding_mode: RoundingMode::Points,
         }

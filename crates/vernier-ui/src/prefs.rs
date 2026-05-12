@@ -1598,6 +1598,11 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
         color_picker(ui, &mut s.guide_color);
     });
 
+    setting(ui, |ui| {
+        field_label(ui, "Alternative guide color (toggled with `x` while placing)");
+        color_picker(ui, &mut s.alternative_guide_color);
+    });
+
     ui.separator();
     ui.add_space(10.0);
 

@@ -150,8 +150,22 @@ pub struct Hud {
     /// layer. `None` while the menu is closed.
     pub context_menu: Option<HudContextMenu>,
     /// Color of the persistent reference guide lines. Sourced from
-    /// the user's appearance prefs.
+    /// the user's appearance prefs. Guides with `color_alternate=true`
+    /// use [`Self::alternative_guide_color`] instead.
     pub guide_color: Color,
+    /// Second guide-line color, chosen via the `X` toggle while a
+    /// guide is pending placement. Once placed, the guide carries
+    /// its own `color_alternate` flag so the renderer can pick which
+    /// of these two colors to draw it with.
+    pub alternative_guide_color: Color,
+    /// Foreground primary color (red default). Used by HUD/stuck/rect
+    /// renders when their `color_alternate` is false. Set from
+    /// appearance prefs; the renderer reads this so it can pick
+    /// per-element colors instead of relying on a single foreground.
+    pub primary_fg: Color,
+    /// Foreground alternate color (black default). Paired with
+    /// `primary_fg` for the per-element color toggle.
+    pub alternate_fg: Color,
     /// How distance / dimension values render in pills (units +
     /// rounding mode). Defaults to integer logical pixels with a
     /// "px" suffix.
@@ -207,6 +221,38 @@ impl Default for HudMeasurementFormat {
             aspect_mode: vernier_core::AspectMode::Automatic,
             dimension_divisor: 1.0,
         }
+    }
+}
+
+impl HudMeasurementFormat {
+    /// Render a logical-pixel measurement value with the configured
+    /// rounding mode. No unit suffix is appended.
+    pub fn format_number(&self, value_logical: f64) -> String {
+        let divisor = if self.dimension_divisor > 0.0 {
+            self.dimension_divisor
+        } else {
+            1.0
+        };
+        let value = value_logical / divisor;
+        match self.rounding {
+            HudRounding::Points => {
+                let r = (value * 10.0).round() / 10.0;
+                if (r - r.round()).abs() < f64::EPSILON {
+                    format!("{}", r as i64)
+                } else {
+                    format!("{r:.1}")
+                }
+            }
+            HudRounding::PointsRounded => format!("{}", value.round() as i64),
+            HudRounding::ScreenPixels => {
+                format!("{}", (value * self.scale_factor).round() as i64)
+            }
+        }
+    }
+
+    /// `format_number` with the configured unit suffix appended.
+    pub fn format_value(&self, value_logical: f64) -> String {
+        format!("{}{}", self.format_number(value_logical), self.unit_suffix)
     }
 }
 
@@ -273,6 +319,12 @@ pub struct HeldRect {
     pub rect_start: (f64, f64),
     pub rect_end: (f64, f64),
     pub camera_armed: bool,
+    /// Foreground variant snapshotted at the moment this rect was
+    /// placed. `false` uses `appearance.primary_color`, `true` uses
+    /// `appearance.alternative_color`. The global `color_alternate`
+    /// (toggled by `X`) only affects new placements + the live HUD —
+    /// existing rects keep whichever color they had when committed.
+    pub color_alternate: bool,
 }
 
 /// A frozen single-axis measurement. Drawn as a coral line spanning
@@ -293,6 +345,14 @@ pub struct StuckMeasurement {
     pub start: f64,
     /// End of the measured span in logical px.
     pub end: f64,
+    /// User-applied translation of the value pill, in logical px,
+    /// from its computed default anchor. Clamped to ±50 in each
+    /// axis at the input layer (click-and-drag on the pill). The
+    /// measurement line itself stays fixed; only the pill moves.
+    pub pill_offset: (f64, f64),
+    /// Foreground variant snapshotted when this measurement was
+    /// dropped. Same semantics as `HeldRect::color_alternate`.
+    pub color_alternate: bool,
     /// Transient: true when the cursor is over this measurement's
     /// pill — renderer swaps the value text for "×" to signal
     /// "click to remove".
@@ -307,6 +367,12 @@ pub struct Guide {
     /// Logical pixels on the surface. For [`GuideAxis::Horizontal`]
     /// this is the y-coordinate; for [`GuideAxis::Vertical`] it's x.
     pub position: i32,
+    /// Color variant snapshotted at placement time. `false` =
+    /// `appearance.guide_color` (the default blue), `true` =
+    /// `appearance.alternative_color`. The global `color_alternate`
+    /// (toggled by `X`) only retags the pending preview + new
+    /// placements; already-placed guides keep their color.
+    pub color_alternate: bool,
     /// Transient: true when the cursor is hovering this line and the
     /// renderer should draw an "×" hint at the cursor. Click-while-
     /// hovered removes the guide.
@@ -360,6 +426,9 @@ impl Hud {
             align_mode: false,
             context_menu: None,
             guide_color: Color::rgba(0x42, 0x9C, 0xFF, 0xF5),
+            alternative_guide_color: Color::rgba(0xFF, 0xA9, 0x4A, 0xF0),
+            primary_fg: Color::rgba(0xFF, 0x5C, 0x5C, 0xF5),
+            alternate_fg: Color::rgba(0x10, 0x10, 0x10, 0xF5),
             measurement_format: HudMeasurementFormat::default(),
             show_cursor: true,
             corner_indicator: None,

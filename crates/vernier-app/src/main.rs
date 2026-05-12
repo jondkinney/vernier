@@ -483,6 +483,37 @@ fn run_daemon() -> Result<()> {
     // Index into `guides` of the guide currently being dragged via
     // pointer down on the line — None when not dragging.
     let mut dragging_guide: Option<usize> = None;
+    // Index into `guides` of the "last selected" guide for arrow-key
+    // nudging. Set when a guide is freshly placed and when a drag
+    // ends without deletion. Cleared on remove / clear-all. Arrow
+    // keys nudge this guide by 1px (10px with SHIFT) when no held
+    // rect is the active target.
+    let mut last_selected_guide: Option<usize> = None;
+    // When the most-recent arrow-key press nudged a guide (as opposed
+    // to a held rect), this records which guide so the repeat-timer
+    // NudgeTick events know to keep nudging it. Cleared when a rect
+    // nudge takes over or the guide goes away.
+    let mut nudge_guide_idx: Option<usize> = None;
+    // Stuck-measurement pill drag state. Press over a pill enters
+    // tracking mode; release-with-no-movement removes the
+    // measurement (the click path), release-with-movement keeps the
+    // new offset. `stuck_press_pos` is the cursor position at press
+    // time and `stuck_initial_offset` is the pill_offset the
+    // measurement had at press, so the running offset is
+    // initial + (cursor - press) clamped to ±100 each axis.
+    let mut dragging_stuck_pill: Option<usize> = None;
+    let mut stuck_press_pos: Option<(f64, f64)> = None;
+    let mut stuck_initial_offset: (f64, f64) = (0.0, 0.0);
+    // True once a stuck-pill drag has moved past STUCK_DRAG_THRESHOLD
+    // since press. While set:
+    //  - the pill renders its value (not the × delete indicator), so
+    //    we don't flash the value on a click-to-remove that hasn't
+    //    actually become a drag yet,
+    //  - the system cursor hides, since the pill is now slaved to the
+    //    pointer and the cursor itself just gets in the way.
+    let mut stuck_pill_drag_committed: bool = false;
+    const STUCK_PILL_DRAG_MAX: f64 = 50.0;
+    const STUCK_DRAG_THRESHOLD: f64 = 2.0;
     // Cursor position at the press that started a guide drag — used
     // to tell a click (no movement) from a drag on release.
     let mut guide_press_pos: Option<Px> = None;
@@ -656,6 +687,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -672,6 +704,51 @@ fn run_daemon() -> Result<()> {
                             GuideAxis::Horizontal => y as i32,
                             GuideAxis::Vertical => x as i32,
                         };
+                    }
+                }
+                // While dragging a stuck-measurement pill, each move
+                // updates the pill's offset relative to the press.
+                // Clamped to ±STUCK_PILL_DRAG_MAX in each axis so it
+                // can't be flung off-screen.
+                if let Some(idx) = dragging_stuck_pill {
+                    if let (Some(press), Some(m)) = (
+                        stuck_press_pos,
+                        stuck_measurements.get_mut(idx),
+                    ) {
+                        let raw_dx = stuck_initial_offset.0 + (x - press.0);
+                        let raw_dy = stuck_initial_offset.1 + (y - press.1);
+                        m.pill_offset = (
+                            raw_dx.clamp(-STUCK_PILL_DRAG_MAX, STUCK_PILL_DRAG_MAX),
+                            raw_dy.clamp(-STUCK_PILL_DRAG_MAX, STUCK_PILL_DRAG_MAX),
+                        );
+                        // First motion past the click/drag threshold
+                        // "commits" the drag: the renderer switches
+                        // from × back to the value text, the OS
+                        // cursor hides, and the compositor confines
+                        // the pointer to a 100×100-px box around the
+                        // press point so the cursor physically stops
+                        // at the same bound the pill_offset clamps to.
+                        if !stuck_pill_drag_committed
+                            && ((x - press.0).abs() > STUCK_DRAG_THRESHOLD
+                                || (y - press.1).abs() > STUCK_DRAG_THRESHOLD)
+                        {
+                            stuck_pill_drag_committed = true;
+                            // Center the confine region on the press
+                            // point, but shift it by the pre-existing
+                            // pill_offset so the cursor's reachable
+                            // range mirrors the pill's ±50 clamp from
+                            // its default anchor.
+                            let rx = (press.0
+                                - STUCK_PILL_DRAG_MAX
+                                - stuck_initial_offset.0)
+                                .round() as i32;
+                            let ry = (press.1
+                                - STUCK_PILL_DRAG_MAX
+                                - stuck_initial_offset.1)
+                                .round() as i32;
+                            let side = (2.0 * STUCK_PILL_DRAG_MAX) as i32;
+                            overlay.confine_pointer(rx, ry, side, side);
+                        }
                     }
                 }
                 if let Some(op) = resizing {
@@ -709,6 +786,7 @@ fn run_daemon() -> Result<()> {
                         active_handle,
                         context_menu.is_some(),
                         alt_held,
+                        stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                     );
@@ -733,6 +811,7 @@ fn run_daemon() -> Result<()> {
                         align_mode,
                         alt_held,
                         pre_clear_freeze,
+                        stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         active_handle,
@@ -813,6 +892,7 @@ fn run_daemon() -> Result<()> {
                         align_mode,
                         alt_held,
                         pre_clear_freeze,
+                        stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -862,6 +942,7 @@ fn run_daemon() -> Result<()> {
                                         &edges,
                                         primary.bounds.w,
                                         primary.bounds.h,
+                                        color_alternate,
                                     );
                                     stuck_measurements.push(m);
                                 }
@@ -882,6 +963,7 @@ fn run_daemon() -> Result<()> {
                                         &edges,
                                         primary.bounds.w,
                                         primary.bounds.h,
+                                        color_alternate,
                                     );
                                     stuck_measurements.push(m);
                                 }
@@ -897,6 +979,7 @@ fn run_daemon() -> Result<()> {
                                     &mut guides,
                                     &mut stuck_measurements,
                                     &mut nudge_selection,
+                                    &mut last_selected_guide,
                                     &mut pending_guide,
                                     &mut pending_guide_shift_acked,
                                     &mut pre_clear_freeze,
@@ -957,6 +1040,7 @@ fn run_daemon() -> Result<()> {
                                 stuck_measurements.clear();
                                 held_rects.clear();
                                 nudge_selection = None;
+                                last_selected_guide = None;
                             }
                             MenuAction::CloseVernier => {
                                 log::info!("close requested via context menu");
@@ -982,6 +1066,7 @@ fn run_daemon() -> Result<()> {
                         align_mode,
                         alt_held,
                         pre_clear_freeze,
+                        stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -1039,12 +1124,89 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
                             context_menu.as_ref(),
                         );
                         continue;
+                    }
+                    // Release ends a stuck-pill drag if one is active.
+                    // No movement → click → remove the measurement.
+                    // Movement → keep the new pill_offset (already
+                    // updated by PointerMove handler above).
+                    if !pressed && dragging_stuck_pill.is_some() {
+                        let idx = dragging_stuck_pill.take().unwrap();
+                        let press_pos = stuck_press_pos.take();
+                        let was_click = press_pos
+                            .map(|(px, py)| {
+                                (x - px).abs() <= 2.0 && (y - py).abs() <= 2.0
+                            })
+                            .unwrap_or(false);
+                        if was_click {
+                            if idx < stuck_measurements.len() {
+                                log::info!("removing stuck measurement at idx {idx} (click)");
+                                stuck_measurements.remove(idx);
+                            }
+                        } else {
+                            log::info!(
+                                "stuck pill drag released at idx {idx} (offset kept)"
+                            );
+                        }
+                        stuck_initial_offset = (0.0, 0.0);
+                        if stuck_pill_drag_committed {
+                            overlay.release_pointer_confine();
+                        }
+                        stuck_pill_drag_committed = false;
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mode,
+                            &mut overlay,
+                            frozen_frame.as_ref(),
+                            x,
+                            y,
+                            current_tol_value(tol_level),
+                            toast,
+                            &guides,
+                            pending_guide,
+                            &stuck_measurements,
+                            &held_rects,
+                            color_alternate,
+                            align_mode,
+                            alt_held,
+                            pre_clear_freeze,
+                            stuck_pill_drag_committed,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                            None,
+                            context_menu.as_ref(),
+                        );
+                        continue;
+                    }
+                    // Press over a stuck-measurement pill → start a
+                    // pill drag (click without movement will remove
+                    // it on release; movement repositions the pill
+                    // up to ±100 logical px in each axis).
+                    if pressed {
+                        let stuck_bboxes = vernier_platform::placement::stuck_pill_bboxes(
+                            &stuck_measurements,
+                            &held_rects,
+                            &current_measurement_format(),
+                            primary.bounds.w as f64,
+                            primary.bounds.h as f64,
+                        );
+                        if let Some(idx) = stuck_bboxes
+                            .iter()
+                            .position(|b| cursor_over_stuck_pill_at(cursor_px, *b))
+                        {
+                            log::info!("stuck pill press at idx {idx}");
+                            dragging_stuck_pill = Some(idx);
+                            stuck_press_pos = Some((x, y));
+                            stuck_initial_offset = stuck_measurements[idx].pill_offset;
+                            continue;
+                        }
                     }
                     // Release ends a guide drag if one is active.
                     if !pressed && dragging_guide.is_some() {
@@ -1071,6 +1233,13 @@ fn run_daemon() -> Result<()> {
                                     if idx < guides.len() {
                                         guides.remove(idx);
                                     }
+                                    if last_selected_guide == Some(idx) {
+                                        last_selected_guide = None;
+                                    } else if let Some(sel) = last_selected_guide {
+                                        if sel > idx {
+                                            last_selected_guide = Some(sel - 1);
+                                        }
+                                    }
                                     last_guide_click = None;
                                     deleted = true;
                                 }
@@ -1082,6 +1251,11 @@ fn run_daemon() -> Result<()> {
                             last_guide_click = None;
                         }
                         if !deleted {
+                            // Either a real drag (move) or a single
+                            // click — both count as "interacting with
+                            // this guide", so it becomes the
+                            // arrow-key nudge target.
+                            last_selected_guide = Some(idx);
                             log::info!("guide drag released at idx {idx}");
                         }
                         last_hud_redraw = Instant::now();
@@ -1102,6 +1276,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1121,6 +1296,13 @@ fn run_daemon() -> Result<()> {
                         }) {
                             log::info!("removing guide {idx} via X badge");
                             guides.remove(idx);
+                            if last_selected_guide == Some(idx) {
+                                last_selected_guide = None;
+                            } else if let Some(sel) = last_selected_guide {
+                                if sel > idx {
+                                    last_selected_guide = Some(sel - 1);
+                                }
+                            }
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
@@ -1139,6 +1321,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1170,6 +1353,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1233,6 +1417,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1270,7 +1455,13 @@ fn run_daemon() -> Result<()> {
                                     GuideAxis::Vertical => snap_to_nearest_x_edge(x, &edges) as i32,
                                 }
                             };
-                            guides.push(Guide { axis, position, hovered: false });
+                            guides.push(Guide {
+                                axis,
+                                position,
+                                color_alternate,
+                                hovered: false,
+                            });
+                            last_selected_guide = Some(guides.len() - 1);
                             log::info!("guide stuck: {:?} @ {}", axis, position);
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
@@ -1290,6 +1481,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1362,6 +1554,7 @@ fn run_daemon() -> Result<()> {
                             }
                             held_rects.clear();
                             nudge_selection = None;
+                            last_selected_guide = None;
                             guides.clear();
                             stuck_measurements.clear();
                             pending_guide = None;
@@ -1424,6 +1617,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1454,6 +1648,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1560,6 +1755,7 @@ fn run_daemon() -> Result<()> {
                                     active_handle,
                                     context_menu.is_some(),
                                     alt_held,
+                                    stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                 );
@@ -1586,6 +1782,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1650,6 +1847,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1697,6 +1895,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1742,6 +1941,7 @@ fn run_daemon() -> Result<()> {
                         pre_clear_freeze = false;
                         held_rects.clear();
                         nudge_selection = None;
+                        last_selected_guide = None;
                         guides.clear();
                         stuck_measurements.clear();
                         pending_guide = None;
@@ -1800,6 +2000,7 @@ fn run_daemon() -> Result<()> {
                                 align_mode,
                                 alt_held,
                                 pre_clear_freeze,
+                                stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
                                 None,
@@ -1849,6 +2050,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1859,9 +2061,10 @@ fn run_daemon() -> Result<()> {
                     && pressed_accel == shortcut_accels.color_toggle
                 {
                     // Configured color-toggle shortcut (default `X`).
-                    // Swaps the HUD foreground between primary
-                    // (coral red) and alternate (black) so it stays
-                    // legible against busy backgrounds either way.
+                    // Swaps the live HUD foreground (and pending
+                    // guide preview) between primary and alternate.
+                    // Already-placed rects / stucks / guides keep
+                    // whichever color they had at placement.
                     color_alternate = !color_alternate;
                     log::info!(
                         "color_alternate → {}",
@@ -1886,6 +2089,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1920,6 +2124,7 @@ fn run_daemon() -> Result<()> {
                             &edges,
                             primary.bounds.w,
                             primary.bounds.h,
+                            color_alternate,
                         );
                         log::info!(
                             "stuck {:?} measurement: {} px @ {}",
@@ -1946,6 +2151,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -1986,6 +2192,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -2026,6 +2233,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -2061,6 +2269,7 @@ fn run_daemon() -> Result<()> {
                                     align_mode,
                                     alt_held,
                                     pre_clear_freeze,
+                                    stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -2087,6 +2296,7 @@ fn run_daemon() -> Result<()> {
                         &mut guides,
                         &mut stuck_measurements,
                         &mut nudge_selection,
+                        &mut last_selected_guide,
                         &mut pending_guide,
                         &mut pending_guide_shift_acked,
                         &mut pre_clear_freeze,
@@ -2148,6 +2358,7 @@ fn run_daemon() -> Result<()> {
                             align_mode,
                             alt_held,
                             pre_clear_freeze,
+                            stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
                             None,
@@ -2213,6 +2424,7 @@ fn run_daemon() -> Result<()> {
                                     align_mode,
                                     alt_held,
                                     pre_clear_freeze,
+                                    stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -2255,7 +2467,105 @@ fn run_daemon() -> Result<()> {
                                 })
                             })
                         });
-                    let Some(idx) = idx else { continue };
+                    // Fallback: when no held rect is the target, nudge
+                    // the last-selected guide instead (the one the user
+                    // just placed or just dragged). Each press = 1px
+                    // (10px with SHIFT). Perpendicular arrows are no-ops
+                    // — a horizontal guide only moves Up/Down, a
+                    // vertical guide only moves Left/Right.
+                    if idx.is_none() {
+                        if let Some(g_idx) = last_selected_guide
+                            .filter(|i| *i < guides.len())
+                        {
+                            let step: i32 = if shift_held { 10 } else { 1 };
+                            let nudged = apply_guide_nudge(
+                                &mut guides, g_idx, dir, step,
+                            );
+                            if nudged {
+                                nudge_guide_idx = Some(g_idx);
+                                nudge_selection = None;
+                                log::debug!(
+                                    "guide nudge {:?} by {} px → {}",
+                                    dir, step, guides[g_idx].position
+                                );
+                                if let Some((px_x, px_y)) = last_pointer_xy {
+                                    last_hud_redraw = Instant::now();
+                                    let toast = current_toast(&active_toast, toast_until);
+                                    refresh_hud(
+                                        &mode,
+                                        &mut overlay,
+                                        frozen_frame.as_ref(),
+                                        px_x,
+                                        px_y,
+                                        current_tol_value(tol_level),
+                                        toast,
+                                        &guides,
+                                        pending_guide,
+                                        &stuck_measurements,
+                                        &held_rects,
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        pre_clear_freeze,
+                                        stuck_pill_drag_committed,
+                                        primary.bounds.w as i32,
+                                        primary.bounds.h as i32,
+                                        None,
+                                        context_menu.as_ref(),
+                                    );
+                                }
+                                // Spawn (or restart) the repeat timer
+                                // so holding the arrow key continues to
+                                // nudge — same pattern as held-rect
+                                // nudges, just routed via
+                                // `nudge_guide_idx` in the tick handler.
+                                if !is_repeat {
+                                    nudge_generation = nudge_generation.wrapping_add(1);
+                                    let this_gen = nudge_generation;
+                                    nudge_active_gen
+                                        .store(this_gen, std::sync::atomic::Ordering::Relaxed);
+                                    active_nudge = Some((dir, this_gen, keysym));
+                                    let tx = combined_tx.clone();
+                                    let atomic = nudge_active_gen.clone();
+                                    std::thread::Builder::new()
+                                        .name("vernier-nudge-repeat".into())
+                                        .spawn(move || {
+                                            std::thread::sleep(Duration::from_millis(
+                                                NUDGE_INITIAL_DELAY_MS,
+                                            ));
+                                            loop {
+                                                if atomic
+                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                    != this_gen
+                                                {
+                                                    return;
+                                                }
+                                                if tx
+                                                    .send(MainEvent::NudgeTick {
+                                                        dir,
+                                                        generation: this_gen,
+                                                    })
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                std::thread::sleep(Duration::from_millis(
+                                                    NUDGE_INTERVAL_MS,
+                                                ));
+                                            }
+                                        })
+                                        .ok();
+                                }
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
+                    let idx = idx.expect("guarded by is_none check");
+                    // Switching to a held-rect nudge — clear any
+                    // lingering guide-nudge target so the tick handler
+                    // doesn't keep moving an unrelated guide.
+                    nudge_guide_idx = None;
                     // Pin / refresh the selection on every fresh
                     // press so the anchor tracks the most recent
                     // mouse position the user committed to.
@@ -2283,6 +2593,7 @@ fn run_daemon() -> Result<()> {
                         &guides,
                         pending_guide,
                         pre_clear_freeze,
+                        stuck_pill_drag_committed,
                         &stuck_measurements,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -2477,6 +2788,7 @@ fn run_daemon() -> Result<()> {
                                     align_mode,
                                     alt_held,
                                     pre_clear_freeze,
+                                    stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                     None,
@@ -2534,6 +2846,7 @@ fn run_daemon() -> Result<()> {
                         align_mode,
                         alt_held,
                         pre_clear_freeze,
+                        stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                         None,
@@ -2549,6 +2862,43 @@ fn run_daemon() -> Result<()> {
                     continue;
                 }
                 if matches!(mode, InteractionMode::Idle) {
+                    continue;
+                }
+                // Guide repeat takes precedence: if the initial press
+                // nudged a guide, every subsequent tick should keep
+                // nudging that same guide until the key releases.
+                if let Some(g_idx) = nudge_guide_idx
+                    .filter(|i| *i < guides.len())
+                {
+                    let step: i32 = if shift_held { 10 } else { 1 };
+                    if apply_guide_nudge(&mut guides, g_idx, dir, step) {
+                        if let Some((px_x, px_y)) = last_pointer_xy {
+                            last_hud_redraw = Instant::now();
+                            let toast = current_toast(&active_toast, toast_until);
+                            refresh_hud(
+                                &mode,
+                                &mut overlay,
+                                frozen_frame.as_ref(),
+                                px_x,
+                                px_y,
+                                current_tol_value(tol_level),
+                                toast,
+                                &guides,
+                                pending_guide,
+                                &stuck_measurements,
+                                &held_rects,
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                pre_clear_freeze,
+                                stuck_pill_drag_committed,
+                                primary.bounds.w as i32,
+                                primary.bounds.h as i32,
+                                None,
+                                context_menu.as_ref(),
+                            );
+                        }
+                    }
                     continue;
                 }
                 let Some(sel) = nudge_selection else { continue };
@@ -2574,6 +2924,7 @@ fn run_daemon() -> Result<()> {
                     &guides,
                     pending_guide,
                     pre_clear_freeze,
+                    stuck_pill_drag_committed,
                     &stuck_measurements,
                     primary.bounds.w as i32,
                     primary.bounds.h as i32,
@@ -2661,6 +3012,35 @@ fn hud_foreground(alt: bool) -> vernier_platform::Color {
     Color::rgba(c.r, c.g, c.b, c.a)
 }
 
+/// Build the [`HudMeasurementFormat`] that matches whatever the
+/// renderer will pick up from `current_settings()`. Used by the
+/// hit-test path so pill placement comes out the same as on screen.
+fn current_measurement_format() -> HudMeasurementFormat {
+    let s = current_settings();
+    let unit_suffix = if s.general.display_units {
+        match s.appearance.units {
+            Units::Px => "px".to_string(),
+            Units::Pt => "pt".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    let (dimension_divisor, _) = current_figma_correction(&s);
+    HudMeasurementFormat {
+        unit_suffix,
+        rounding: match s.appearance.rounding_mode {
+            RoundingMode::Points => HudRounding::Points,
+            RoundingMode::PointsRounded => HudRounding::PointsRounded,
+            RoundingMode::ScreenPixels => HudRounding::ScreenPixels,
+        },
+        scale_factor: primary_scale_factor(),
+        wh_indicators: s.general.display_wh_indicators,
+        aspect_in_area: s.general.aspect_in_area_tool,
+        aspect_mode: s.general.aspect_mode,
+        dimension_divisor,
+    }
+}
+
 
 fn scale_factor_lock() -> &'static std::sync::Mutex<f64> {
     use std::sync::{Mutex, OnceLock};
@@ -2703,6 +3083,12 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
     let s = current_settings();
     let g = s.appearance.guide_color;
     hud.guide_color = PlatColor::rgba(g.r, g.g, g.b, g.a);
+    let ag = s.appearance.alternative_guide_color;
+    hud.alternative_guide_color = PlatColor::rgba(ag.r, ag.g, ag.b, ag.a);
+    let p = s.appearance.primary_color;
+    hud.primary_fg = PlatColor::rgba(p.r, p.g, p.b, p.a);
+    let a = s.appearance.alternative_color;
+    hud.alternate_fg = PlatColor::rgba(a.r, a.g, a.b, a.a);
     let unit_suffix = if s.general.display_units {
         match s.appearance.units {
             Units::Px => "px".to_string(),
@@ -3337,6 +3723,26 @@ fn matches_nudge(
     }
 }
 
+/// Nudge a guide by `step` logical px in `dir`. Returns true if the
+/// direction matches the guide's free axis (vertical guide → L/R,
+/// horizontal guide → U/D); perpendicular nudges are no-ops. Used by
+/// both the initial keypress and the repeat-timer NudgeTick handler.
+fn apply_guide_nudge(
+    guides: &mut [Guide],
+    idx: usize,
+    dir: NudgeDir,
+    step: i32,
+) -> bool {
+    let Some(g) = guides.get_mut(idx) else { return false };
+    match (dir, g.axis) {
+        (NudgeDir::Left, GuideAxis::Vertical) => { g.position -= step; true }
+        (NudgeDir::Right, GuideAxis::Vertical) => { g.position += step; true }
+        (NudgeDir::Up, GuideAxis::Horizontal) => { g.position -= step; true }
+        (NudgeDir::Down, GuideAxis::Horizontal) => { g.position += step; true }
+        _ => false,
+    }
+}
+
 /// One nudge increment: shift the held rect at `idx` 1 px in the
 /// given direction (10 px when Shift is held) and repaint the HUD.
 /// Used both for the initial press and for the follow-up
@@ -3360,6 +3766,7 @@ fn apply_nudge_step(
     guides: &[Guide],
     pending_guide: Option<GuideAxis>,
     pre_clear_freeze: bool,
+    stuck_pill_drag_committed: bool,
     stuck_measurements: &[StuckMeasurement],
     screen_w: i32,
     screen_h: i32,
@@ -3409,6 +3816,7 @@ fn apply_nudge_step(
             align_mode,
             alt_held,
             pre_clear_freeze,
+            stuck_pill_drag_committed,
             screen_w,
             screen_h,
             None,
@@ -4194,6 +4602,7 @@ fn do_take_normal_screenshot(
     guides: &mut Vec<Guide>,
     stuck_measurements: &mut Vec<StuckMeasurement>,
     nudge_selection: &mut Option<NudgeSelection>,
+    last_selected_guide: &mut Option<usize>,
     pending_guide: &mut Option<GuideAxis>,
     pending_guide_shift_acked: &mut bool,
     pre_clear_freeze: &mut bool,
@@ -4216,6 +4625,7 @@ fn do_take_normal_screenshot(
     *pre_clear_freeze = false;
     held_rects.clear();
     *nudge_selection = None;
+    *last_selected_guide = None;
     guides.clear();
     stuck_measurements.clear();
     *pending_guide = None;
@@ -4431,6 +4841,7 @@ fn refresh_hud(
     align_mode: bool,
     alt_held: bool,
     pre_clear_freeze: bool,
+    stuck_drag_committed: bool,
     screen_w: i32,
     screen_h: i32,
     resize_handle: Option<ResizeHandle>,
@@ -4485,7 +4896,8 @@ fn refresh_hud(
     // Compose guides + pending guide. Mark the FIRST committed guide
     // the cursor is over as hovered so the renderer shows an X badge
     // (only one removal target at a time, prevents accidental clicks).
-    let mut composed_guides = compose_guides(guides, pending_guide, pending_x, pending_y);
+    let mut composed_guides =
+        compose_guides(guides, pending_guide, pending_x, pending_y, color_alternate);
     if pending_guide.is_none() {
         let mut found = false;
         for g in composed_guides.iter_mut() {
@@ -4495,14 +4907,29 @@ fn refresh_hud(
             }
         }
     }
-    // Same hover detection for stuck measurements.
+    // Same hover detection for stuck measurements. Suppressed while
+    // a stuck-pill drag is committed: the pill is slaved to the
+    // cursor, so the hit-box is trivially true; keeping hovered=false
+    // here makes the renderer show the value text (not the × delete
+    // glyph) for the duration of the drag.
     let mut composed_stuck: Vec<StuckMeasurement> = stuck_measurements.to_vec();
-    if pending_guide.is_none() {
+    if pending_guide.is_none() && !stuck_drag_committed {
+        let stuck_bboxes = vernier_platform::placement::stuck_pill_bboxes(
+            stuck_measurements,
+            held_rects,
+            &current_measurement_format(),
+            screen_w as f64,
+            screen_h as f64,
+        );
         let mut found = false;
-        for s in composed_stuck.iter_mut() {
-            if !found && cursor_over_stuck_pill(cursor_px, s) {
-                s.hovered = true;
-                found = true;
+        for (i, s) in composed_stuck.iter_mut().enumerate() {
+            if !found {
+                if let Some(b) = stuck_bboxes.get(i) {
+                    if cursor_over_stuck_pill_at(cursor_px, *b) {
+                        s.hovered = true;
+                        found = true;
+                    }
+                }
             }
         }
     }
@@ -4514,6 +4941,7 @@ fn refresh_hud(
         .map(|r| HeldRect {
             rect_start: r.rect_start,
             rect_end: r.rect_end,
+            color_alternate: r.color_alternate,
             camera_armed: cursor_over_pill(
                 cursor_px,
                 Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32),
@@ -4536,9 +4964,16 @@ fn refresh_hud(
     let over_guide_x = hovered_guide
         .map(|g| cursor_over_guide_x_badge(cursor_px, g, screen_w, screen_h))
         .unwrap_or(false);
-    let any_stuck_hover = stuck_measurements
+    let stuck_bboxes_here = vernier_platform::placement::stuck_pill_bboxes(
+        stuck_measurements,
+        held_rects,
+        &current_measurement_format(),
+        screen_w as f64,
+        screen_h as f64,
+    );
+    let any_stuck_hover = stuck_bboxes_here
         .iter()
-        .any(|m| cursor_over_stuck_pill(cursor_px, m));
+        .any(|b| cursor_over_stuck_pill_at(cursor_px, *b));
     // Cursor swap: any X-to-remove element (held-rect pill, stuck
     // pill, guide X badge) becomes the arrow pointer. The guide line
     // body (between X and edges) becomes the matching resize cursor
@@ -4703,6 +5138,7 @@ fn compose_guides(
     pending: Option<GuideAxis>,
     x: f64,
     y: f64,
+    pending_color_alternate: bool,
 ) -> Vec<Guide> {
     let mut out: Vec<Guide> = committed.to_vec();
     if let Some(axis) = pending {
@@ -4710,7 +5146,12 @@ fn compose_guides(
             GuideAxis::Horizontal => y as i32,
             GuideAxis::Vertical => x as i32,
         };
-        out.push(Guide { axis, position, hovered: false });
+        out.push(Guide {
+            axis,
+            position,
+            color_alternate: pending_color_alternate,
+            hovered: false,
+        });
     }
     out
 }
@@ -4827,6 +5268,7 @@ fn freeze_axis_measurement(
     edges: &[Option<HudEdge>; 4],
     surface_w: u32,
     surface_h: u32,
+    color_alternate: bool,
 ) -> StuckMeasurement {
     // Keep edge positions as floats so the renderer's pill text
     // matches the live W×H readout (subtract first, then round).
@@ -4844,6 +5286,8 @@ fn freeze_axis_measurement(
                 at: x,
                 start: up,
                 end: down,
+                pill_offset: (0.0, 0.0),
+                color_alternate,
                 hovered: false,
             }
         }
@@ -4857,6 +5301,8 @@ fn freeze_axis_measurement(
                 at: y,
                 start: left,
                 end: right,
+                pill_offset: (0.0, 0.0),
+                color_alternate,
                 hovered: false,
             }
         }
@@ -4996,38 +5442,10 @@ fn cursor_over_guide_x_badge(cursor: Px, g: &Guide, screen_w: i32, screen_h: i32
 /// measurement's value pill. Pill bounds are estimated from the
 /// digit count of the value text and the constants used by the
 /// renderer (TEXT_STUCK_LOGICAL_PX = 10, proportional padding).
-fn cursor_over_stuck_pill(cursor: Px, m: &StuckMeasurement) -> bool {
-    let length = (m.end - m.start).abs().round() as i64;
-    let value_text = format!("{length}");
-    let chars = value_text.len() as f64;
-    // Approximation: avg glyph advance ≈ 0.55 × text size.
-    let pill_w = (chars * 10.0 * 0.55 + 2.0 * 8.0).max(20.0);
-    let pill_h = 10.0 * 1.8; // text + 2 × pad
-    let est_pill_h = pill_h;
-    let inside_long = (m.end - m.start).abs() >= 3.0 * est_pill_h;
-    let (px, py) = match m.axis {
-        GuideAxis::Vertical => {
-            let mid = (m.start + m.end) * 0.5;
-            if inside_long {
-                (m.at - pill_w * 0.5, mid - pill_h * 0.5)
-            } else {
-                // LeftCenter at (m.at + tick_half + 4, mid)
-                (m.at + 9.0, mid - pill_h * 0.5)
-            }
-        }
-        GuideAxis::Horizontal => {
-            let mid = (m.start + m.end) * 0.5;
-            if inside_long {
-                (mid - pill_w * 0.5, m.at - pill_h * 0.5)
-            } else {
-                // AnchorTop at (mid, m.at + tick_half + 4)
-                (mid - pill_w * 0.5, m.at + 9.0)
-            }
-        }
-    };
+fn cursor_over_stuck_pill_at(cursor: Px, bbox: vernier_platform::placement::PillRect) -> bool {
     let cx = cursor.x as f64;
     let cy = cursor.y as f64;
-    cx >= px && cx <= px + pill_w && cy >= py && cy <= py + pill_h
+    cx >= bbox.x && cx <= bbox.x + bbox.w && cy >= bbox.y && cy <= bbox.y + bbox.h
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5141,6 +5559,7 @@ fn want_system_pointer(
     resize_handle: Option<ResizeHandle>,
     menu_open: bool,
     alt_held: bool,
+    stuck_drag_committed: bool,
     screen_w: i32,
     screen_h: i32,
 ) -> bool {
@@ -5154,6 +5573,11 @@ fn want_system_pointer(
     // overlaps clickable elements underneath.
     if menu_open {
         return true;
+    }
+    // Mid-drag on a stuck pill: the pill is the visual feedback, so
+    // a cursor on top of it would just be clutter.
+    if stuck_drag_committed {
+        return false;
     }
     if pending_guide.is_some()
         || dragging_guide.is_some()
@@ -5175,9 +5599,15 @@ fn want_system_pointer(
         let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
         cursor_in_held_rect(cursor_px, rs, re) || cursor_over_pill(cursor_px, rs, re)
     });
-    let on_stuck = stuck_measurements
-        .iter()
-        .any(|m| cursor_over_stuck_pill(cursor_px, m));
+    let on_stuck = vernier_platform::placement::stuck_pill_bboxes(
+        stuck_measurements,
+        held_rects,
+        &current_measurement_format(),
+        screen_w as f64,
+        screen_h as f64,
+    )
+    .iter()
+    .any(|b| cursor_over_stuck_pill_at(cursor_px, *b));
     on_held || on_stuck || on_guide_x
 }
 
@@ -5341,20 +5771,11 @@ fn handle_pointer_button(
     let fg = hud_foreground(color_alternate);
     let cursor_px = Px::new(x as i32, y as i32);
     if pressed {
-        // First: if cursor is over a stuck-measurement pill or a guide
-        // line, the click removes that single item (the renderer is
-        // showing an X badge to signal this).
-        if let Some(idx) = stuck_measurements
-            .iter()
-            .position(|m| cursor_over_stuck_pill(cursor_px, m))
-        {
-            log::info!("removing stuck measurement at idx {idx}");
-            stuck_measurements.remove(idx);
-            return ButtonOutcome::None;
-        }
-        // (Guide removal and drag-to-move are handled at the main
-        // loop level — see the PointerButton branch — because they
-        // need access to the dragging_guide state machine.)
+        // (Stuck-measurement pill click→remove and drag→reposition
+        // are handled at the main loop level — same pattern as guide
+        // dragging — because they need a press/release state machine
+        // that this single-call helper can't model. Guide removal and
+        // drag-to-move are handled there too.)
         // Pressing on any held rect's W×H pill takes a screenshot of
         // that region. Otherwise the press starts a new measurement
         // drag — held rects accumulate, the new draw doesn't replace
@@ -5452,6 +5873,7 @@ fn handle_pointer_button(
             rect_start: snapped_start,
             rect_end: snapped_end,
             camera_armed: false,
+            color_alternate,
         });
         *mode = InteractionMode::Hover { cursor: cursor_px };
         let mut hud = Hud::hover((x, y));
@@ -5712,8 +6134,12 @@ fn save_session(
     s.push_str("# vernier session v1\n");
     for r in rects {
         s.push_str(&format!(
-            "rect {} {} {} {}\n",
-            r.rect_start.0, r.rect_start.1, r.rect_end.0, r.rect_end.1
+            "rect {} {} {} {} {}\n",
+            r.rect_start.0,
+            r.rect_start.1,
+            r.rect_end.0,
+            r.rect_end.1,
+            r.color_alternate as u8,
         ));
     }
     for g in guides {
@@ -5721,14 +6147,25 @@ fn save_session(
             GuideAxis::Horizontal => "h",
             GuideAxis::Vertical => "v",
         };
-        s.push_str(&format!("guide {axis} {}\n", g.position));
+        s.push_str(&format!(
+            "guide {axis} {} {}\n",
+            g.position, g.color_alternate as u8
+        ));
     }
     for m in stuck_measurements {
         let axis = match m.axis {
             GuideAxis::Horizontal => "h",
             GuideAxis::Vertical => "v",
         };
-        s.push_str(&format!("stuck {axis} {} {} {}\n", m.at, m.start, m.end));
+        s.push_str(&format!(
+            "stuck {axis} {} {} {} {} {} {}\n",
+            m.at,
+            m.start,
+            m.end,
+            m.pill_offset.0,
+            m.pill_offset.1,
+            m.color_alternate as u8,
+        ));
     }
     std::fs::write(&path, s)
 }
@@ -5756,6 +6193,25 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                         rect_start: (ax, ay),
                         rect_end: (bx, by),
                         camera_armed: false,
+                        color_alternate: false,
+                    });
+                }
+            }
+            // v2 rect line: trailing color-alt flag (0 / 1). Pre-v0.1.5
+            // saves drop through to the 5-token arm above.
+            ["rect", a, b, c, d, alt] => {
+                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by), Ok(alt)) = (
+                    a.parse::<f64>(),
+                    b.parse::<f64>(),
+                    c.parse::<f64>(),
+                    d.parse::<f64>(),
+                    alt.parse::<u8>(),
+                ) {
+                    rects.push(HeldRect {
+                        rect_start: (ax, ay),
+                        rect_end: (bx, by),
+                        camera_armed: false,
+                        color_alternate: alt != 0,
                     });
                 }
             }
@@ -5764,6 +6220,7 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     guides.push(Guide {
                         axis: GuideAxis::Horizontal,
                         position: p,
+                        color_alternate: false,
                         hovered: false,
                     });
                 }
@@ -5773,6 +6230,23 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     guides.push(Guide {
                         axis: GuideAxis::Vertical,
                         position: p,
+                        color_alternate: false,
+                        hovered: false,
+                    });
+                }
+            }
+            // v2 guide line: trailing color-alt flag.
+            ["guide", ax_s, pos, alt] => {
+                let ax = match *ax_s {
+                    "h" => GuideAxis::Horizontal,
+                    "v" => GuideAxis::Vertical,
+                    _ => continue,
+                };
+                if let (Ok(p), Ok(alt)) = (pos.parse::<i32>(), alt.parse::<u8>()) {
+                    guides.push(Guide {
+                        axis: ax,
+                        position: p,
+                        color_alternate: alt != 0,
                         hovered: false,
                     });
                 }
@@ -5791,6 +6265,57 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                         at,
                         start,
                         end,
+                        pill_offset: (0.0, 0.0),
+                        color_alternate: false,
+                        hovered: false,
+                    });
+                }
+            }
+            // v2 stuck-line format: extra pill_offset (ox, oy) at end.
+            // Pre-v0.1.5 sessions don't have these — they fall through
+            // to the 5-token arm above with a default (0, 0) offset.
+            ["stuck", axis, at, start, end, ox, oy] => {
+                let ax = match *axis {
+                    "h" => GuideAxis::Horizontal,
+                    "v" => GuideAxis::Vertical,
+                    _ => continue,
+                };
+                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy)) =
+                    (at.parse(), start.parse(), end.parse(), ox.parse(), oy.parse())
+                {
+                    stuck.push(StuckMeasurement {
+                        axis: ax,
+                        at,
+                        start,
+                        end,
+                        pill_offset: (ox, oy),
+                        color_alternate: false,
+                        hovered: false,
+                    });
+                }
+            }
+            // v3 stuck-line format: pill_offset + color-alt flag.
+            ["stuck", axis, at, start, end, ox, oy, alt] => {
+                let ax = match *axis {
+                    "h" => GuideAxis::Horizontal,
+                    "v" => GuideAxis::Vertical,
+                    _ => continue,
+                };
+                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy), Ok(alt)) = (
+                    at.parse::<f64>(),
+                    start.parse::<f64>(),
+                    end.parse::<f64>(),
+                    ox.parse::<f64>(),
+                    oy.parse::<f64>(),
+                    alt.parse::<u8>(),
+                ) {
+                    stuck.push(StuckMeasurement {
+                        axis: ax,
+                        at,
+                        start,
+                        end,
+                        pill_offset: (ox, oy),
+                        color_alternate: alt != 0,
                         hovered: false,
                     });
                 }

@@ -17,17 +17,23 @@ use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
+    delegate_pointer_constraints, delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    reexports::protocols::wp::cursor_shape::v1::client::{
-        wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+    reexports::protocols::wp::{
+        cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+        pointer_constraints::zv1::client::{
+            zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+            zwp_locked_pointer_v1::ZwpLockedPointerV1,
+            zwp_pointer_constraints_v1::Lifetime as PointerLifetime,
+        },
     },
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager},
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
     },
     shell::{
         WaylandSurface,
@@ -304,6 +310,13 @@ enum Cmd {
     /// the compositor's `wp_cursor_shape_v1` so the user sees their
     /// actual theme arrow.
     OverlaySetSystemPointer(OverlayKey, SystemPointerKind),
+    /// Confine the pointer to a logical-px rectangle inside this
+    /// overlay's surface. The (x, y, w, h) is in surface-local
+    /// (logical) px. Used while dragging a stuck-measurement pill
+    /// so the cursor physically stops at the drag bound.
+    OverlayConfinePointer(OverlayKey, i32, i32, i32, i32),
+    /// Tear down any active pointer confinement for this overlay.
+    OverlayReleasePointerConfine(OverlayKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +374,16 @@ impl OverlayOps for WaylandOverlay {
         };
         let _ = self.cmd_tx.send(Cmd::OverlaySetSystemPointer(self.key, kind));
     }
+    fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let _ = self
+            .cmd_tx
+            .send(Cmd::OverlayConfinePointer(self.key, x, y, w, h));
+    }
+    fn release_pointer_confine(&mut self) {
+        let _ = self
+            .cmd_tx
+            .send(Cmd::OverlayReleasePointerConfine(self.key));
+    }
 }
 
 impl Drop for WaylandOverlay {
@@ -400,6 +423,14 @@ struct WaylandState {
     /// it (Hyprland does). Used to display the user's actual theme
     /// pointer instead of a hand-drawn arrow.
     cursor_shape_manager: Option<CursorShapeManager>,
+    /// `zwp_pointer_constraints_v1` global if the compositor offers
+    /// it. We use `confine_pointer` to physically bound the cursor
+    /// while a stuck-measurement pill is being dragged so the user
+    /// can't overshoot the 50px clamp.
+    pointer_constraints: PointerConstraintsState,
+    /// Currently-active pointer confinement, if any. Lifetime
+    /// `Persistent` until we explicitly destroy it on drag release.
+    active_confined_pointer: Option<ZwpConfinedPointerV1>,
     /// Per-pointer cursor-shape device, lazily created on first Enter.
     pointer_shape_devices: HashMap<wayland_client::backend::ObjectId, WpCursorShapeDeviceV1>,
     /// Most recent pointer + Enter serial seen across any overlay —
@@ -488,6 +519,7 @@ fn run_event_loop(
         }
     };
 
+    let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
     let mut state = WaylandState {
         registry,
         output_state,
@@ -502,6 +534,8 @@ fn run_event_loop(
         keyboards: Vec::new(),
         loop_handle: None,
         cursor_shape_manager,
+        pointer_constraints,
+        active_confined_pointer: None,
         pointer_shape_devices: HashMap::new(),
         last_pointer_enter: None,
         overlay_pointer_kind: HashMap::new(),
@@ -592,6 +626,66 @@ impl WaylandState {
             Cmd::OverlaySetSystemPointer(key, kind) => {
                 self.set_overlay_system_pointer(key, kind);
             }
+            Cmd::OverlayConfinePointer(key, x, y, w, h) => {
+                self.confine_overlay_pointer(key, x, y, w, h);
+            }
+            Cmd::OverlayReleasePointerConfine(_key) => {
+                self.release_overlay_pointer_confine();
+            }
+        }
+    }
+
+    fn confine_overlay_pointer(&mut self, key: OverlayKey, x: i32, y: i32, w: i32, h: i32) {
+        // Drop any prior confinement before requesting a new one
+        // (the protocol bans stacking constraints on the same seat).
+        self.release_overlay_pointer_confine();
+        let Some(inst) = self.overlays.get(&key) else {
+            return;
+        };
+        let pointer = match self.pointers.first() {
+            Some(p) => p.clone(),
+            None => {
+                log::warn!("confine_pointer: no pointer bound yet");
+                return;
+            }
+        };
+        let surface = inst.layer.wl_surface().clone();
+        // The region is in surface-local coords; let the compositor
+        // free us when the surface loses input focus (`Persistent`
+        // would keep it reapplying on every refocus, which is more
+        // than we need for a single drag gesture).
+        let region = Region::new(&self.compositor)
+            .ok()
+            .map(|r| {
+                r.add(x, y, w, h);
+                r
+            });
+        let region_ref = region.as_ref().map(|r| r.wl_region());
+        match self.pointer_constraints.confine_pointer(
+            &surface,
+            &pointer,
+            region_ref,
+            PointerLifetime::Persistent,
+            &self.qh,
+        ) {
+            Ok(cp) => {
+                self.active_confined_pointer = Some(cp);
+                log::debug!(
+                    "pointer confined to surface rect ({x},{y}) {w}x{h}"
+                );
+            }
+            Err(e) => log::warn!("confine_pointer failed: {e}"),
+        }
+        // Keep the wl_region alive for the duration of the confinement
+        // by storing it alongside — actually drop it; the compositor
+        // has consumed its reference at this point.
+        drop(region);
+    }
+
+    fn release_overlay_pointer_confine(&mut self) {
+        if let Some(cp) = self.active_confined_pointer.take() {
+            cp.destroy();
+            log::debug!("pointer confinement released");
         }
     }
 
@@ -1289,8 +1383,48 @@ delegate_layer!(WaylandState);
 delegate_shm!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_pointer!(WaylandState);
+delegate_pointer_constraints!(WaylandState);
 delegate_keyboard!(WaylandState);
 delegate_registry!(WaylandState);
+
+impl PointerConstraintsHandler for WaylandState {
+    fn confined(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        _qh: &QueueHandle<Self>,
+        _confined_pointer: &ZwpConfinedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+        log::debug!("pointer confined by compositor");
+    }
+    fn unconfined(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        _qh: &QueueHandle<Self>,
+        _confined_pointer: &ZwpConfinedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {
+        log::debug!("pointer unconfined by compositor");
+    }
+    fn locked(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        _qh: &QueueHandle<Self>,
+        _locked_pointer: &ZwpLockedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {}
+    fn unlocked(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        _qh: &QueueHandle<Self>,
+        _locked_pointer: &ZwpLockedPointerV1,
+        _surface: &wl_surface::WlSurface,
+        _pointer: &wl_pointer::WlPointer,
+    ) {}
+}
 // (delegate_pointer! already wires Dispatch for the wp_cursor_shape
 // manager + device through SCTK's CursorShapeManager.)
 
@@ -1358,38 +1492,10 @@ const TEXT_STUCK_LOGICAL_PX: f32 = 10.0;
 /// measurement-pill text doesn't shrink the toast.
 const TOAST_TEXT_LOGICAL_PX: f32 = 18.0;
 
-/// Lazily-loaded TTF font for the dimension readout. We try a few
-/// well-known system paths; if none are available we fall back to no
-/// text (the pill stays empty).
-fn hud_font() -> Option<&'static fontdue::Font> {
-    use std::sync::OnceLock;
-    static FONT: OnceLock<Option<fontdue::Font>> = OnceLock::new();
-    FONT.get_or_init(|| {
-        const CANDIDATES: &[&str] = &[
-            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        ];
-        for path in CANDIDATES {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = fontdue::Font::from_bytes(
-                    bytes.as_slice(),
-                    fontdue::FontSettings::default(),
-                ) {
-                    log::info!("hud font: {path}");
-                    return Some(font);
-                }
-            }
-        }
-        log::warn!("hud font: no system TTF found; pill text will be blank");
-        None
-    })
-    .as_ref()
-}
+// Re-export the shared hud_font so existing call sites keep working.
+// The actual font + caching lives in `crate::font` so the
+// placement module can measure widths against the exact same font.
+use crate::font::hud_font;
 
 /// Fallback font for glyphs the primary HUD font doesn't carry —
 /// notably the macOS modifier symbols (⇧⌃⌘⌥). Adwaita Sans includes
@@ -1603,42 +1709,50 @@ fn render_hud_strokes(
     };
 
     let mut pills: Vec<PillLayout> = Vec::new();
+    // Pre-compute every committed pill's final position once. Both
+    // the renderer and the main loop's hit-test use the same function
+    // so a click always lands on whatever pill the user sees.
+    let pill_layout = crate::placement::compute_pill_layout(
+        &hud.held_rects,
+        &hud.stuck_measurements,
+        &hud.measurement_format,
+        (buf_w as f32 / scale as f32) as f64,
+        (buf_h as f32 / scale as f32) as f64,
+    );
 
     // Held rects are additive — drawn first so the live HUD sits on
     // top. Each accumulated drag stays visible.
-    if !hud.held_rects.is_empty() {
-        for rect in &hud.held_rects {
-            // Held rect's W×H pill sits inside only if the rect is
-            // at least 70 logical px wide and 35 tall. Smaller rects
-            // get the pill anchored below to keep the readout legible.
-            let rw_logical = (rect.rect_end.0 - rect.rect_start.0).abs() as i32;
-            let rh_logical = (rect.rect_end.1 - rect.rect_start.1).abs() as i32;
-            let pill_below = rw_logical < 70 || rh_logical < 35;
-            draw_area_rect(
-                &mut pixmap,
-                &mut pills,
-                &rect.rect_start,
-                &rect.rect_end,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                fg,
-                &hud.measurement_format,
-                &stroke,
-                &paint,
-                rect.camera_armed,
-                pill_below,
-            );
-        }
+    for (i, rect) in hud.held_rects.iter().enumerate() {
+        let dim_bbox = pill_layout.rect_dim_bboxes.get(i).copied();
+        let rect_fg = if rect.color_alternate {
+            hud.alternate_fg
+        } else {
+            hud.primary_fg
+        };
+        let mut rect_paint = Paint::default();
+        rect_paint.set_color_rgba8(rect_fg.r, rect_fg.g, rect_fg.b, rect_fg.a);
+        rect_paint.anti_alias = false;
+        draw_area_rect(
+            &mut pixmap,
+            &mut pills,
+            &rect.rect_start,
+            &rect.rect_end,
+            buf_w as f32,
+            buf_h as f32,
+            scale,
+            rect_fg,
+            &hud.measurement_format,
+            &stroke,
+            &rect_paint,
+            rect.camera_armed,
+            dim_bbox,
+        );
     }
 
     // Live drag rect, BEFORE the cursor — the cursor (arrow or
     // crosshair) is rendered last so it sits on top of every other
     // overlay element including hover X badges.
     if let HudKind::Drawing { start, cursor } = &hud.kind {
-        let rw_logical = (cursor.0 - start.0).abs() as i32;
-        let rh_logical = (cursor.1 - start.1).abs() as i32;
-        let pill_below = rw_logical < 70 || rh_logical < 35;
         draw_area_rect(
             &mut pixmap,
             &mut pills,
@@ -1652,7 +1766,7 @@ fn render_hud_strokes(
             &stroke,
             &paint,
             false,
-            pill_below,
+            None,
         );
     }
     if let HudKind::Held {
@@ -1675,7 +1789,7 @@ fn render_hud_strokes(
             &stroke,
             &paint,
             *camera_armed,
-            false,
+            None,
         );
     }
     if !hud.stuck_measurements.is_empty() {
@@ -1683,7 +1797,9 @@ fn render_hud_strokes(
             &mut pixmap,
             &mut pills,
             &hud.stuck_measurements,
-            fg,
+            &pill_layout.stuck_bboxes,
+            hud.primary_fg,
+            hud.alternate_fg,
             &hud.measurement_format,
             buf_w as f32,
             buf_h as f32,
@@ -1706,6 +1822,7 @@ fn render_hud_strokes(
             cursor,
             hud.align_mode,
             hud.guide_color,
+            hud.alternative_guide_color,
             &hud.measurement_format,
             buf_w as f32,
             buf_h as f32,
@@ -2022,26 +2139,28 @@ fn draw_stuck_measurements(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
     measurements: &[crate::StuckMeasurement],
-    fg: Color,
+    pill_bboxes: &[crate::placement::PillRect],
+    primary_fg: Color,
+    alternate_fg: Color,
     fmt: &crate::HudMeasurementFormat,
-    buf_w: f32,
-    buf_h: f32,
+    _buf_w: f32,
+    _buf_h: f32,
     scale_f: f32,
 ) {
     use tiny_skia::*;
     use crate::GuideAxis;
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
-    paint.anti_alias = false;
     let line_stroke = Stroke { width: 2.0, ..Default::default() };
     let tick_stroke = Stroke { width: 2.0, ..Default::default() };
     let tick_half = 5.0 * scale_f; // tick reach in buffer px
-    // Approximate pill height in buffer px — text + proportional pad.
-    // Used to decide "is the line long enough to fit the value pill
-    // comfortably inside?" Threshold = 3 × pill height.
-    let est_pill_h = TEXT_STUCK_LOGICAL_PX * scale_f * 1.8;
 
-    for m in measurements {
+    for (i, m) in measurements.iter().enumerate() {
+        // Per-stuck color (snapshot at placement). Existing pieces
+        // keep whatever color they were placed in even if `X`
+        // re-flips the live HUD afterward.
+        let fg = if m.color_alternate { alternate_fg } else { primary_fg };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
+        paint.anti_alias = false;
         // Snap endpoints to the physical pixel grid (same `floor`
         // step the live crosshair uses), subtract in buffer px, and
         // divide back by scale. Rounded to an integer so the pill
@@ -2051,13 +2170,7 @@ fn draw_stuck_measurements(
         let start_buf = (m.start as f32 * scale_f).floor();
         let end_buf = (m.end as f32 * scale_f).floor();
         let length = ((end_buf - start_buf).abs() / scale_f).round() as f64;
-        let value_text = format_value(length, fmt);
-        // Pill bg is ALWAYS sized for the value text so the size
-        // doesn't change when hovering. The displayed glyph may be
-        // larger (× at 1.5×) and overflow the bg slightly — that's
-        // the visual cue.
-        let (pill_w, pill_h, _, _) =
-            pill_dims_at(&value_text, TEXT_STUCK_LOGICAL_PX, scale_f);
+        let value_text = fmt.format_value(length);
         let display_text = if m.hovered {
             "\u{00D7}".to_string()
         } else {
@@ -2069,6 +2182,15 @@ fn draw_stuck_measurements(
             TEXT_STUCK_LOGICAL_PX
         };
         let half = 1.0; // half of the 2px stroke for pixel-grid snap
+        let bbox = match pill_bboxes.get(i) {
+            Some(b) => *b,
+            None => continue,
+        };
+        // Logical → buffer.
+        let pill_x = (bbox.x as f32 * scale_f).floor();
+        let pill_y = (bbox.y as f32 * scale_f).floor();
+        let pill_w = (bbox.w as f32 * scale_f).floor();
+        let pill_h = (bbox.h as f32 * scale_f).floor();
         match m.axis {
             GuideAxis::Vertical => {
                 let x = (m.at as f32 * scale_f).floor() + half;
@@ -2090,29 +2212,22 @@ fn draw_stuck_measurements(
                         pixmap.stroke_path(&p, &paint, &tick_stroke, Transform::identity(), None);
                     }
                 }
-                let mid_y = (y0 + y1) * 0.5;
-                let line_len = (y1 - y0).abs();
-                let (anchor_x, anchor_y, anchor) = if line_len >= 3.0 * est_pill_h {
-                    (x, mid_y, PillAnchor::Centered)
-                } else {
-                    (x + tick_half + 4.0 * scale_f, mid_y, PillAnchor::LeftCenter)
-                };
-                let (mut pill_x, mut pill_y) = match anchor {
-                    PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
-                    PillAnchor::LeftCenter => (anchor_x, anchor_y - pill_h * 0.5),
-                    _ => (anchor_x, anchor_y),
-                };
-                pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
-                pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
-                draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
-                push_text_in_box(
-                    pills,
-                    display_text.clone(),
+                // Tether (drawn before the pill bg so the pill sits
+                // on top): a dashed half-alpha line from the pill's
+                // nearer edge to the projection on the measurement
+                // line. Skipped when the pill is centered on the
+                // line itself.
+                draw_pill_tether(
+                    pixmap,
+                    crate::GuideAxis::Vertical,
+                    x,
+                    y0.min(y1),
+                    y0.max(y1),
                     pill_x,
                     pill_y,
                     pill_w,
                     pill_h,
-                    display_size,
+                    fg,
                     scale_f,
                 );
             }
@@ -2136,33 +2251,103 @@ fn draw_stuck_measurements(
                         pixmap.stroke_path(&p, &paint, &tick_stroke, Transform::identity(), None);
                     }
                 }
-                let mid_x = (x0 + x1) * 0.5;
-                let line_len = (x1 - x0).abs();
-                let (anchor_x, anchor_y, anchor) = if line_len >= 3.0 * est_pill_h {
-                    (mid_x, y, PillAnchor::Centered)
-                } else {
-                    (mid_x, y + tick_half + 4.0 * scale_f, PillAnchor::AnchorTop)
-                };
-                let (mut pill_x, mut pill_y) = match anchor {
-                    PillAnchor::Centered => (anchor_x - pill_w * 0.5, anchor_y - pill_h * 0.5),
-                    PillAnchor::AnchorTop => (anchor_x - pill_w * 0.5, anchor_y),
-                    _ => (anchor_x, anchor_y),
-                };
-                pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
-                pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
-                draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
-                push_text_in_box(
-                    pills,
-                    display_text.clone(),
+                draw_pill_tether(
+                    pixmap,
+                    crate::GuideAxis::Horizontal,
+                    y,
+                    x0.min(x1),
+                    x0.max(x1),
                     pill_x,
                     pill_y,
                     pill_w,
                     pill_h,
-                    display_size,
+                    fg,
                     scale_f,
                 );
             }
         }
+        draw_pill_bg(pixmap, pill_x, pill_y, pill_w, pill_h);
+        push_text_in_box(
+            pills,
+            display_text.clone(),
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            display_size,
+            scale_f,
+        );
+    }
+}
+
+/// Draw a half-alpha dashed line from the nearest edge of a stuck
+/// measurement's value pill to the projection of the pill's center
+/// onto the measurement line. Skipped when the pill overlaps the
+/// line (centered on it) — there's nothing to tether back to.
+///
+/// `axis` is the orientation of the MEASUREMENT line, not the
+/// tether. For a Vertical measurement, `line_pos` is its `x` and
+/// `line_lo/hi` are the `y` extent; for Horizontal it's flipped.
+#[allow(clippy::too_many_arguments)]
+fn draw_pill_tether(
+    pixmap: &mut tiny_skia::PixmapMut,
+    axis: crate::GuideAxis,
+    line_pos: f32,
+    line_lo: f32,
+    line_hi: f32,
+    pill_x: f32,
+    pill_y: f32,
+    pill_w: f32,
+    pill_h: f32,
+    fg: Color,
+    scale_f: f32,
+) {
+    use tiny_skia::*;
+    let (anchor_pt, pill_pt) = match axis {
+        crate::GuideAxis::Vertical => {
+            // Line is vertical at x = line_pos. The pill sits to the
+            // left or right; the tether is horizontal.
+            let pill_cy = (pill_y + pill_h * 0.5).clamp(line_lo, line_hi);
+            // Pill side closest to the line.
+            let pill_near_x = if pill_x + pill_w * 0.5 < line_pos {
+                pill_x + pill_w // right edge of left-side pill
+            } else {
+                pill_x // left edge of right-side pill
+            };
+            // No tether if the pill straddles or sits on the line.
+            if (pill_near_x - line_pos).abs() < 1.0 {
+                return;
+            }
+            ((line_pos, pill_cy), (pill_near_x, pill_cy))
+        }
+        crate::GuideAxis::Horizontal => {
+            // Line is horizontal at y = line_pos.
+            let pill_cx = (pill_x + pill_w * 0.5).clamp(line_lo, line_hi);
+            let pill_near_y = if pill_y + pill_h * 0.5 < line_pos {
+                pill_y + pill_h
+            } else {
+                pill_y
+            };
+            if (pill_near_y - line_pos).abs() < 1.0 {
+                return;
+            }
+            ((pill_cx, line_pos), (pill_cx, pill_near_y))
+        }
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(fg.r, fg.g, fg.b, (fg.a as u16 * 128 / 255) as u8);
+    paint.anti_alias = true;
+    let dash = StrokeDash::new(vec![4.0 * scale_f, 3.0 * scale_f], 0.0);
+    let stroke = Stroke {
+        width: 1.0,
+        dash,
+        ..Default::default()
+    };
+    let mut pb = PathBuilder::new();
+    pb.move_to(anchor_pt.0, anchor_pt.1);
+    pb.line_to(pill_pt.0, pill_pt.1);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 }
 
@@ -2178,6 +2363,7 @@ fn draw_guides(
     cursor: Option<(f64, f64)>,
     align_mode: bool,
     guide_color: crate::Color,
+    alternative_guide_color: crate::Color,
     fmt: &crate::HudMeasurementFormat,
     buf_w: f32,
     buf_h: f32,
@@ -2185,14 +2371,21 @@ fn draw_guides(
 ) {
     use tiny_skia::*;
     use crate::GuideAxis;
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(guide_color.r, guide_color.g, guide_color.b, guide_color.a);
-    paint.anti_alias = false;
     let stroke = Stroke {
         width: 1.0,
         ..Default::default()
     };
     for guide in guides {
+        // Per-guide color (snapshot at placement, except for the
+        // pending preview which mirrors the live `color_alternate`).
+        let c = if guide.color_alternate {
+            alternative_guide_color
+        } else {
+            guide_color
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(c.r, c.g, c.b, c.a);
+        paint.anti_alias = false;
         let pos = (guide.position as f32 * scale_f).floor() + 0.5;
         let mut pb = PathBuilder::new();
         match guide.axis {
@@ -2238,7 +2431,7 @@ fn draw_guides(
         if dist == 0 {
             continue;
         }
-        let value = format_value(dist as f64, fmt);
+        let value = fmt.format_value(dist as f64);
         let (pill_w, pill_h, _, _) =
             pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Horizontal pair (gap is vertical) → label anchored at the
@@ -2274,7 +2467,7 @@ fn draw_guides(
         if dist == 0 {
             continue;
         }
-        let value = format_value(dist as f64, fmt);
+        let value = fmt.format_value(dist as f64);
         let (pill_w, pill_h, _, _) =
             pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Vertical pair (gap is horizontal) → label anchored at the
@@ -2570,7 +2763,10 @@ fn draw_area_rect(
     stroke: &tiny_skia::Stroke,
     line_paint: &tiny_skia::Paint,
     camera_armed: bool,
-    pill_below: bool,
+    // Pre-computed dim-pill bbox (logical px) for committed rects;
+    // None for live drag / live held rects → default position, no
+    // collision search.
+    precomputed_dim_bbox: Option<crate::placement::PillRect>,
 ) {
     use tiny_skia::*;
     let scale_f = scale as f32;
@@ -2604,101 +2800,125 @@ fn draw_area_rect(
     let w_logical = w_logical_f.round() as u32;
     let h_logical = h_logical_f.round() as u32;
 
-    // W × H pill, centered inside the rectangle. When the cursor is
-    // over it (camera_armed=true), swap the text for a camera icon
-    // while keeping the same pill bounds so the visible chip doesn't
-    // jump as you hover in/out.
     let dim_text = if fmt.wh_indicators {
         format!(
             "W: {}{} \u{00D7} H: {}{}",
-            format_number(w_logical_f, fmt),
+            fmt.format_number(w_logical_f),
             fmt.unit_suffix,
-            format_number(h_logical_f, fmt),
+            fmt.format_number(h_logical_f),
             fmt.unit_suffix,
         )
     } else {
         format!(
             "{} \u{00D7} {}{}",
-            format_number(w_logical_f, fmt),
-            format_number(h_logical_f, fmt),
+            fmt.format_number(w_logical_f),
+            fmt.format_number(h_logical_f),
             fmt.unit_suffix
         )
     };
-    // Drawing-mode pills sit below the rect so the user can see what
-    // they're highlighting. Held rects keep the centered position
-    // (after snap-shrink they're tight to content, less obscuring).
-    let dim_anchor_x = rx + rw * 0.5;
-    let (dim_anchor_y, dim_anchor) = if pill_below {
-        (ry + rh + 8.0 * scale_f, PillAnchor::AnchorTop)
-    } else {
-        (ry + rh * 0.5, PillAnchor::Centered)
-    };
-    if camera_armed {
-        // Use the SAME pill bounds and position as the text version
-        // would have — when the pill is below the rect, the camera
-        // icon goes below too. Then just swap the content (icon
-        // instead of text) inside that pill.
-        let (pill_w, pill_h) = pill_dimensions_for_text(&dim_text, scale_f);
-        let (mut pill_x, mut pill_y) = match dim_anchor {
-            PillAnchor::Centered => {
-                (dim_anchor_x - pill_w * 0.5, dim_anchor_y - pill_h * 0.5)
+    let pill_below = w_logical < 70 || h_logical < 35;
+    // Resolve the dim pill bbox: pre-computed (logical px) for
+    // committed rects, default for transient live rects.
+    let dim_bbox_logical = match precomputed_dim_bbox {
+        Some(b) => b,
+        None => {
+            let (dim_pill_w_buf, dim_pill_h_buf) =
+                pill_dimensions_for_text(&dim_text, scale_f);
+            let dim_pill_w = dim_pill_w_buf / scale_f;
+            let dim_pill_h = dim_pill_h_buf / scale_f;
+            let cx_log = (rx + rw * 0.5) as f64 / scale as f64;
+            if pill_below {
+                crate::placement::PillRect {
+                    x: cx_log - dim_pill_w as f64 * 0.5,
+                    y: (ry as f64 + rh as f64 + 8.0 * scale as f64) / scale as f64,
+                    w: dim_pill_w as f64,
+                    h: dim_pill_h as f64,
+                }
+            } else {
+                crate::placement::PillRect {
+                    x: cx_log - dim_pill_w as f64 * 0.5,
+                    y: (ry as f64 + rh as f64 * 0.5) / scale as f64
+                        - dim_pill_h as f64 * 0.5,
+                    w: dim_pill_w as f64,
+                    h: dim_pill_h as f64,
+                }
             }
-            PillAnchor::AnchorTop => (dim_anchor_x - pill_w * 0.5, dim_anchor_y),
-            _ => (dim_anchor_x - pill_w * 0.5, dim_anchor_y - pill_h * 0.5),
-        };
-        pill_x = pill_x.floor().min(buf_w - pill_w - 1.0).max(0.0);
-        pill_y = pill_y.floor().min(buf_h - pill_h - 1.0).max(0.0);
-        let mut bg_paint = Paint::default();
-        bg_paint.set_color_rgba8(40, 40, 40, 230);
-        bg_paint.anti_alias = true;
-        if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
-            pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
         }
+    };
+    let dim_pill_x = (dim_bbox_logical.x as f32 * scale_f)
+        .floor()
+        .min(buf_w - (dim_bbox_logical.w as f32 * scale_f) - 1.0)
+        .max(0.0);
+    let dim_pill_y = (dim_bbox_logical.y as f32 * scale_f)
+        .floor()
+        .min(buf_h - (dim_bbox_logical.h as f32 * scale_f) - 1.0)
+        .max(0.0);
+    let dim_pill_w = (dim_bbox_logical.w as f32 * scale_f).floor();
+    let dim_pill_h = (dim_bbox_logical.h as f32 * scale_f).floor();
+    // Did the W×H pill end up above the rect? Aspect pill follows.
+    let dim_flipped_up = pill_below && dim_pill_y < ry;
+    if camera_armed {
+        draw_pill_bg(pixmap, dim_pill_x, dim_pill_y, dim_pill_w, dim_pill_h);
         draw_camera_icon(
             pixmap,
-            pill_x + pill_w * 0.5,
-            pill_y + pill_h * 0.5,
+            dim_pill_x + dim_pill_w * 0.5,
+            dim_pill_y + dim_pill_h * 0.5,
             scale_f,
         );
     } else {
-        push_pill(
-            pixmap,
+        draw_pill_bg(pixmap, dim_pill_x, dim_pill_y, dim_pill_w, dim_pill_h);
+        push_text_in_box(
             pills,
             dim_text,
-            dim_anchor_x,
-            dim_anchor_y,
-            dim_anchor,
-            buf_w,
-            buf_h,
-            scale_f,
+            dim_pill_x,
+            dim_pill_y,
+            dim_pill_w,
+            dim_pill_h,
             TEXT_LOGICAL_PX,
+            scale_f,
         );
     }
 
-    // Aspect ratio pill — sits just below the dimension pill when
-    // both are below the rect, otherwise just below the rect.
+    // Aspect ratio pill — stays attached to whichever side the
+    // dimension pill landed on. Not collision-resolved; it tracks
+    // the dim pill (the dim pill already won the collision search).
     let aspect_text = if fmt.aspect_in_area {
         estimate_aspect_text(w_logical, h_logical, fmt.aspect_mode)
     } else {
         None
     };
     if let Some(aspect_text) = aspect_text {
-        let aspect_y = if pill_below {
-            ry + rh + 8.0 * scale_f + (TEXT_LOGICAL_PX + 2.0 * 5.0) * scale_f + 6.0 * scale_f
+        let center_x = rx + rw * 0.5;
+        let aspect_y_anchor = if dim_flipped_up {
+            dim_pill_y - 6.0 * scale_f
+        } else if pill_below {
+            dim_pill_y + dim_pill_h + 6.0 * scale_f
         } else {
             ry + rh + 24.0 * scale_f
         };
-        push_pill(
-            pixmap,
+        let (apill_w, apill_h) = pill_dimensions_for_text(&aspect_text, scale_f);
+        let apill_x = (center_x - apill_w * 0.5)
+            .floor()
+            .min(buf_w - apill_w - 1.0)
+            .max(0.0);
+        let apill_y = if dim_flipped_up {
+            (aspect_y_anchor - apill_h)
+                .floor()
+                .min(buf_h - apill_h - 1.0)
+                .max(0.0)
+        } else {
+            aspect_y_anchor.floor().min(buf_h - apill_h - 1.0).max(0.0)
+        };
+        draw_pill_bg(pixmap, apill_x, apill_y, apill_w, apill_h);
+        push_text_in_box(
             pills,
             aspect_text,
-            rx + rw * 0.5,
-            aspect_y,
-            PillAnchor::AnchorTop,
-            buf_w,
-            buf_h,
-            scale_f,
+            apill_x,
+            apill_y,
+            apill_w,
+            apill_h,
             TEXT_LOGICAL_PX,
+            scale_f,
         );
     }
 }
@@ -2736,7 +2956,12 @@ fn estimate_aspect_text(
     Some(format!("{} : {}", n, d))
 }
 
+// Pill placement (collision-avoiding bbox selection) lives in
+// `crate::placement` so the renderer and the main loop's hit-test
+// stay in lock-step. See `placement::compute_pill_layout`.
+
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 enum PillAnchor {
     /// Position pill so its center lands at (anchor_x, anchor_y).
     Centered,
@@ -2748,7 +2973,6 @@ enum PillAnchor {
     /// vertical center sits at `anchor_y`.
     LeftCenter,
     /// Lower-right of the anchor by the given buffer-pixel offset.
-    #[allow(dead_code)]
     BelowRight(f32),
 }
 
@@ -3069,34 +3293,8 @@ fn draw_toast(
     });
 }
 
-/// Render a logical-pixel measurement value with the user's
-/// configured rounding mode. No unit suffix is appended — callers
-/// add it for single-value pills and omit it for W×H pills.
-fn format_number(value_logical: f64, fmt: &crate::HudMeasurementFormat) -> String {
-    use crate::HudRounding::*;
-    let divisor = if fmt.dimension_divisor > 0.0 {
-        fmt.dimension_divisor
-    } else {
-        1.0
-    };
-    let value = value_logical / divisor;
-    match fmt.rounding {
-        Points => {
-            let r = (value * 10.0).round() / 10.0;
-            if (r - r.round()).abs() < f64::EPSILON {
-                format!("{}", r as i64)
-            } else {
-                format!("{r:.1}")
-            }
-        }
-        PointsRounded => format!("{}", value.round() as i64),
-        ScreenPixels => format!("{}", (value * fmt.scale_factor).round() as i64),
-    }
-}
-
-fn format_value(value_logical: f64, fmt: &crate::HudMeasurementFormat) -> String {
-    format!("{}{}", format_number(value_logical, fmt), fmt.unit_suffix)
-}
+// format_number / format_value live on crate::HudMeasurementFormat now
+// (see crate::types). Renderer + placement use the same impls.
 
 /// Right-click context menu — floating list of actions anchored at
 /// the cursor where the right-click happened. Drawn last (on top of

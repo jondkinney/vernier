@@ -4,6 +4,8 @@
 //! concrete OS modules are private and selected via cfg.
 
 pub mod figma_bridge;
+pub mod font;
+pub mod placement;
 mod tray;
 mod types;
 pub use types::*;
@@ -122,6 +124,14 @@ pub trait OverlayOps: Send {
     /// `false` → the cursor is hidden so we can draw our own custom
     /// crosshair / move / resize cursor instead.
     fn set_system_pointer_visible(&mut self, visible: bool);
+    /// Confine the system pointer to a (x, y, w, h) rectangle in
+    /// surface-local (logical) px, via `wp_pointer_constraints_v1`.
+    /// Used to physically clamp the cursor while a stuck-pill drag
+    /// is in progress so it can't run past the offset bound.
+    fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32);
+    /// Tear down whatever confinement is active for this overlay,
+    /// freeing the cursor.
+    fn release_pointer_confine(&mut self);
 }
 
 /// Owned handle to an overlay surface. Drop to destroy.
@@ -159,6 +169,12 @@ impl OverlayHandle {
     }
     pub fn set_system_pointer_visible(&mut self, visible: bool) {
         self.inner.set_system_pointer_visible(visible)
+    }
+    pub fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.inner.confine_pointer(x, y, w, h)
+    }
+    pub fn release_pointer_confine(&mut self) {
+        self.inner.release_pointer_confine()
     }
 }
 
