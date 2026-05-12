@@ -459,12 +459,17 @@ fn run_daemon() -> Result<()> {
     // Modifier state — tracked separately from the keysym handler so
     // we know it across non-key events too.
     // Shift held → "alignment crosshair" mode (full-screen axis lines,
-    // measurements suppressed). Super held → place guides freely
-    // (skip the snap-to-detected-edge default).
+    // measurements suppressed). Alt held → "precise" mode: hide the
+    // measurement crosshair / pointer so the user can read pixels under
+    // the cursor, and skip the snap-to-detected-edge guide placement.
+    // (Originally Super, but Hyprland's default `bindm = SUPER` traps
+    // the click for `movewindow` before it reaches our layer surface.)
+    // Super is still tracked separately so user-configured shortcuts
+    // that include SUPER as a modifier still match.
     let mut shift_held: bool = false;
-    let mut super_held: bool = false;
-    let mut ctrl_held: bool = false;
     let mut alt_held: bool = false;
+    let mut ctrl_held: bool = false;
+    let mut super_held: bool = false;
     // Cached parsed accelerators for the user's configured
     // shortcuts. Refreshed on startup + on each `reload-settings`
     // so a bare keypress can match against the live config rather
@@ -649,9 +654,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -673,7 +676,7 @@ fn run_daemon() -> Result<()> {
                 }
                 if let Some(op) = resizing {
                     if let Some(rect) = held_rects.get_mut(op.rect_idx) {
-                        apply_resize(rect, &op, (x, y), &guides, super_held);
+                        apply_resize(rect, &op, (x, y), &guides, alt_held);
                     }
                 }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
@@ -705,7 +708,7 @@ fn run_daemon() -> Result<()> {
                         resizing,
                         active_handle,
                         context_menu.is_some(),
-                        super_held,
+                        alt_held,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
                     );
@@ -728,9 +731,7 @@ fn run_daemon() -> Result<()> {
                         &held_rects,
                         color_alternate,
                         align_mode,
-                        super_held,
-                        shift_held,
-                        pending_guide_shift_acked,
+                        alt_held,
                         pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -810,9 +811,7 @@ fn run_daemon() -> Result<()> {
                         &held_rects,
                         color_alternate,
                         align_mode,
-                        super_held,
-                        shift_held,
-                        pending_guide_shift_acked,
+                        alt_held,
                         pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -981,9 +980,7 @@ fn run_daemon() -> Result<()> {
                         &held_rects,
                         color_alternate,
                         align_mode,
-                        super_held,
-                        shift_held,
-                        pending_guide_shift_acked,
+                        alt_held,
                         pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -1007,7 +1004,7 @@ fn run_daemon() -> Result<()> {
                         // own top-left can land inside content after
                         // a few iterations and would otherwise pin
                         // the wrong reference color).
-                        if !super_held {
+                        if !alt_held {
                             if let Some(rect) = held_rects.get_mut(op.rect_idx) {
                                 let lo_x = rect.rect_start.0.min(rect.rect_end.0);
                                 let hi_x = rect.rect_start.0.max(rect.rect_end.0);
@@ -1040,9 +1037,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1105,9 +1100,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1144,9 +1137,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1177,9 +1168,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1242,9 +1231,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1261,15 +1248,11 @@ fn run_daemon() -> Result<()> {
                     // pending_guide set so the user can drop several
                     // (and toggle axis via SHIFT). ESC exits.
                     if pressed {
-                        if let Some(axis) = effective_pending_axis(
-                            pending_guide,
-                            pending_guide_shift_acked,
-                            shift_held,
-                        ) {
+                        if let Some(axis) = pending_guide {
                             // Use the snapped position (matches what
                             // the user saw under the move cursor),
-                            // unless Super is held for free-place.
-                            let position = if super_held {
+                            // unless Alt is held for free-place.
+                            let position = if alt_held {
                                 match axis {
                                     GuideAxis::Horizontal => y as i32,
                                     GuideAxis::Vertical => x as i32,
@@ -1305,9 +1288,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1330,7 +1311,7 @@ fn run_daemon() -> Result<()> {
                         &mut held_rects,
                         &mut nudge_selection,
                         color_alternate,
-                        super_held,
+                        alt_held,
                     );
                     last_hud_redraw = Instant::now();
                     if let ButtonOutcome::ScreenshotPillClicked { rs, re } = outcome {
@@ -1441,9 +1422,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1473,9 +1452,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1500,16 +1477,18 @@ fn run_daemon() -> Result<()> {
                 let is_ctrl = keysym == 0xffe3 || keysym == 0xffe4;
                 let is_alt = keysym == 0xffe9 || keysym == 0xffea;
                 if is_shift || is_ctrl || is_alt || is_super {
-                    let super_was = super_held;
                     let shift_was = shift_held;
+                    let alt_was = alt_held;
                     if is_shift { shift_held = pressed; }
                     if is_ctrl { ctrl_held = pressed; }
                     if is_alt { alt_held = pressed; }
                     if is_super { super_held = pressed; }
                     // First SHIFT release after entering pending guide
                     // mode "acknowledges" the trigger keypress — from
-                    // here on, holding SHIFT means "flip the axis for
-                    // the next click."
+                    // here on, each SHIFT press toggles the pending
+                    // axis (latching). The release-after-trigger gate
+                    // keeps the keypress that started pending mode
+                    // (e.g. SHIFT+H) from immediately flipping itself.
                     if pending_guide.is_some()
                         && !pending_guide_shift_acked
                         && shift_was
@@ -1517,31 +1496,38 @@ fn run_daemon() -> Result<()> {
                     {
                         pending_guide_shift_acked = true;
                     }
+                    // Latching axis toggle: rising edge of SHIFT while
+                    // acknowledged flips the pending guide axis in
+                    // place — the user can drop a horizontal guide,
+                    // tap SHIFT, drop a vertical one, etc.
+                    let shift_pressed_edge = !shift_was && shift_held;
+                    let pending_flipped = pending_guide.is_some()
+                        && pending_guide_shift_acked
+                        && shift_pressed_edge;
+                    if pending_flipped {
+                        pending_guide = pending_guide.map(flip_axis);
+                        log::info!("guide toggled via SHIFT: now {:?}", pending_guide);
+                    }
                     let new_align = shortcut_accels
                         .crosshair
                         .map(|m| modifier_held(m, shift_held, ctrl_held, alt_held, super_held))
                         .unwrap_or(false);
                     let align_changed = new_align != align_mode;
-                    // Repaint as soon as SUPER toggles so the
+                    // Repaint as soon as ALT toggles so the
                     // momentary cursor-hide kicks in / clears without
                     // waiting for the next PointerMove. Also flip the
                     // system pointer right here, since
                     // `want_system_pointer` is otherwise only
                     // re-evaluated on pointer events.
-                    let super_changed = super_was != super_held;
-                    let shift_changed = shift_was != shift_held;
-                    // While a guide is pending and the user toggles
-                    // SHIFT, the rendered axis flips — redraw the HUD.
-                    let pending_axis_changed =
-                        pending_guide.is_some() && pending_guide_shift_acked && shift_changed;
+                    let alt_changed = alt_was != alt_held;
                     if align_changed {
                         align_mode = new_align;
                     }
-                    if (align_changed || super_changed || pending_axis_changed)
+                    if (align_changed || alt_changed || pending_flipped)
                         && !matches!(mode, InteractionMode::Idle)
                     {
                         if let Some((px_x, px_y)) = last_pointer_xy {
-                            if super_changed {
+                            if alt_changed {
                                 let cursor_px = Px::new(px_x as i32, px_y as i32);
                                 let active_handle =
                                     resizing.map(|op| op.handle).or_else(|| {
@@ -1573,7 +1559,7 @@ fn run_daemon() -> Result<()> {
                                     resizing,
                                     active_handle,
                                     context_menu.is_some(),
-                                    super_held,
+                                    alt_held,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
                                 );
@@ -1598,9 +1584,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1664,9 +1648,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1713,9 +1695,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1818,9 +1798,7 @@ fn run_daemon() -> Result<()> {
                                 &held_rects,
                                 color_alternate,
                                 align_mode,
-                                super_held,
-                                shift_held,
-                                pending_guide_shift_acked,
+                                alt_held,
                                 pre_clear_freeze,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1869,9 +1847,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1908,9 +1884,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1970,9 +1944,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2012,9 +1984,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2054,9 +2024,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2091,9 +2059,7 @@ fn run_daemon() -> Result<()> {
                                     &held_rects,
                                     color_alternate,
                                     align_mode,
-                                    super_held,
-                                    shift_held,
-                                    pending_guide_shift_acked,
+                                    alt_held,
                                     pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -2180,9 +2146,7 @@ fn run_daemon() -> Result<()> {
                             &held_rects,
                             color_alternate,
                             align_mode,
-                            super_held,
-                            shift_held,
-                            pending_guide_shift_acked,
+                            alt_held,
                             pre_clear_freeze,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2247,9 +2211,7 @@ fn run_daemon() -> Result<()> {
                                     &held_rects,
                                     color_alternate,
                                     align_mode,
-                                    super_held,
-                                    shift_held,
-                                    pending_guide_shift_acked,
+                                    alt_held,
                                     pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -2307,7 +2269,7 @@ fn run_daemon() -> Result<()> {
                         dir,
                         idx,
                         shift_held,
-                        super_held,
+                        alt_held,
                         align_mode,
                         color_alternate,
                         last_pointer_xy,
@@ -2320,7 +2282,6 @@ fn run_daemon() -> Result<()> {
                         toast_until,
                         &guides,
                         pending_guide,
-                        pending_guide_shift_acked,
                         pre_clear_freeze,
                         &stuck_measurements,
                         primary.bounds.w as i32,
@@ -2514,9 +2475,7 @@ fn run_daemon() -> Result<()> {
                                     &held_rects,
                                     color_alternate,
                                     align_mode,
-                                    super_held,
-                                    shift_held,
-                                    pending_guide_shift_acked,
+                                    alt_held,
                                     pre_clear_freeze,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -2573,9 +2532,7 @@ fn run_daemon() -> Result<()> {
                         &held_rects,
                         color_alternate,
                         align_mode,
-                        super_held,
-                        shift_held,
-                        pending_guide_shift_acked,
+                        alt_held,
                         pre_clear_freeze,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -2603,7 +2560,7 @@ fn run_daemon() -> Result<()> {
                     dir,
                     sel.rect_idx,
                     shift_held,
-                    super_held,
+                    alt_held,
                     align_mode,
                     color_alternate,
                     last_pointer_xy,
@@ -2616,7 +2573,6 @@ fn run_daemon() -> Result<()> {
                     toast_until,
                     &guides,
                     pending_guide,
-                    pending_guide_shift_acked,
                     pre_clear_freeze,
                     &stuck_measurements,
                     primary.bounds.w as i32,
@@ -2743,7 +2699,7 @@ fn refresh_frame_if_live(
 /// from settings and write them into a freshly-built `Hud`. Called
 /// at every refresh_hud branch so the live HUD reflects prefs
 /// changes the moment the daemon's IPC reload finishes.
-fn populate_hud_appearance(hud: &mut Hud, super_held: bool) {
+fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
     let s = current_settings();
     let g = s.appearance.guide_color;
     hud.guide_color = PlatColor::rgba(g.r, g.g, g.b, g.a);
@@ -2769,12 +2725,12 @@ fn populate_hud_appearance(hud: &mut Hud, super_held: bool) {
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
     };
-    // Momentary cursor-hide: holding SUPER suppresses Vernier's own
+    // Momentary cursor-hide: holding ALT suppresses Vernier's own
     // crosshair so the user can read the pixels under it when
     // measuring very small things. The system pointer hide is
     // handled separately (see `want_system_pointer` in the pointer
     // handler so the OS cursor goes away too).
-    hud.show_cursor = s.general.show_cursor && !super_held;
+    hud.show_cursor = s.general.show_cursor && !alt_held;
     hud.corner_indicator = corner_indicator;
 }
 
@@ -3390,7 +3346,7 @@ fn apply_nudge_step(
     dir: NudgeDir,
     idx: usize,
     shift_held: bool,
-    super_held: bool,
+    alt_held: bool,
     align_mode: bool,
     color_alternate: bool,
     last_pointer_xy: Option<(f64, f64)>,
@@ -3403,7 +3359,6 @@ fn apply_nudge_step(
     toast_until: Option<Instant>,
     guides: &[Guide],
     pending_guide: Option<GuideAxis>,
-    pending_guide_shift_acked: bool,
     pre_clear_freeze: bool,
     stuck_measurements: &[StuckMeasurement],
     screen_w: i32,
@@ -3452,9 +3407,7 @@ fn apply_nudge_step(
             held_rects,
             color_alternate,
             align_mode,
-            super_held,
-            shift_held,
-            pending_guide_shift_acked,
+            alt_held,
             pre_clear_freeze,
             screen_w,
             screen_h,
@@ -4397,7 +4350,7 @@ fn toggle_measurement(
         overlay.set_input_capturing(true);
         let mut hud = Hud::hover((-100.0, -100.0));
         hud.foreground = fg;
-        // `toggle_measurement` runs at mode transitions only; Super's
+        // `toggle_measurement` runs at mode transitions only; Alt's
         // momentary cursor-hide kicks in on the next PointerMove redraw.
         populate_hud_appearance(&mut hud, false);
         hud.held_rects = held_rects.to_vec();
@@ -4476,20 +4429,13 @@ fn refresh_hud(
     held_rects: &[HeldRect],
     color_alternate: bool,
     align_mode: bool,
-    super_held: bool,
-    shift_held: bool,
-    pending_guide_shift_acked: bool,
+    alt_held: bool,
     pre_clear_freeze: bool,
     screen_w: i32,
     screen_h: i32,
     resize_handle: Option<ResizeHandle>,
     context_menu: Option<&ContextMenuState>,
 ) {
-    // SHIFT held + acknowledged flips the BASE pending axis. Shadow
-    // here so every downstream check uses the effective axis without
-    // needing to thread it separately.
-    let pending_guide = effective_pending_axis(pending_guide, pending_guide_shift_acked, shift_held);
-
     let fg = hud_foreground(color_alternate);
 
     // 1st ESC has visually frozen the overlay: content stays but the
@@ -4500,7 +4446,7 @@ fn refresh_hud(
         let mut hud = Hud::hover((-1000.0, -1000.0));
         hud.kind = HudKind::None;
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud, super_held);
+        populate_hud_appearance(&mut hud, alt_held);
         hud.toast = toast.cloned();
         hud.guides = guides.to_vec();
         hud.stuck_measurements = stuck_measurements.to_vec();
@@ -4521,10 +4467,10 @@ fn refresh_hud(
     };
     let cursor_px = Px::new(x as i32, y as i32);
     // For pending guide placement, snap the position to the nearest
-    // detected pixel edge on the relevant axis — unless Super is
+    // detected pixel edge on the relevant axis — unless Alt is
     // held, which falls back to free placement at the cursor.
     let (pending_x, pending_y) = if let Some(axis) = pending_guide {
-        if super_held {
+        if alt_held {
             (x, y)
         } else {
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
@@ -4634,17 +4580,17 @@ fn refresh_hud(
         let mut hud = Hud::hover((x, y));
         hud.kind = HudKind::None;
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud, super_held);
+        populate_hud_appearance(&mut hud, alt_held);
         hud.toast = toast.cloned();
         hud.guides = composed_guides;
         hud.stuck_measurements = composed_stuck;
         hud.held_rects = composed_rects;
         hud.cursor_in_rect = cursor_in_rect;
         // Resize cursor matching the axis the new guide will move
-        // along. Suppressed when SUPER is held so the user can read
+        // along. Suppressed when ALT is held so the user can read
         // pixels under the cursor (matches the cursor-hide in Hover
         // / Held modes).
-        if !super_held {
+        if !alt_held {
             hud.move_cursor_at = Some((pending_x, pending_y));
             hud.cursor_kind = match axis {
                 GuideAxis::Horizontal => CursorKind::ResizeNS,
@@ -4665,7 +4611,7 @@ fn refresh_hud(
                 let mut hud = Hud::hover((x, y));
                 hud.kind = HudKind::None;
                 hud.foreground = fg;
-                populate_hud_appearance(&mut hud, super_held);
+                populate_hud_appearance(&mut hud, alt_held);
                 hud.toast = toast.cloned();
                 hud.guides = composed_guides;
                 hud.stuck_measurements = composed_stuck;
@@ -4689,7 +4635,7 @@ fn refresh_hud(
                 ..Hud::hover((x, y))
             };
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud, super_held);
+            populate_hud_appearance(&mut hud, alt_held);
             hud.toast = toast.cloned();
             hud.guides = composed_guides.clone();
             hud.stuck_measurements = composed_stuck.clone();
@@ -4711,12 +4657,12 @@ fn refresh_hud(
         InteractionMode::Drawing { start, .. } => {
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud, super_held);
+            populate_hud_appearance(&mut hud, alt_held);
             if has_drag_distance(start.pixel, cursor_px) {
                 let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
                 // Snap the moving end of the rect to nearby guides on
-                // each axis. Super disables snap for free placement.
-                let (cx, cy) = if super_held {
+                // each axis. Alt disables snap for free placement.
+                let (cx, cy) = if alt_held {
                     (x, y)
                 } else {
                     (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
@@ -4750,19 +4696,6 @@ fn flip_axis(axis: GuideAxis) -> GuideAxis {
         GuideAxis::Horizontal => GuideAxis::Vertical,
         GuideAxis::Vertical => GuideAxis::Horizontal,
     }
-}
-
-/// Resolve the BASE pending axis (what the user originally chose) to
-/// the EFFECTIVE axis for the next click. SHIFT held + acknowledged →
-/// flipped; otherwise base. The acknowledgement gate keeps the
-/// trigger press (typically `SHIFT+H` / `SHIFT+V`) from immediately
-/// flipping itself — the user has to release SHIFT once first.
-fn effective_pending_axis(
-    base: Option<GuideAxis>,
-    shift_acked: bool,
-    shift_held: bool,
-) -> Option<GuideAxis> {
-    base.map(|b| if shift_acked && shift_held { flip_axis(b) } else { b })
 }
 
 fn compose_guides(
@@ -5193,7 +5126,7 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// Whether the compositor should draw its theme pointer over the
 /// overlay. Returns `true` when the cursor sits on an interactive
 /// affordance (held rect, guide badge, stuck pill, menu) and `false`
-/// when Vernier draws its own custom cursor instead. Holding SUPER
+/// when Vernier draws its own custom cursor instead. Holding ALT
 /// also returns `false` so the OS pointer hides momentarily for
 /// precise reads (paired with `populate_hud_appearance` suppressing
 /// Vernier's own crosshair).
@@ -5207,14 +5140,14 @@ fn want_system_pointer(
     resizing: Option<ResizeOp>,
     resize_handle: Option<ResizeHandle>,
     menu_open: bool,
-    super_held: bool,
+    alt_held: bool,
     screen_w: i32,
     screen_h: i32,
 ) -> bool {
-    // Holding SUPER hides everything cursor-related so the user can
+    // Holding ALT hides everything cursor-related so the user can
     // read the pixels under their cursor. The menu still gets the
     // pointer (the row hover otherwise becomes invisible).
-    if super_held && !menu_open {
+    if alt_held && !menu_open {
         return false;
     }
     // The context menu always wants the system arrow, even when it
@@ -5255,7 +5188,7 @@ fn apply_resize(
     op: &ResizeOp,
     cursor: (f64, f64),
     guides: &[Guide],
-    super_held: bool,
+    alt_held: bool,
 ) {
     let initial_lo_x = op.initial_start.0.min(op.initial_end.0);
     let initial_hi_x = op.initial_start.0.max(op.initial_end.0);
@@ -5291,8 +5224,8 @@ fn apply_resize(
         }
     }
     // Snap the moving edges to nearby guides — corner handles move
-    // both axes, side handles only move one. Super disables snap.
-    if !super_held {
+    // both axes, side handles only move one. Alt disables snap.
+    if !alt_held {
         match op.handle {
             Top | TopLeft | TopRight => lo_y = snap_y_to_guides(lo_y, guides),
             Bottom | BottomLeft | BottomRight => hi_y = snap_y_to_guides(hi_y, guides),
@@ -5403,7 +5336,7 @@ fn handle_pointer_button(
     held_rects: &mut Vec<HeldRect>,
     nudge_selection: &mut Option<NudgeSelection>,
     color_alternate: bool,
-    super_held: bool,
+    alt_held: bool,
 ) -> ButtonOutcome {
     let fg = hud_foreground(color_alternate);
     let cursor_px = Px::new(x as i32, y as i32);
@@ -5458,7 +5391,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud, super_held);
+            populate_hud_appearance(&mut hud, alt_held);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -5473,7 +5406,7 @@ fn handle_pointer_button(
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
-            populate_hud_appearance(&mut hud, super_held);
+            populate_hud_appearance(&mut hud, alt_held);
             hud.kind = HudKind::Hover { cursor: (x, y), edges };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
@@ -5484,8 +5417,8 @@ fn handle_pointer_button(
         let raw_start = (start.pixel.x as f64, start.pixel.y as f64);
         // Snap the moving end of the rect to nearby guides on release
         // so the committed rect aligns with whatever guide the user
-        // saw it snap to mid-drag. Super disables snap.
-        let raw_end = if super_held {
+        // saw it snap to mid-drag. Alt disables snap.
+        let raw_end = if alt_held {
             (x, y)
         } else {
             (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
@@ -5523,7 +5456,7 @@ fn handle_pointer_button(
         *mode = InteractionMode::Hover { cursor: cursor_px };
         let mut hud = Hud::hover((x, y));
         hud.foreground = fg;
-        populate_hud_appearance(&mut hud, super_held);
+        populate_hud_appearance(&mut hud, alt_held);
         hud.kind = HudKind::Hover {
             cursor: (x, y),
             edges: [None; 4],
