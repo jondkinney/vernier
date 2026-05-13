@@ -243,8 +243,9 @@ fn run_ksni_tray(
     Ok(())
 }
 
-/// SVG sources for the app icon (full color) and the tray icon
-/// (monochrome, `currentColor`-based, recolored to white at render
-/// time). Embedded at compile time so the binary is self-contained.
 // Icon rasterizers moved to `crate::icon` so they remain available
 // on non-Linux platforms (this whole file is cfg-gated to Linux).
+// SVG sources for the app icon (full color) and the tray icon
+// (monochrome, `currentColor`-based, recolored to white at render
+// time) live there as APP_ICON_SVG / TRAY_ICON_SVG, embedded at
+// compile time so the binary stays self-contained.
