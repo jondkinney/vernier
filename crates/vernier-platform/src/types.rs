@@ -21,7 +21,7 @@ pub type Result<T> = std::result::Result<T, PlatformError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct MonitorId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -41,7 +41,7 @@ pub struct Point {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -256,7 +256,7 @@ impl HudMeasurementFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HudRounding {
     /// Logical (point) pixels, fractional values allowed to one
     /// decimal place.
@@ -298,7 +298,7 @@ pub struct HudContextMenuItem {
     pub divider_after: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HudContextMenuIcon {
     GuideH,
     GuideV,
@@ -382,13 +382,13 @@ pub struct Guide {
     pub hovered: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GuideAxis {
     Horizontal,
     Vertical,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CursorKind {
     /// 4-direction arrows (used while placing or dragging a guide).
     Move,
@@ -481,7 +481,7 @@ pub struct HudEdge {
     pub distance_px: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HudAxis {
     Left,
     Right,

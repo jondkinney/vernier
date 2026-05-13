@@ -198,7 +198,135 @@ fn push_text_in_box(
 /// Render a [`Hud`] into a wl_shm Abgr8888 buffer at the given buffer
 /// dimensions and HiDPI scale factor. Cursor / edge coords are in
 /// surface (logical) pixels and get multiplied by `scale` internally.
+///
+/// One-shot convenience that fills `hud.background` then composites
+/// the static + dynamic layers into a single buffer. Backends that
+/// want to skip the static rasterize on hot paths call
+/// [`render_static_into`] / [`render_dynamic_into`] directly and key
+/// the static layer off [`static_hash`].
 pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+    fill_background(canvas, hud);
+    render_static_layer(canvas, buf_w, buf_h, scale, hud);
+    render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
+}
+
+/// Rasterize only the layer that's invariant under cursor movement —
+/// held rects, stuck measurements, guides — into a fresh transparent
+/// canvas. Pair with [`static_hash`] so the backend can skip this
+/// call entirely when the static-affecting inputs haven't changed.
+pub(crate) fn render_static_into(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
+    canvas.fill(0);
+    render_static_layer(canvas, buf_w, buf_h, scale, hud);
+}
+
+/// Rasterize only the cursor-driven layer — live drag rect / Held
+/// overlay, crosshair, move/resize cursor, toast, context menu,
+/// corner indicator — into a fresh transparent canvas. Re-run every
+/// time `set_hud` fires; the backend composites this on top of the
+/// cached static buffer.
+pub(crate) fn render_dynamic_into(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
+    canvas.fill(0);
+    render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
+}
+
+/// Digest of the [`Hud`] fields that affect the static layer. A change
+/// in the digest is the signal to re-rasterize the static cache; a
+/// match means the cached buffer is still valid. Hash collisions only
+/// cause a spurious rebuild, never a stale image, so we use `DefaultHasher`
+/// without worrying about cryptographic strength.
+///
+/// Keep this in sync with [`render_static_layer`]: any new
+/// static-affecting input has to be fed into both functions.
+pub(crate) fn static_hash(hud: &Hud) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+
+    // Background tint is painted by the overlay backend (CALayer fill
+    // on macOS, parent surface on Wayland), not by the static stroke
+    // pass — so it doesn't belong in this digest. Same for hud.foreground,
+    // which is only consumed by the dynamic (live drag / crosshair)
+    // path.
+
+    hud.held_rects.len().hash(&mut h);
+    for r in &hud.held_rects {
+        hash_f64(&mut h, r.rect_start.0);
+        hash_f64(&mut h, r.rect_start.1);
+        hash_f64(&mut h, r.rect_end.0);
+        hash_f64(&mut h, r.rect_end.1);
+        r.camera_armed.hash(&mut h);
+        r.color_alternate.hash(&mut h);
+    }
+
+    hud.guides.len().hash(&mut h);
+    for g in &hud.guides {
+        // Guide has no floats so it could `derive(Hash)`, but keeping
+        // the hashing explicit here matches the rest of the function
+        // and avoids the per-type `Hash` derive boilerplate.
+        g.axis.hash(&mut h);
+        g.position.hash(&mut h);
+        g.color_alternate.hash(&mut h);
+        g.hovered.hash(&mut h);
+    }
+
+    hud.stuck_measurements.len().hash(&mut h);
+    for m in &hud.stuck_measurements {
+        m.axis.hash(&mut h);
+        hash_f64(&mut h, m.at);
+        hash_f64(&mut h, m.start);
+        hash_f64(&mut h, m.end);
+        hash_f64(&mut h, m.pill_offset.0);
+        hash_f64(&mut h, m.pill_offset.1);
+        m.color_alternate.hash(&mut h);
+        m.hovered.hash(&mut h);
+    }
+
+    hud.align_mode.hash(&mut h);
+    hud.guide_color.hash(&mut h);
+    hud.alternative_guide_color.hash(&mut h);
+    hud.primary_fg.hash(&mut h);
+    hud.alternate_fg.hash(&mut h);
+
+    let fmt = &hud.measurement_format;
+    fmt.unit_suffix.hash(&mut h);
+    fmt.rounding.hash(&mut h);
+    hash_f64(&mut h, fmt.scale_factor);
+    fmt.wh_indicators.hash(&mut h);
+    fmt.aspect_in_area.hash(&mut h);
+    // AspectMode lives in vernier-core without a Hash derive; hash by
+    // discriminant so we don't need to touch that crate for an enum of
+    // unit variants.
+    std::mem::discriminant(&fmt.aspect_mode).hash(&mut h);
+    hash_f64(&mut h, fmt.dimension_divisor);
+
+    h.finish()
+}
+
+/// Quantize an `f64` to its bit pattern and feed it to the hasher.
+/// Daemon-side layout produces the same bit pattern frame-to-frame for
+/// an unchanging logical value, so `to_bits` is enough — no need for
+/// rounding-based quantization.
+fn hash_f64<H: std::hash::Hasher>(h: &mut H, v: f64) {
+    h.write_u64(v.to_bits());
+}
+
+/// Fill `canvas` with `hud.background` as premultiplied RGBA. Used by
+/// [`render_hud_into`] before the static + dynamic layers paint on
+/// top. The per-layer entry points clear to transparent instead so
+/// backend composition starts with two transparent layers.
+fn fill_background(canvas: &mut [u8], hud: &Hud) {
     let bg = rgba8888_premul(hud.background);
     if bg == [0, 0, 0, 0] {
         canvas.fill(0);
@@ -207,11 +335,21 @@ pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: 
             chunk.copy_from_slice(&bg);
         }
     }
+}
 
+/// Static-layer strokes + pill text. Mutates `canvas` in place,
+/// expecting an existing background (transparent or tint-filled). Does
+/// NOT clear the canvas — the caller does that.
+fn render_static_layer(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
     // tiny-skia phase scoped so its &mut borrow on canvas is released
-    // before we rasterize glyphs into it.
-    let pills = render_hud_strokes(canvas, buf_w, buf_h, scale, hud);
-
+    // before the glyph rasterizer writes into it.
+    let pills = render_static_strokes(canvas, buf_w, buf_h, scale, hud);
     if !pills.is_empty() {
         if let Some(font) = hud_font() {
             for layout in &pills {
@@ -221,7 +359,29 @@ pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: 
     }
 }
 
-fn render_hud_strokes(
+/// Dynamic-layer strokes + pill text. Same canvas contract as
+/// [`render_static_layer`].
+fn render_dynamic_layer(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
+    let pills = render_dynamic_strokes(canvas, buf_w, buf_h, scale, hud);
+    if !pills.is_empty() {
+        if let Some(font) = hud_font() {
+            for layout in &pills {
+                render_pill_text(canvas, buf_w, buf_h, font, layout);
+            }
+        }
+    }
+}
+
+/// Rasterize the static stroke pass — held rects, stuck measurements,
+/// and guides — and return the corresponding pill layouts so the
+/// caller can run the glyph pass.
+fn render_static_strokes(
     canvas: &mut [u8],
     buf_w: u32,
     buf_h: u32,
@@ -233,25 +393,10 @@ fn render_hud_strokes(
         return Vec::new();
     };
 
-    let fg = hud.foreground;
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
-    // Anti-aliasing is the bulk of tiny-skia's per-frame cost. Crisp
-    // 1px lines are also closer to a clean minimal aesthetic.
-    paint.anti_alias = false;
-    // Axis lines: 1 LOGICAL pixel = `scale` buffer pixels.
     let stroke = Stroke {
         // Hard 2 physical pixels regardless of buffer scale — narrow
         // enough not to obscure the pixel boundary being measured,
         // wide enough to stay legible against busy backgrounds.
-        width: 2.0,
-        ..Default::default()
-    };
-    // Tick caps: ~2 LOGICAL pixels so they read as filled bars over the
-    // thinner axis lines. Hard 2
-    // physical pixels — distinct enough from the 1 px axis lines to
-    // read as caps without being chunky.
-    let tick_stroke = Stroke {
         width: 2.0,
         ..Default::default()
     };
@@ -268,8 +413,8 @@ fn render_hud_strokes(
         (buf_h as f32 / scale as f32) as f64,
     );
 
-    // Held rects are additive — drawn first so the live HUD sits on
-    // top. Each accumulated drag stays visible.
+    // Held rects are additive — drawn first. Each accumulated drag
+    // stays visible.
     for (i, rect) in hud.held_rects.iter().enumerate() {
         let dim_bbox = pill_layout.rect_dim_bboxes.get(i).copied();
         let rect_fg = if rect.color_alternate {
@@ -297,9 +442,82 @@ fn render_hud_strokes(
         );
     }
 
-    // Live drag rect, BEFORE the cursor — the cursor (arrow or
-    // crosshair) is rendered last so it sits on top of every other
-    // overlay element including hover X badges.
+    if !hud.stuck_measurements.is_empty() {
+        draw_stuck_measurements(
+            &mut pixmap,
+            &mut pills,
+            &hud.stuck_measurements,
+            &pill_layout.stuck_bboxes,
+            hud.primary_fg,
+            hud.alternate_fg,
+            &hud.measurement_format,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
+
+    if !hud.guides.is_empty() {
+        // Cursor is needed by `draw_guides` only as a comment-anchor
+        // hint; the function ignores it today. Pass it through so the
+        // signature stays unchanged if hovered-X behavior moves back
+        // to the cursor later.
+        let cursor = match &hud.kind {
+            HudKind::Hover { cursor, .. } => Some(*cursor),
+            HudKind::Drawing { cursor, .. } => Some(*cursor),
+            HudKind::Held { cursor, .. } => Some(*cursor),
+            HudKind::None => None,
+        };
+        draw_guides(
+            &mut pixmap,
+            &mut pills,
+            &hud.guides,
+            cursor,
+            hud.align_mode,
+            hud.guide_color,
+            hud.alternative_guide_color,
+            &hud.measurement_format,
+            buf_w as f32,
+            buf_h as f32,
+            scale as f32,
+        );
+    }
+
+    pills
+}
+
+/// Rasterize the dynamic stroke pass — live drag rect, Held overlay,
+/// crosshair, custom cursors, toast, context menu, corner indicator —
+/// and return the corresponding pill layouts.
+fn render_dynamic_strokes(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) -> Vec<PillLayout> {
+    use tiny_skia::*;
+    let Some(mut pixmap) = PixmapMut::from_bytes(canvas, buf_w, buf_h) else {
+        return Vec::new();
+    };
+
+    let fg = hud.foreground;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
+    paint.anti_alias = false;
+    let stroke = Stroke {
+        width: 2.0,
+        ..Default::default()
+    };
+    let tick_stroke = Stroke {
+        width: 2.0,
+        ..Default::default()
+    };
+
+    let mut pills: Vec<PillLayout> = Vec::new();
+
+    // Live drag rect — drawn before the cursor so the crosshair sits
+    // on top.
     if let HudKind::Drawing { start, cursor } = &hud.kind {
         draw_area_rect(
             &mut pixmap,
@@ -340,52 +558,13 @@ fn render_hud_strokes(
             None,
         );
     }
-    if !hud.stuck_measurements.is_empty() {
-        draw_stuck_measurements(
-            &mut pixmap,
-            &mut pills,
-            &hud.stuck_measurements,
-            &pill_layout.stuck_bboxes,
-            hud.primary_fg,
-            hud.alternate_fg,
-            &hud.measurement_format,
-            buf_w as f32,
-            buf_h as f32,
-            scale as f32,
-        );
-    }
-    if !hud.guides.is_empty() {
-        // Cursor extracted from kind so the guide-hover X badge can
-        // render at the actual cursor position on the line.
-        let cursor = match &hud.kind {
-            HudKind::Hover { cursor, .. } => Some(*cursor),
-            HudKind::Drawing { cursor, .. } => Some(*cursor),
-            HudKind::Held { cursor, .. } => Some(*cursor),
-            HudKind::None => None,
-        };
-        draw_guides(
-            &mut pixmap,
-            &mut pills,
-            &hud.guides,
-            cursor,
-            hud.align_mode,
-            hud.guide_color,
-            hud.alternative_guide_color,
-            &hud.measurement_format,
-            buf_w as f32,
-            buf_h as f32,
-            scale as f32,
-        );
-    }
-    // Cursor crosshair / arrow goes on top of EVERYTHING so the
-    // user's pointer indicator never disappears behind a pill, X
-    // badge, or guide. Toast comes after so it sits above the
-    // cursor too — fine, toast is a transient status message and
-    // the cursor isn't the focus when it's up.
-    // The live measurement crosshair (axis lines + tick caps + W×H
-    // pill) always renders — that's the actual measurement, not the
-    // cursor. Inside `draw_hover_indicators`, the white-outlined `+`
-    // marker (the cursor itself) is gated by `hud.show_cursor`.
+
+    // Cursor crosshair / arrow goes on top of every other dynamic
+    // primitive so the user's pointer indicator never disappears
+    // behind a pill. The live measurement crosshair (axis lines + tick
+    // caps + W×H pill) always renders — that's the actual measurement,
+    // not the cursor. Inside `draw_hover_indicators`, the white-outlined
+    // `+` marker (the cursor itself) is gated by `hud.show_cursor`.
     if let HudKind::Hover { cursor, edges } = &hud.kind {
         if hud.align_mode {
             draw_hover_indicators(
@@ -405,8 +584,7 @@ fn render_hud_strokes(
                 hud.show_cursor,
             );
         } else if hud.move_cursor_at.is_some() {
-            // The dedicated draw_move_cursor block at the end of
-            // this function paints it.
+            // The dedicated draw_move_cursor block below paints it.
         } else if hud.cursor_in_rect {
             // System cursor is shown via wp_cursor_shape from main.rs
             // when cursor_in_rect is true — no custom drawing here.
@@ -514,6 +692,7 @@ fn render_hud_strokes(
             scale as f32,
         );
     }
+
     pills
 }
 
@@ -2257,4 +2436,374 @@ pub(crate) fn rgba8888_premul(c: Color) -> [u8; 4] {
     let g = (c.g as u16 * a / 255) as u8;
     let b = (c.b as u16 * a / 255) as u8;
     [r, g, b, c.a]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Guide, GuideAxis, HeldRect, Hud, HudEdge, HudKind, HudMeasurementFormat, HudToast,
+        StuckMeasurement,
+    };
+
+    /// Static-heavy fixture WITHOUT a crosshair. Held rect, guide, and
+    /// stuck measurement live in the upper portion; toast + corner
+    /// indicator live far away in the dynamic layer. Designed so no
+    /// pixel is painted by BOTH a static and a dynamic stroke — the
+    /// composite path then matches the single-pass render byte-for-byte
+    /// even though `composite_glyph` and tiny-skia's `draw_pixmap` use
+    /// slightly different SrcOver rounding.
+    fn fixture_no_overlap() -> Hud {
+        let mut hud = Hud::hover((0.0, 0.0));
+        // No crosshair → no full-surface axis lines that would touch
+        // both layers' painted regions.
+        hud.kind = HudKind::None;
+        hud.held_rects.push(HeldRect {
+            rect_start: (10.0, 10.0),
+            rect_end: (60.0, 60.0),
+            camera_armed: false,
+            color_alternate: false,
+        });
+        hud.guides.push(Guide {
+            axis: GuideAxis::Horizontal,
+            position: 80,
+            color_alternate: false,
+            hovered: false,
+        });
+        hud.stuck_measurements.push(StuckMeasurement {
+            axis: GuideAxis::Horizontal,
+            at: 110.0,
+            start: 10.0,
+            end: 90.0,
+            pill_offset: (0.0, 0.0),
+            color_alternate: false,
+            hovered: false,
+        });
+        hud.toast = Some(HudToast { text: "ok".into() });
+        hud.corner_indicator = Some("F".into());
+        hud
+    }
+
+    /// Wider fixture with a live crosshair whose axis lines DO sweep
+    /// across the static guide. Used to catch catastrophic drift
+    /// (e.g. a stroke disappearing from a layer would put hundreds of
+    /// pixels off), while tolerating a handful of 1-ULP rounding
+    /// differences at stroke intersections — `composite_glyph`'s
+    /// integer SrcOver and tiny-skia's float SrcOver round differently
+    /// in the last byte.
+    fn fixture_with_crosshair() -> Hud {
+        let mut hud = Hud::hover((180.0, 180.0));
+        hud.kind = HudKind::Hover {
+            cursor: (180.0, 180.0),
+            edges: [None; 4],
+        };
+        hud.held_rects.push(HeldRect {
+            rect_start: (10.0, 10.0),
+            rect_end: (60.0, 60.0),
+            camera_armed: false,
+            color_alternate: false,
+        });
+        hud.guides.push(Guide {
+            axis: GuideAxis::Vertical,
+            position: 100,
+            color_alternate: false,
+            hovered: false,
+        });
+        hud.stuck_measurements.push(StuckMeasurement {
+            axis: GuideAxis::Horizontal,
+            at: 80.0,
+            start: 10.0,
+            end: 90.0,
+            pill_offset: (0.0, 0.0),
+            color_alternate: false,
+            hovered: false,
+        });
+        hud
+    }
+
+    /// Composite `static_buf` then `dynamic_buf` onto a fresh
+    /// background-tinted pixmap and return the resulting bytes. Uses
+    /// tiny-skia's `draw_pixmap` so the SrcOver math matches the
+    /// stroke pipeline.
+    fn compose_layers(hud: &Hud, w: u32, h: u32, scale: u32) -> Vec<u8> {
+        use tiny_skia::{IntSize, Pixmap, PixmapPaint, Transform};
+        let mut sta = vec![0u8; (w * h * 4) as usize];
+        render_static_into(&mut sta, w, h, scale, hud);
+        let mut dyn_ = vec![0u8; (w * h * 4) as usize];
+        render_dynamic_into(&mut dyn_, w, h, scale, hud);
+
+        let size = IntSize::from_wh(w, h).unwrap();
+        let sta_pix = Pixmap::from_vec(sta, size).unwrap();
+        let dyn_pix = Pixmap::from_vec(dyn_, size).unwrap();
+        let mut composed = Pixmap::new(w, h).unwrap();
+        composed
+            .data_mut()
+            .chunks_exact_mut(4)
+            .for_each(|c| c.copy_from_slice(&rgba8888_premul(hud.background)));
+        composed.draw_pixmap(
+            0,
+            0,
+            sta_pix.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        composed.draw_pixmap(
+            0,
+            0,
+            dyn_pix.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        composed.data().to_vec()
+    }
+
+    fn diff_pixels(a: &[u8], b: &[u8]) -> usize {
+        a.chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(x, y)| x != y)
+            .count()
+    }
+
+    /// Byte-exact: two-buffer composite produces the same pixels as
+    /// the single-buffer render when no pixel is painted by both
+    /// layers. This is the strictest signal the split is correct —
+    /// any draw call leaking between layers would change the output.
+    #[test]
+    fn split_matches_single_pass_byte_for_byte() {
+        let (w, h, scale) = (240u32, 240u32, 1u32);
+        let hud = fixture_no_overlap();
+        let mut all = vec![0u8; (w * h * 4) as usize];
+        render_hud_into(&mut all, w, h, scale, &hud);
+        let composed = compose_layers(&hud, w, h, scale);
+        assert_eq!(
+            all, composed,
+            "no-overlap split composite must match single-pass byte-for-byte"
+        );
+    }
+
+    /// Looser bound: when static and dynamic strokes share pixels at
+    /// the cursor crosshair, integer-rounding noise in
+    /// `composite_glyph` vs tiny-skia leaves a handful of 1-ULP-off
+    /// pixels (~2 in the standard fixture). Catches any change that
+    /// would corrupt the composite at scale — a removed stroke or
+    /// glyph would be thousands of bad pixels, not single digits.
+    #[test]
+    fn split_matches_single_pass_with_crosshair_overlap() {
+        let (w, h, scale) = (240u32, 240u32, 1u32);
+        let hud = fixture_with_crosshair();
+        let mut all = vec![0u8; (w * h * 4) as usize];
+        render_hud_into(&mut all, w, h, scale, &hud);
+        let composed = compose_layers(&hud, w, h, scale);
+        let diffs = diff_pixels(&all, &composed);
+        // Empirically 2 pixels at the guide × crosshair intersection.
+        // Bump the bound if a future refactor adds another overlap;
+        // catch a serious regression if the count balloons.
+        assert!(
+            diffs <= 16,
+            "overlapping composite drifted from single-pass by {diffs} pixels; expected ≤ 16"
+        );
+    }
+
+    /// Hash must be stable across mutations to dynamic-only fields.
+    /// If it isn't, the static cache invalidates on every cursor
+    /// move, defeating the whole optimization.
+    #[test]
+    fn static_hash_ignores_dynamic_fields() {
+        let hud = fixture_with_crosshair();
+        let base = static_hash(&hud);
+
+        let mut moved = hud.clone();
+        moved.kind = HudKind::Hover {
+            cursor: (50.0, 50.0),
+            edges: [None; 4],
+        };
+        assert_eq!(static_hash(&moved), base, "cursor move changed static hash");
+
+        let mut toasted = hud.clone();
+        toasted.toast = Some(HudToast { text: "hi".into() });
+        assert_eq!(
+            static_hash(&toasted),
+            base,
+            "toast set changed static hash"
+        );
+
+        let mut menu_open = hud.clone();
+        menu_open.context_menu = Some(crate::HudContextMenu {
+            origin: (10.0, 10.0),
+            width: 200.0,
+            items: vec![],
+            hovered: None,
+        });
+        assert_eq!(
+            static_hash(&menu_open),
+            base,
+            "context menu open changed static hash"
+        );
+
+        let mut corner = hud.clone();
+        corner.corner_indicator = Some("F · 200%".into());
+        assert_eq!(
+            static_hash(&corner),
+            base,
+            "corner indicator changed static hash"
+        );
+
+        let mut shown = hud.clone();
+        shown.show_cursor = !shown.show_cursor;
+        assert_eq!(
+            static_hash(&shown),
+            base,
+            "show_cursor toggle changed static hash"
+        );
+
+        let mut foreground = hud.clone();
+        foreground.foreground = Color::rgba(1, 2, 3, 4);
+        assert_eq!(
+            static_hash(&foreground),
+            base,
+            "foreground change leaked into static hash"
+        );
+
+        let mut bg = hud.clone();
+        bg.background = Color::rgba(9, 9, 9, 255);
+        assert_eq!(
+            static_hash(&bg),
+            base,
+            "background change leaked into static hash"
+        );
+
+        let mut held_kind = hud.clone();
+        held_kind.kind = HudKind::Held {
+            rect_start: (1.0, 2.0),
+            rect_end: (3.0, 4.0),
+            cursor: (5.0, 6.0),
+            edges: [Some(HudEdge {
+                axis: crate::HudAxis::Left,
+                position: (5.0, 5.0),
+                distance_px: 10,
+            }), None, None, None],
+            camera_armed: true,
+            cursor_in_rect: false,
+        };
+        assert_eq!(
+            static_hash(&held_kind),
+            base,
+            "HudKind::Held change leaked into static hash"
+        );
+    }
+
+    /// Hash must change when any static-affecting field changes; if
+    /// it doesn't, the backend reuses a stale cache and the held /
+    /// stuck / guide draws disappear.
+    #[test]
+    fn static_hash_tracks_static_fields() {
+        let hud = fixture_with_crosshair();
+        let base = static_hash(&hud);
+
+        let mut more_rects = hud.clone();
+        more_rects.held_rects.push(HeldRect {
+            rect_start: (70.0, 70.0),
+            rect_end: (80.0, 80.0),
+            camera_armed: false,
+            color_alternate: false,
+        });
+        assert_ne!(
+            static_hash(&more_rects),
+            base,
+            "adding a held rect must invalidate"
+        );
+
+        let mut moved_rect = hud.clone();
+        moved_rect.held_rects[0].rect_start.0 += 1.0;
+        assert_ne!(
+            static_hash(&moved_rect),
+            base,
+            "moving a held rect must invalidate"
+        );
+
+        let mut more_guides = hud.clone();
+        more_guides.guides.push(Guide {
+            axis: GuideAxis::Horizontal,
+            position: 120,
+            color_alternate: false,
+            hovered: false,
+        });
+        assert_ne!(
+            static_hash(&more_guides),
+            base,
+            "adding a guide must invalidate"
+        );
+
+        let mut more_stuck = hud.clone();
+        more_stuck.stuck_measurements.push(StuckMeasurement {
+            axis: GuideAxis::Vertical,
+            at: 150.0,
+            start: 10.0,
+            end: 200.0,
+            pill_offset: (0.0, 0.0),
+            color_alternate: false,
+            hovered: false,
+        });
+        assert_ne!(
+            static_hash(&more_stuck),
+            base,
+            "adding a stuck must invalidate"
+        );
+
+        let mut align = hud.clone();
+        align.align_mode = !align.align_mode;
+        assert_ne!(
+            static_hash(&align),
+            base,
+            "align_mode toggle must invalidate"
+        );
+
+        let mut units = hud.clone();
+        units.measurement_format = HudMeasurementFormat {
+            unit_suffix: "pt".into(),
+            ..hud.measurement_format.clone()
+        };
+        assert_ne!(
+            static_hash(&units),
+            base,
+            "unit suffix change must invalidate"
+        );
+
+        let mut scale = hud.clone();
+        scale.measurement_format.scale_factor += 1.0;
+        assert_ne!(
+            static_hash(&scale),
+            base,
+            "scale_factor change must invalidate"
+        );
+
+        let mut primary = hud.clone();
+        primary.primary_fg = Color::rgba(1, 1, 1, 255);
+        assert_ne!(
+            static_hash(&primary),
+            base,
+            "primary_fg change must invalidate"
+        );
+
+        let mut guide_color = hud.clone();
+        guide_color.guide_color = Color::rgba(2, 2, 2, 255);
+        assert_ne!(
+            static_hash(&guide_color),
+            base,
+            "guide_color change must invalidate"
+        );
+    }
+
+    /// A static_hash that varies frame-to-frame for the SAME inputs
+    /// would never let the cache hit. The daemon clones the Hud
+    /// before sending; clones must produce the same digest.
+    #[test]
+    fn static_hash_stable_under_clone() {
+        let hud = fixture_with_crosshair();
+        let a = static_hash(&hud);
+        let b = static_hash(&hud.clone());
+        assert_eq!(a, b);
+    }
 }
