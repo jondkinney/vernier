@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>vernier</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jondkinney.vernier</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Vernier</string>
+    <key>CFBundleDisplayName</key>
+    <string>Vernier</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <!-- Accessory app: no Dock icon, no menu bar. The daemon runs in
+         the background as a tray utility; the prefs window comes up
+         as a separately-spawned subprocess that promotes itself to a
+         foreground application via TransformProcessType so it can take
+         key focus despite the parent being .accessory. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <!-- Permission strings shown in the system prompts. macOS uses
+         these the first time the corresponding capability is touched
+         (CGWindowListCreateImage for screen capture; NSAppleScript /
+         AppleEvent dispatch for handing off to external apps). -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Vernier captures the screen to detect edges and take measurement screenshots.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Vernier coordinates with installed screenshot apps to hand off captured images for annotation.</string>
+</dict>
+</plist>
