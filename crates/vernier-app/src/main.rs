@@ -3929,12 +3929,18 @@ fn parse_modifier_only(s: &str) -> Option<vernier_platform::Modifiers> {
     }
 }
 
+/// True when *exactly* the modifier set `m` is held — no extras. Used
+/// for sticky-mode triggers like the Shift-held alignment crosshair,
+/// where the user pressing Cmd+Shift+4 (macOS screenshot) shouldn't
+/// also trip the alignment lines. A loose "is Shift down?" check
+/// would fire on every system shortcut that happens to include Shift.
 fn modifier_held(m: vernier_platform::Modifiers, shift: bool, ctrl: bool, alt: bool, sup: bool) -> bool {
     use vernier_platform::Modifiers;
-    (m == Modifiers::SHIFT && shift)
-        || (m == Modifiers::CTRL && ctrl)
-        || (m == Modifiers::ALT && alt)
-        || (m == Modifiers::META && sup)
+    let want_shift = m == Modifiers::SHIFT;
+    let want_ctrl = m == Modifiers::CTRL;
+    let want_alt = m == Modifiers::ALT;
+    let want_sup = m == Modifiers::META;
+    shift == want_shift && ctrl == want_ctrl && alt == want_alt && sup == want_sup
 }
 
 #[derive(Debug, Clone, Copy)]
