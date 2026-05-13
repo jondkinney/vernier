@@ -10,16 +10,16 @@
 //! * Forwards mouse / keyboard events into the daemon's
 //!   [`PlatformEvent`] channel.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
 
 use crate::{
@@ -92,7 +92,9 @@ pub(crate) fn create(monitor: MonitorId) -> Result<OverlayHandle> {
             monitor,
             tint: RefCell::new(Color::TRANSPARENT),
             hud: RefCell::new(None),
-            hud_bitmap: RefCell::new(None),
+            static_hud_image: RefCell::new(None),
+            static_hud_hash: Cell::new(0),
+            dynamic_hud_image: RefCell::new(None),
             background_image: RefCell::new(None),
             cursor_hidden: RefCell::new(false),
             last_flags: RefCell::new(0),
@@ -272,18 +274,42 @@ impl OverlayOps for MacOverlay {
         super::app::run_on_main_async(move || {
             super::with_main_state(|s| {
                 if let Some(o) = s.overlays.get(&monitor) {
+                    use crate::hud_render::{
+                        render_dynamic_into, render_static_into, static_hash,
+                    };
+                    let ivars = o.view.ivars();
                     let tint = match &hud {
                         // Tint is the HUD background; the renderer
                         // composes strokes/pills/guides over it.
                         Some(h) => h.background,
                         None => Color::TRANSPARENT,
                     };
-                    *o.view.ivars().tint.borrow_mut() = tint;
-                    let bitmap = hud
+                    *ivars.tint.borrow_mut() = tint;
+
+                    // Static layer: only re-rasterize when the
+                    // hash-tracked inputs (held rects, guides, stuck
+                    // measurements, colors, measurement format) change.
+                    // On a hash hit the cursor-only frame skips the
+                    // entire static stroke pass — that's the whole
+                    // point of the split.
+                    let new_hash = hud.as_ref().map(static_hash).unwrap_or(0);
+                    if new_hash != ivars.static_hud_hash.get() {
+                        let image = hud
+                            .as_ref()
+                            .and_then(|h| rasterize_layer_for_view(&o.view, h, render_static_into));
+                        *ivars.static_hud_image.borrow_mut() = image;
+                        ivars.static_hud_hash.set(new_hash);
+                    }
+                    // Dynamic layer: always re-rasterize. Smaller
+                    // stroke set, no glyphs in the static-layer pill
+                    // text path, so this is the path that has to be
+                    // fast.
+                    let dynamic = hud
                         .as_ref()
-                        .and_then(|h| rasterize_hud_for_view(&o.view, h));
-                    *o.view.ivars().hud_bitmap.borrow_mut() = bitmap;
-                    *o.view.ivars().hud.borrow_mut() = hud;
+                        .and_then(|h| rasterize_layer_for_view(&o.view, h, render_dynamic_into));
+                    *ivars.dynamic_hud_image.borrow_mut() = dynamic;
+
+                    *ivars.hud.borrow_mut() = hud;
                     o.view.setNeedsDisplay(true);
                 }
             });
@@ -346,18 +372,26 @@ pub(crate) struct OverlayIvars {
     tint: RefCell<Color>,
     #[allow(dead_code)]
     hud: RefCell<Option<Hud>>,
-    /// Rasterized HUD layer + the buffer dimensions that produced
-    /// it. Drawn on top of the tint in `drawRect:`. Held in a
-    /// RefCell because `set_hud` (async from worker) and `drawRect`
-    /// (sync on main) both touch it.
-    hud_bitmap: RefCell<Option<HudBitmap>>,
+    /// Cached "static" HUD layer — held rects, guides, stuck
+    /// measurements. Re-rasterized only when `static_hud_hash`
+    /// changes, so cursor-only frames skip the expensive stroke
+    /// pass entirely. `None` means nothing to draw on this layer.
+    static_hud_image: RefCell<Option<CFRetained<CGImage>>>,
+    /// Digest of the HUD fields that affect `static_hud_image`. A
+    /// `set_hud` call whose digest matches reuses the cached image
+    /// and only rebuilds the dynamic layer.
+    static_hud_hash: Cell<u64>,
+    /// "Dynamic" HUD layer — cursor crosshair, live drag rect, toast,
+    /// context menu, corner indicator. Re-rasterized on every
+    /// `set_hud` since the cursor moves every frame.
+    dynamic_hud_image: RefCell<Option<CFRetained<CGImage>>>,
     /// "Freeze screen" background: the captured display frame at the
     /// moment measure mode opened, converted to a CGImage so
     /// `drawRect:` can paint it opaquely under the HUD. Held as a
     /// retained CGImage rather than the raw pixel Vec so each redraw
     /// doesn't have to re-upload to the GPU. `None` outside measure
     /// mode (overlay stays transparent and shows live content).
-    background_image: RefCell<Option<CFRetained<objc2_core_graphics::CGImage>>>,
+    background_image: RefCell<Option<CFRetained<CGImage>>>,
     /// NSCursor::hide / unhide is reference-counted on macOS. Track
     /// whether we're currently in the hidden state so we don't
     /// unbalance the counter (which would either leave the cursor
@@ -375,23 +409,6 @@ pub(crate) struct OverlayIvars {
     transparent_cursor: RefCell<Option<Retained<objc2_app_kit::NSCursor>>>,
     #[allow(dead_code)]
     captures_input: RefCell<bool>,
-}
-
-/// A rasterized HUD ready to blit. We hang on to the CGImage so
-/// `drawRect:` doesn't have to reconstruct it every paint.
-pub(crate) struct HudBitmap {
-    pub image: objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>,
-    /// View bounds (in points, i.e. logical pixels) the bitmap
-    /// was sized for. If the view resizes we'll just blit the
-    /// bitmap stretched until the next `set_hud` rasterizes
-    /// fresh pixels.
-    pub view_size: NSSizeF,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct NSSizeF {
-    pub width: f64,
-    pub height: f64,
 }
 
 define_class!(
@@ -426,20 +443,22 @@ define_class!(
                 color.setFill();
                 objc2_app_kit::NSRectFill(bounds);
             }
-            // "Freeze screen" background: paint the captured display
-            // frame underneath the HUD strokes. drawn AFTER the tint
-            // (which is usually transparent in measure mode) and
-            // BEFORE the HUD so cursor crosshairs / pills sit on top
-            // of the frozen pixels.
-            if let Some(image) = self.ivars().background_image.borrow().as_ref() {
-                draw_background_image(bounds, image);
+            // Paint, bottom to top:
+            //   1. tint (filled above)
+            //   2. freeze-screen background (if any)
+            //   3. cached static HUD layer — held rects, guides, stuck
+            //   4. dynamic HUD layer — crosshair, drag rect, toast, menu
+            // CGContext::draw_image composites each layer via SrcOver on
+            // the GPU; no CPU compositing on the hot path.
+            let ivars = self.ivars();
+            if let Some(image) = ivars.background_image.borrow().as_ref() {
+                draw_hud_image(bounds, image);
             }
-            // Blit the rasterized HUD over the tint + background,
-            // if we have one. The image's pixel grid was rendered at
-            // the view's backing scale; CGContextDrawImage handles
-            // the logical→physical mapping for us.
-            if let Some(bitmap) = self.ivars().hud_bitmap.borrow().as_ref() {
-                draw_hud_bitmap(bounds, bitmap);
+            if let Some(image) = ivars.static_hud_image.borrow().as_ref() {
+                draw_hud_image(bounds, image);
+            }
+            if let Some(image) = ivars.dynamic_hud_image.borrow().as_ref() {
+                draw_hud_image(bounds, image);
             }
         }
 
@@ -762,21 +781,32 @@ fn transparent_cursor(view: &OverlayView) -> Retained<objc2_app_kit::NSCursor> {
 
 // --- HUD rasterization + blit ----------------------------------------------
 
-fn rasterize_hud_for_view(view: &OverlayView, hud: &Hud) -> Option<HudBitmap> {
-    use crate::hud_render::render_hud_into;
+/// Rasterize a single HUD layer through `render_fn` (either
+/// `render_static_into` or `render_dynamic_into`) and wrap the
+/// resulting RGBA bytes in a CGImage sized to the view's physical
+/// pixel grid. Returns `None` if the view has zero area or CGImage
+/// allocation fails.
+///
+/// Both static and dynamic layers share this path so the pixel
+/// format, scale handling, and CGImage construction stay in one
+/// place — and so the static cache and the per-frame dynamic
+/// rasterize never disagree on canvas dimensions.
+fn rasterize_layer_for_view(
+    view: &OverlayView,
+    hud: &Hud,
+    render_fn: fn(&mut [u8], u32, u32, u32, &Hud),
+) -> Option<CFRetained<CGImage>> {
     let bounds = view.bounds();
     let scale = view
         .window()
         .map(|w| w.backingScaleFactor())
         .unwrap_or(1.0)
         .max(1.0);
-    let logical_w = bounds.size.width;
-    let logical_h = bounds.size.height;
-    let phys_w = ((logical_w * scale).round() as u32).max(1);
-    let phys_h = ((logical_h * scale).round() as u32).max(1);
+    let phys_w = ((bounds.size.width * scale).round() as u32).max(1);
+    let phys_h = ((bounds.size.height * scale).round() as u32).max(1);
 
     let mut canvas = vec![0u8; (phys_w as usize) * (phys_h as usize) * 4];
-    render_hud_into(
+    render_fn(
         &mut canvas,
         phys_w,
         phys_h,
@@ -784,14 +814,7 @@ fn rasterize_hud_for_view(view: &OverlayView, hud: &Hud) -> Option<HudBitmap> {
         hud,
     );
 
-    let image = cgimage_from_rgba(&canvas, phys_w, phys_h)?;
-    Some(HudBitmap {
-        image,
-        view_size: NSSizeF {
-            width: logical_w,
-            height: logical_h,
-        },
-    })
+    cgimage_from_rgba(&canvas, phys_w, phys_h)
 }
 
 fn cgimage_from_rgba(
@@ -829,20 +852,17 @@ fn cgimage_from_rgba(
     }
 }
 
-/// Paint the captured "freeze" frame into the view's bounds. The
-/// CGImage has its own pixel dimensions (physical px from
-/// CGDisplayCreateImage); CGContext::draw_image scales it into the
-/// destination rect, and AppKit's `drawRect:` already gave us a
-/// context whose unit space is points — so passing `bounds`
-/// (logical px) makes the frame appear at 1:1 logical size with
-/// every captured pixel preserved on Retina (a 2× source scaled
-/// into a 1× destination rect renders at the display's native
-/// pixel grid via the GPU). No swizzle needed: `Frame.pixels` is
-/// already RGBA per `native_to_packed_rgba`.
-fn draw_background_image(
-    bounds: NSRect,
-    image: &CFRetained<objc2_core_graphics::CGImage>,
-) {
+/// Blit `image` over the view's bounds. The CGImage carries its own
+/// pixel dimensions (physical px from tiny-skia or `CGDisplayCreateImage`);
+/// `CGContext::draw_image` scales it into the destination rect on the
+/// GPU, and AppKit's `drawRect:` already gave us a context whose unit
+/// space is points — so passing `bounds` (logical px) makes the image
+/// appear at 1:1 logical size while preserving every captured pixel on
+/// Retina (a 2× source into a 1× rect renders at the display's native
+/// pixel grid). Shared by the freeze-screen background, the static
+/// HUD layer, and the dynamic HUD layer so the four passes in
+/// `drawRect:` all go through the same scale + colorspace path.
+fn draw_hud_image(bounds: NSRect, image: &CFRetained<CGImage>) {
     use objc2_app_kit::NSGraphicsContext;
     use objc2_core_foundation::CGRect as CFRect;
     let Some(ctx) = (unsafe { NSGraphicsContext::currentContext() }) else {
@@ -858,34 +878,5 @@ fn draw_background_image(
     };
     unsafe {
         objc2_core_graphics::CGContext::draw_image(Some(&cg_ctx), rect, Some(image));
-    }
-}
-
-fn draw_hud_bitmap(bounds: NSRect, bitmap: &HudBitmap) {
-    use objc2::runtime::AnyObject;
-    use objc2_app_kit::NSGraphicsContext;
-    use objc2_core_foundation::CGRect as CFRect;
-
-    let Some(ctx) = (unsafe { NSGraphicsContext::currentContext() }) else {
-        return;
-    };
-    // `NSGraphicsContext.CGContext` returns a `Retained<CGContext>`
-    // in objc2-app-kit 0.3 — we deref to `&CGContext` and call the
-    // CG blit, which handles the HiDPI mapping for us.
-    let cg_ctx = unsafe { ctx.CGContext() };
-    let rect = CFRect {
-        origin: objc2_core_foundation::CGPoint {
-            x: 0.0,
-            y: 0.0,
-        },
-        size: objc2_core_foundation::CGSize {
-            width: bounds.size.width,
-            height: bounds.size.height,
-        },
-    };
-    let _ = bitmap.view_size; // suppress unused-field warning until we wire size invalidation
-    unsafe {
-        objc2_core_graphics::CGContext::draw_image(Some(&cg_ctx), rect, Some(&bitmap.image));
-        let _ = std::ptr::null::<AnyObject>();
     }
 }
