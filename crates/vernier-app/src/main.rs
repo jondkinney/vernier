@@ -390,6 +390,43 @@ fn run_daemon() -> Result<()> {
     }
     let mut current_accel: Option<Accelerator> = initial_accel_opt;
 
+    // Global "open preferences" hotkey: Cmd+, on macOS (the universal
+    // Mac shortcut for app preferences) and Ctrl+, on every other
+    // platform. Fires regardless of whether measure mode is open;
+    // the handler tears measure mode down, clears persisted state,
+    // and brings the prefs window to front. Not user-configurable
+    // yet — convention is strong enough that "the comma shortcut"
+    // doesn't need a setting.
+    let prefs_hotkey_accel_str = if cfg!(target_os = "macos") {
+        "META+,"
+    } else {
+        "CTRL+,"
+    };
+    let prefs_hotkey: Option<HotkeyId> = Accelerator::parse(prefs_hotkey_accel_str)
+        .and_then(|accel| {
+            if on_hyprland {
+                // Hyprland routes hotkeys through hyprctl, not the
+                // platform's register_hotkey. Skip for now; Hyprland
+                // users can bind `vernier prefs` themselves.
+                None
+            } else {
+                match platform.register_hotkey(accel, "Vernier Preferences") {
+                    Ok(id) => {
+                        log::info!(
+                            "prefs hotkey registered as {prefs_hotkey_accel_str}",
+                        );
+                        Some(id)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "prefs hotkey registration ({prefs_hotkey_accel_str}) failed: {e}"
+                        );
+                        None
+                    }
+                }
+            }
+        });
+
     let (combined_tx, combined_rx) = std::sync::mpsc::channel::<MainEvent>();
 
     // Drain platform events into the combined channel.
@@ -637,6 +674,57 @@ fn run_daemon() -> Result<()> {
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) => {
                 log::info!("unhandled tray menu id: {id}");
+            }
+            MainEvent::Platform(PlatformEvent::HotkeyPressed(id))
+                if prefs_hotkey == Some(id) =>
+            {
+                // Cmd+, (Ctrl+, elsewhere) — universal "open
+                // preferences" shortcut. Treat it as an explicit exit
+                // from measurement mode: save persisted content,
+                // wipe held rects / guides / stuck so the user lands
+                // on a clean prefs window with no leftover overlay,
+                // then surface prefs.
+                log::info!("prefs hotkey: clearing state and opening prefs");
+                if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
+                    log::warn!("save session before prefs hotkey: {e:#}");
+                }
+                pre_clear_freeze = false;
+                pending_guide = None;
+                pending_guide_shift_acked = false;
+                last_esc_at = None;
+                nudge_selection = None;
+                last_selected_guide = None;
+                active_toast = None;
+                toast_until = None;
+                held_rects.clear();
+                guides.clear();
+                stuck_measurements.clear();
+                if !matches!(mode, InteractionMode::Idle) {
+                    // In measure mode → toggle off. With the vecs
+                    // cleared above, toggle_measurement takes the
+                    // clean-hide branch and the overlay disappears.
+                    toggle_measurement(
+                        &mut mode,
+                        &mut overlay,
+                        &platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut capture_worker,
+                        &held_rects,
+                        &guides,
+                        &stuck_measurements,
+                        color_alternate,
+                    );
+                } else {
+                    // Already idle but the overlay may still be in
+                    // passthrough mode showing previously-persisted
+                    // rects/guides/stuck. Force the overlay closed so
+                    // the cleared state is visible immediately.
+                    overlay.set_background_frame(None);
+                    overlay.hide();
+                    overlay.set_hud(None);
+                }
+                ensure_prefs_window(&mut prefs_child);
             }
             MainEvent::Platform(PlatformEvent::HotkeyPressed(_)) => {
                 // Same reset as the tray toggle path — explicit
@@ -4159,13 +4247,17 @@ fn toggle_prefs_window(handle: &mut Option<std::process::Child>) {
     *handle = spawn_prefs_window();
 }
 
-/// Open prefs only if there isn't already a window up — keeps the
-/// `vernier` (no-args) IPC path from spawning a duplicate when
-/// the tray icon already brought a window up.
+/// Open prefs, or bring the existing window to the front when one is
+/// already up. Keeps the `vernier` (no-args) IPC path from spawning a
+/// duplicate, and ensures every "Preferences..." invocation (tray
+/// menu, in-overlay menu, Cmd+, hotkey) lands the prefs window in
+/// front of whatever the user was looking at instead of silently
+/// no-op'ing when prefs was already open behind another app.
 fn ensure_prefs_window(handle: &mut Option<std::process::Child>) {
     if let Some(child) = handle.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
-            log::info!("prefs window already open — ignoring open request");
+            log::info!("prefs window already open — focusing existing window");
+            focus_prefs_window(handle.as_ref());
             return;
         }
     }
