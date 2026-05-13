@@ -147,6 +147,15 @@ impl Default for ScreenshotSettings {
             output_dir: None,
             filename_template: "screenshot-{ts}.png".to_string(),
             padding_px: 0,
+            // macOS's `screencapture` always writes at native pixel
+            // resolution (2x on Retina), so the W×H pill in the
+            // captured image won't match the W×H pill the user saw
+            // during measurement unless we downscale. Linux's `grim`
+            // honors `-s 1` separately, and most Linux users want the
+            // raw HiDPI buffer, so the default is platform-split.
+            #[cfg(target_os = "macos")]
+            retina_downscale: true,
+            #[cfg(not(target_os = "macos"))]
             retina_downscale: false,
             capture_sound: true,
             copy_to_clipboard: true,
@@ -274,7 +283,14 @@ impl Default for AppearanceSettings {
             // glance which color a given guide was placed in.
             alternative_guide_color: ColorRgba::new(0xFF, 0xA9, 0x4A, 0xF0),
             units: Units::Px,
-            rounding_mode: RoundingMode::Points,
+            // Integer display by default — fractional logical-px values
+            // are a side effect of physical-pixel edge snapping on
+            // Retina (a snap to a half-logical-pixel boundary is
+            // internally accurate but visually noisy). Underlying
+            // coordinates keep full precision regardless of this
+            // setting, so the rounding only affects what the HUD pill
+            // shows, not what gets exported / saved.
+            rounding_mode: RoundingMode::PointsRounded,
         }
     }
 }

@@ -102,7 +102,22 @@ fn main() -> Result<()> {
                 let _ = run_client_command("open-prefs");
                 Ok(())
             } else {
-                run_daemon()
+                // macOS: NSApp must own the main thread for the
+                // tray + overlay windows to receive events. Push
+                // the daemon body onto a worker and run NSApp.run()
+                // here. Never returns.
+                #[cfg(target_os = "macos")]
+                {
+                    vernier_platform::bootstrap_main(|| {
+                        if let Err(e) = run_daemon() {
+                            log::error!("daemon exited with error: {e:#}");
+                        }
+                    });
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    run_daemon()
+                }
             }
         }
     }
@@ -1034,6 +1049,42 @@ fn run_daemon() -> Result<()> {
                                     false,
                                 );
                             }
+                            MenuAction::OpenPrefs => {
+                                log::info!(
+                                    "preferences (menu) — clearing all drawings + exiting measure \
+                                     mode + opening prefs"
+                                );
+                                // The user wants a clean transition into
+                                // prefs: drop every drawing (held rects,
+                                // guides, stuck measurements) so the
+                                // overlay isn't left in passthrough with
+                                // stale content, then exit measure mode,
+                                // then spawn / activate the prefs window.
+                                pre_clear_freeze = false;
+                                pending_guide = None;
+                                pending_guide_shift_acked = false;
+                                last_esc_at = None;
+                                held_rects.clear();
+                                guides.clear();
+                                stuck_measurements.clear();
+                                nudge_selection = None;
+                                last_selected_guide = None;
+                                if !matches!(mode, InteractionMode::Idle) {
+                                    toggle_measurement(
+                                        &mut mode,
+                                        &mut overlay,
+                                        &*platform,
+                                        primary.id,
+                                        &mut frozen_frame,
+                                        &held_rects,
+                                        &guides,
+                                        &stuck_measurements,
+                                        color_alternate,
+                                    );
+                                }
+                                ensure_prefs_window(&mut prefs_child);
+                                focus_prefs_window(prefs_child.as_ref());
+                            }
                             MenuAction::ClearAll => {
                                 log::info!("clear all (menu)");
                                 guides.clear();
@@ -1523,6 +1574,9 @@ fn run_daemon() -> Result<()> {
                         // the framebuffer. ~150ms is a safe single-
                         // vsync margin on Hyprland.
                         std::thread::sleep(std::time::Duration::from_millis(150));
+                        #[cfg(target_os = "macos")]
+                        let shot_outcome = take_held_screenshot_via_screencapture(rs, re);
+                        #[cfg(not(target_os = "macos"))]
                         let shot_outcome = take_held_screenshot_via_grim(rs, re);
                         let handed_off = match shot_outcome {
                             Ok(o) => matches!(o, CaptureOutcome::HandedOff),
@@ -1855,15 +1909,45 @@ fn run_daemon() -> Result<()> {
                             );
                         }
                     }
-                } else if ctrl_held && keysym == 0x002c {
-                    // Ctrl+, → open the preferences window. macOS
-                    // uses Cmd+, for prefs; Super+, would be the
-                    // direct port but Omarchy already binds that
-                    // combo at the compositor level (mako's
+                } else if {
+                    // Open Prefs binding. macOS expects Cmd+, (Apple's
+                    // long-standing "open preferences" convention);
+                    // Linux/Windows use Ctrl+, — Super+, would be the
+                    // direct port of macOS but Omarchy already binds
+                    // that combo at the compositor level (mako's
                     // "Dismiss last notification") so the keypress
-                    // never reaches our layer surface. Ctrl+, is
-                    // the next-closest convention and is free.
-                    log::info!("ctrl+, → opening prefs");
+                    // never reaches our layer surface.
+                    #[cfg(target_os = "macos")]
+                    { super_held && keysym == 0x002c }
+                    #[cfg(not(target_os = "macos"))]
+                    { ctrl_held && keysym == 0x002c }
+                } {
+                    log::info!("prefs hotkey → opening prefs");
+                    // If a measurement is in progress, exit it cleanly
+                    // before the prefs window opens. Otherwise the user
+                    // is left with the overlay grabbing the cursor /
+                    // keyboard while they're trying to interact with
+                    // prefs — a frustrating modal lockout. The
+                    // `toggle_measurement` call below the matches!
+                    // check handles every state (Hover, Drawing, Held)
+                    // by transitioning to Idle.
+                    if !matches!(mode, InteractionMode::Idle) {
+                        pre_clear_freeze = false;
+                        pending_guide = None;
+                        pending_guide_shift_acked = false;
+                        last_esc_at = None;
+                        toggle_measurement(
+                            &mut mode,
+                            &mut overlay,
+                            &*platform,
+                            primary.id,
+                            &mut frozen_frame,
+                            &held_rects,
+                            &guides,
+                            &stuck_measurements,
+                            color_alternate,
+                        );
+                    }
                     ensure_prefs_window(&mut prefs_child);
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.clear_and_hide
@@ -1916,7 +2000,19 @@ fn run_daemon() -> Result<()> {
                     // is on), wipes every held rect / guide / stuck
                     // measurement, and toggles measure mode off.
                     let s = current_settings();
-                    let need_double = s.shortcuts.clear_and_hide_double_press;
+                    // Skip the two-press confirmation when there's
+                    // nothing to lose — no held rects, no guides, no
+                    // stuck measurements means a single Esc just
+                    // exits measure mode cleanly. The double-press
+                    // exists to protect persisted content from being
+                    // wiped by an accidental Esc; with nothing on
+                    // screen there's no content to protect, and the
+                    // "Press Esc again" toast is just friction.
+                    let has_persisted_content = !held_rects.is_empty()
+                        || !guides.is_empty()
+                        || !stuck_measurements.is_empty();
+                    let need_double =
+                        s.shortcuts.clear_and_hide_double_press && has_persisted_content;
                     let window = Duration::from_millis(
                         s.shortcuts.clear_and_hide_double_press_window_ms.clamp(100, 3000) as u64,
                     );
@@ -3057,10 +3153,18 @@ fn set_primary_scale_factor(s: f64) {
 }
 
 /// When `general.freeze_screen` is off, pull the latest frame from
-/// PipeWire so edge detection follows live content. No-op in the
+/// the platform so edge detection follows live content. No-op in the
 /// default frozen mode (the user explicitly refreshes via the R key).
 /// Errors are logged at debug — a transient capture miss just leaves
 /// the previous frame in place for this redraw.
+///
+/// Throttled to `LIVE_CAPTURE_MIN_INTERVAL` between calls. macOS's
+/// `CGDisplayCreateImage` is ~50–100 ms on a 4K display — calling it
+/// from every HUD redraw (~60 Hz) blocks the main loop and the
+/// cursor lags noticeably. 5 Hz is fast enough that the snap-to-edge
+/// targets feel "live" while leaving the rest of the frame budget
+/// for HUD render and event handling. Wayland's PipeWire path is
+/// much cheaper but the throttle is harmless there.
 fn refresh_frame_if_live(
     platform: &dyn Platform,
     monitor: MonitorId,
@@ -3068,6 +3172,29 @@ fn refresh_frame_if_live(
 ) {
     if current_settings().general.freeze_screen {
         return;
+    }
+    // 100 ms (10 Hz). The `CGWindowListCreateImage` call on macOS is
+    // ~30–60 ms on a 4K display; at 10 Hz that's ~30–60% of the main
+    // loop's time slice between captures, which still leaves the
+    // cursor responsive. Previously sat at 200 ms when we suspected
+    // cursor blocking, but the cursor stays smooth now that
+    // `NSCursor::hide()` (sticky, refcounted) is doing the work
+    // instead of `setHiddenUntilMouseMoves` (flashed visible on
+    // every move).
+    const LIVE_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(100);
+    // Per-call static — cheap to look up, no need to thread state
+    // through every caller (there are several refresh sites).
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = Instant::now();
+        if let Some(t) = *last {
+            if now.duration_since(t) < LIVE_CAPTURE_MIN_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(now);
     }
     match platform.capture_screen_native(monitor) {
         Ok(f) => *frozen_frame = Some(f),
@@ -4010,6 +4137,24 @@ fn ensure_prefs_window(handle: &mut Option<std::process::Child>) {
     *handle = spawn_prefs_window();
 }
 
+/// Bring the prefs window to the foreground when it's already open.
+/// macOS only: routes through `NSRunningApplication
+/// .runningApplicationWithProcessIdentifier(...)
+/// .activateWithOptions(...)`, which raises every window owned by
+/// the prefs process and gives them focus. On Linux/Windows this is
+/// a no-op — eframe / winit handles focus on creation, and the
+/// existing "already running, do nothing" branch is fine since
+/// users typically expect the existing window to surface via the
+/// window manager.
+#[allow(unused_variables)]
+fn focus_prefs_window(child: Option<&std::process::Child>) {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(pid) = child.map(|c| c.id() as i32) else { return };
+        vernier_platform::focus_macos_app_by_pid(pid);
+    }
+}
+
 /// Returns the active toast iff its dismissal time hasn't passed.
 fn current_toast<'a>(toast: &'a Option<HudToast>, until: Option<Instant>) -> Option<&'a HudToast> {
     if until.map_or(false, |t| Instant::now() < t) {
@@ -4260,6 +4405,7 @@ enum MenuAction {
     OpenScreenshotTool,
     EnterBackgroundMode,
     RestoreLastSession,
+    OpenPrefs,
     ClearAll,
     CloseVernier,
 }
@@ -4327,6 +4473,18 @@ const MENU_ITEMS: &[MenuItemDef] = &[
         shortcut: Some(&["\u{21E7}", "R"]),
         icon: HudContextMenuIcon::Restore,
         action: MenuAction::RestoreLastSession,
+        divider_after: true,
+    },
+    MenuItemDef {
+        // Shortcut hint is intentionally None — the actual binding
+        // is Cmd+, on macOS and Ctrl+, elsewhere; the MENU_ITEMS
+        // const can't easily express that platform-conditional. The
+        // user gets the label only; the keyboard shortcut still
+        // works system-wide regardless.
+        label: "Preferences…",
+        shortcut: None,
+        icon: HudContextMenuIcon::Settings,
+        action: MenuAction::OpenPrefs,
         divider_after: true,
     },
     MenuItemDef {
@@ -4410,6 +4568,7 @@ fn menu_contains(origin: (f64, f64), items: &[MenuItemDef], cursor: (f64, f64)) 
 /// buffer directly, which excludes the cursor by default. Vernier's
 /// own overlay is hidden by the caller (overlay.set_hud(None) + a
 /// brief wait) before this fires, so grim sees a clean desktop too.
+#[cfg(not(target_os = "macos"))]
 fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<CaptureOutcome> {
     let s = current_settings();
     let prefs = s.screenshots.clone();
@@ -4443,7 +4602,107 @@ fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<Capture
     let img = image::open(&tmp_path)
         .with_context(|| format!("decode grim output {}", tmp_path.display()))?
         .to_rgba8();
-    finish_held_screenshot(img, &prefs)
+    finish_held_screenshot(img, None, &prefs)
+}
+
+/// macOS counterpart to [`take_held_screenshot_via_grim`]: shells out
+/// to `/usr/sbin/screencapture` (always installed) for the actual
+/// pixel grab, then funnels the decoded PNG through the shared
+/// `finish_held_screenshot` post-pipeline so handoff / save / sound
+/// behavior matches Linux.
+///
+/// `screencapture -R x,y,w,h` captures a screen-space region in
+/// display *points* (logical px) — the same coordinate space Vernier
+/// already uses for `Px` — origin top-left of primary display.
+/// `-x` suppresses the system shutter sound (Vernier plays its own
+/// when `capture_sound` is on). `-t png` forces PNG output regardless
+/// of filename heuristics. The captured frame omits the cursor
+/// (screencapture's default for region mode), matching the no-cursor
+/// behavior of the Wayland grim path.
+///
+/// Note: `screencapture` always writes the image at the source
+/// display's native pixel resolution (i.e., HiDPI / "retina"); the
+/// `retina_downscale` preference is currently honored only on Linux.
+/// Add post-decode resizing here when wiring it up on macOS.
+#[cfg(target_os = "macos")]
+fn take_held_screenshot_via_screencapture(
+    rect_start: Px,
+    rect_end: Px,
+) -> Result<CaptureOutcome> {
+    let s = current_settings();
+    let prefs = s.screenshots.clone();
+    let pad = prefs.padding_px as i32;
+    let lo_x = rect_start.x.min(rect_end.x) - pad;
+    let lo_y = rect_start.y.min(rect_end.y) - pad;
+    let hi_x = rect_start.x.max(rect_end.x) + pad;
+    let hi_y = rect_start.y.max(rect_end.y) + pad;
+    let w = hi_x - lo_x;
+    let h = hi_y - lo_y;
+    if w <= 0 || h <= 0 {
+        anyhow::bail!("empty screenshot region");
+    }
+    let region = format!("{},{},{},{}", lo_x, lo_y, w, h);
+    let tmp_path = std::env::temp_dir()
+        .join(format!("vernier-screencapture-{}.png", current_timestamp()));
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .args(["-R", &region, "-x", "-t", "png"])
+        .arg(&tmp_path)
+        .status()
+        .with_context(|| "screencapture spawn failed")?;
+    if !status.success() {
+        anyhow::bail!("screencapture exited with status {status}");
+    }
+    // `screencapture` writes the capture at the display's native
+    // pixel density (2x on Retina) but tags the PNG with DPI=72,
+    // which causes DPI-aware viewers (CleanShot X, Preview, Quick
+    // Look, Safari) to render it at the doubled pixel grid — so the
+    // image visually appears 2x larger than the region the user
+    // measured.
+    //
+    // Always rewrite the PNG's `pHYs` chunk to advertise the
+    // display's actual DPI (typically 144 on Retina). DPI-aware
+    // viewers then render the 2x physical-px frame at half size:
+    // same logical dimensions as the captured region, every pixel
+    // of detail preserved. This is strictly better than downscaling
+    // (which would lose detail through interpolation), so we apply
+    // it unconditionally on macOS — the prefs `retina_downscale`
+    // toggle still gates the Linux-side `grim -s 1` downscale where
+    // the pHYs trick doesn't help (annotation tools like Satty
+    // ignore PNG DPI metadata).
+    //
+    // Scale factor is computed from the ratio of captured pixels to
+    // requested logical px so a 1x external display gets DPI=72
+    // (no rewrite), a 2x Retina gets 144, a hypothetical 3x gets
+    // 216 — never wrong even when displays mix.
+    let captured_dims = image::image_dimensions(&tmp_path)
+        .with_context(|| format!("read dims {}", tmp_path.display()))?;
+    let scale_x = captured_dims.0 as f64 / w as f64;
+    let dpi = (72.0 * scale_x).round() as i64;
+    if dpi != 72 {
+        let dpi_str = dpi.to_string();
+        let dpi_status = std::process::Command::new("/usr/bin/sips")
+            .args([
+                "-s", "dpiWidth", &dpi_str,
+                "-s", "dpiHeight", &dpi_str,
+            ])
+            .arg(&tmp_path)
+            .arg("--out")
+            .arg(&tmp_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| "sips spawn failed")?;
+        if !dpi_status.success() {
+            anyhow::bail!("sips exited with status {dpi_status}");
+        }
+    }
+    let img = image::open(&tmp_path)
+        .with_context(|| format!("decode screencapture output {}", tmp_path.display()))?
+        .to_rgba8();
+    // Pass the source PNG so the handoff / save-to-disk path copies
+    // it byte-for-byte instead of going through `image::save`, which
+    // would strip the DPI metadata we just wrote.
+    finish_held_screenshot(img, Some(&tmp_path), &prefs)
 }
 
 /// Post-capture pipeline: shutter sound, handoff to external editor
@@ -4451,8 +4710,18 @@ fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<Capture
 /// between the PipeWire-frame path (legacy, currently unused for
 /// the camera-pill click but still wired for tests) and the
 /// grim-based path.
+///
+/// `source_png`, when provided, is the path of a fully-encoded PNG
+/// on disk that should be copied (not re-encoded) for any output
+/// file. Used on macOS where `screencapture`'s native PNG carries a
+/// `pHYs` DPI=144 chunk that we *don't* want `image::save` to strip
+/// — DPI-aware viewers (CleanShot X, Preview) use that chunk to
+/// render the 2x physical-px frame at logical (point) size, so the
+/// captured pixels appear sharp at their measurement dimensions
+/// instead of either lossy (downscaled) or doubled (raw).
 fn finish_held_screenshot(
     img: image::RgbaImage,
+    source_png: Option<&Path>,
     prefs: &vernier_core::ScreenshotSettings,
 ) -> Result<CaptureOutcome> {
     let final_w = img.width();
@@ -4474,8 +4743,14 @@ fn finish_held_screenshot(
         let cmd = prefs.handoff_command.clone();
         let temp_path = std::env::temp_dir()
             .join(format!("vernier-handoff-{}.png", current_timestamp()));
-        img.save(&temp_path)
-            .with_context(|| format!("write {}", temp_path.display()))?;
+        if let Some(src) = source_png {
+            std::fs::copy(src, &temp_path).with_context(|| {
+                format!("copy {} → {}", src.display(), temp_path.display())
+            })?;
+        } else {
+            img.save(&temp_path)
+                .with_context(|| format!("write {}", temp_path.display()))?;
+        }
         let path_str = temp_path.to_string_lossy().into_owned();
         let argv = vernier_core::render_args(&args_template, &path_str);
         let spawned = std::process::Command::new(&cmd).args(&argv).spawn();
@@ -4514,8 +4789,13 @@ fn finish_held_screenshot(
         .replace("{w}", &final_w.to_string())
         .replace("{h}", &final_h.to_string());
     let path = dir.join(filename);
-    img.save(&path)
-        .with_context(|| format!("write {}", path.display()))?;
+    if let Some(src) = source_png {
+        std::fs::copy(src, &path)
+            .with_context(|| format!("copy {} → {}", src.display(), path.display()))?;
+    } else {
+        img.save(&path)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
     log::info!(
         "screenshot saved: {} ({}×{}) padding={} retina_downscale={}",
         path.display(),
@@ -4746,6 +5026,19 @@ fn toggle_measurement(
                     "measurement mode: ON (frozen {}×{} {:?})",
                     frame.width, frame.height, frame.format
                 );
+                // Push the captured frame to the overlay as its
+                // background so the user sees a literal snapshot —
+                // anything moving underneath (browser scroll, video)
+                // becomes invisible while measuring. Backends that
+                // don't implement set_background_frame fall through to
+                // the default no-op (transparent overlay, live content
+                // visible), which is functionally fine since edge
+                // detection still uses the frozen NativeFrame.
+                if current_settings().general.freeze_screen {
+                    if let Ok(packed) = platform.capture_screen(monitor) {
+                        overlay.set_background_frame(Some(packed));
+                    }
+                }
                 *frozen_frame = Some(frame);
             }
             Err(e) => {
@@ -4787,6 +5080,11 @@ fn toggle_measurement(
         *mode = InteractionMode::Idle;
         *frozen_frame = None;
         overlay.set_input_capturing(false);
+        // Drop the snapshot so the desktop is visible again in
+        // passthrough mode — the user explicitly wanted to interact
+        // with their underlying apps but still see the persisted
+        // measurement overlay.
+        overlay.set_background_frame(None);
         let mut hud = Hud::hover((-1000.0, -1000.0));
         hud.kind = HudKind::None;
         hud.foreground = fg;
@@ -4800,6 +5098,7 @@ fn toggle_measurement(
         log::info!("measurement mode: OFF");
         *mode = InteractionMode::Idle;
         *frozen_frame = None;
+        overlay.set_background_frame(None);
         overlay.hide();
         overlay.set_input_capturing(false);
         overlay.set_hud(None);
@@ -5219,16 +5518,28 @@ fn snap_to_nearest_x_edge(cursor_x: f64, edges: &[Option<HudEdge>; 4]) -> f64 {
     best
 }
 
-/// Snap an x coordinate to the nearest vertical guide within 8 logical
-/// px. Used while drawing or resizing held rects so edges align cleanly
-/// with reference guides. No-op when `general.snap_to_guides` is off.
-fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
+/// Default snap threshold for mid-drag and end-of-drag guide snap.
+/// Tight enough that the moving corner doesn't feel "stuck" when the
+/// user is dragging past a guide intentionally.
+const SNAP_PX_DEFAULT: f64 = 8.0;
+
+/// Wider snap threshold used at the *start* of a drag — when the user
+/// is committing to a corner position with no visual mid-drag
+/// feedback yet, a generous magnet helps them land on the guide
+/// intersection without precise aim. 30 px is the working value
+/// (matches Figma/Sketch's "snap zone" for object creation).
+const SNAP_PX_START_DRAG: f64 = 30.0;
+
+/// Snap an x coordinate to the nearest vertical guide within
+/// `threshold_px` logical px. No-op when `general.snap_to_guides`
+/// is off. Used while drawing or resizing held rects so edges align
+/// cleanly with reference guides.
+fn snap_x_to_guides_within(x: f64, guides: &[Guide], threshold_px: f64) -> f64 {
     if !current_settings().general.snap_to_guides {
         return x;
     }
-    const SNAP_PX: f64 = 8.0;
     let mut best = x;
-    let mut best_d = SNAP_PX;
+    let mut best_d = threshold_px;
     for g in guides.iter().filter(|g| g.axis == GuideAxis::Vertical) {
         let d = (x - g.position as f64).abs();
         if d < best_d {
@@ -5239,14 +5550,13 @@ fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
     best
 }
 
-/// Mirror of [`snap_x_to_guides`] for horizontal guides.
-fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
+/// Mirror of [`snap_x_to_guides_within`] for horizontal guides.
+fn snap_y_to_guides_within(y: f64, guides: &[Guide], threshold_px: f64) -> f64 {
     if !current_settings().general.snap_to_guides {
         return y;
     }
-    const SNAP_PX: f64 = 8.0;
     let mut best = y;
-    let mut best_d = SNAP_PX;
+    let mut best_d = threshold_px;
     for g in guides.iter().filter(|g| g.axis == GuideAxis::Horizontal) {
         let d = (y - g.position as f64).abs();
         if d < best_d {
@@ -5255,6 +5565,16 @@ fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
         }
     }
     best
+}
+
+/// Convenience: default-threshold (`SNAP_PX_DEFAULT`) snap. Used by
+/// the mid-drag / end-of-drag / resize paths.
+fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
+    snap_x_to_guides_within(x, guides, SNAP_PX_DEFAULT)
+}
+
+fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
+    snap_y_to_guides_within(y, guides, SNAP_PX_DEFAULT)
 }
 
 /// Snapshot the current axis distance into a [`StuckMeasurement`].
@@ -5803,8 +6123,32 @@ fn handle_pointer_button(
             return ButtonOutcome::None;
         }
         if matches!(mode, InteractionMode::Hover { .. }) {
-            let snap = SnapPoint::loose(cursor_px);
-            log::info!("drag started at ({},{})", cursor_px.x, cursor_px.y);
+            // Snap the start corner to a nearby guide on press, mirroring
+            // the end-snap on release. Without this, only the trailing
+            // corner aligns mid-drag and the user has to reach back to
+            // pull the leading corner onto its guide via a resize handle.
+            //
+            // Uses a wider threshold (SNAP_PX_START_DRAG = 30 px) than
+            // mid-drag/end-of-drag: at press time the user has no
+            // visual feedback yet — they're committing to a corner with
+            // a single click — so a generous magnet makes "draw a box
+            // around these guides" forgiving without feeling sticky
+            // during the drag.
+            //
+            // Alt disables snap (same modifier as the release-snap).
+            let snapped_start = if alt_held {
+                cursor_px
+            } else {
+                Px::new(
+                    snap_x_to_guides_within(x, guides, SNAP_PX_START_DRAG).round() as i32,
+                    snap_y_to_guides_within(y, guides, SNAP_PX_START_DRAG).round() as i32,
+                )
+            };
+            let snap = SnapPoint::loose(snapped_start);
+            log::info!(
+                "drag started at ({},{}) (raw cursor ({},{}))",
+                snapped_start.x, snapped_start.y, cursor_px.x, cursor_px.y
+            );
             *mode = InteractionMode::Drawing { start: snap, cursor: cursor_px };
             // Don't paint the rect yet — wait for the user to actually
             // move past `DRAG_THRESHOLD_PX`. A bare click should look
