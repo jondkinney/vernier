@@ -12,8 +12,12 @@ use vernier_platform::{
     StuckMeasurement, TrayMenu,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
+
+mod capture_worker;
+use capture_worker::CaptureWorker;
 
 /// Minimum gap between HUD redraws / wl_buffer commits.
 /// ~120Hz — enough headroom over typical display refresh that the
@@ -271,6 +275,10 @@ fn run_daemon() -> Result<()> {
     replace_settings(initial_settings.clone());
 
     let (platform, platform_events) = vernier_platform::init()?;
+    // Wrap in Arc so the capture worker thread can hold its own
+    // reference. Everything else still goes through &*platform via
+    // deref coercion — the trait-object API is unchanged.
+    let platform: Arc<dyn Platform> = Arc::from(platform);
     let monitors = platform.monitors()?;
     log::info!("monitors detected: {}", monitors.len());
     for m in &monitors {
@@ -601,6 +609,13 @@ fn run_daemon() -> Result<()> {
     // captures our own overlay surface; without freezing, our own lines
     // would be detected as edges on the next frame).
     let mut frozen_frame: Option<NativeFrame> = None;
+    // Live mode only: background-thread screen-capture worker. `Some`
+    // when measure mode is ON AND freeze_screen is OFF. The daemon's
+    // hot path pulls the latest frame via try_latest_frame() without
+    // blocking on `CGWindowListCreateImage`. None means either
+    // measure mode is off or freeze is on (capture is a one-shot in
+    // freeze mode, not a stream).
+    let mut capture_worker: Option<CaptureWorker> = None;
 
     while let Ok(event) = combined_rx.recv() {
         match event {
@@ -615,7 +630,7 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 last_esc_at = None;
-                toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
+                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
                 ensure_prefs_window(&mut prefs_child);
@@ -630,7 +645,7 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 last_esc_at = None;
-                toggle_measurement(&mut mode, &mut overlay, &*platform, primary.id, &mut frozen_frame, &held_rects, &guides, &stuck_measurements, color_alternate);
+                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
                 let now = Instant::now();
@@ -684,7 +699,7 @@ fn run_daemon() -> Result<()> {
                     }
                     if needs_redraw && last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
                         last_hud_redraw = Instant::now();
-                        refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
+                        refresh_frame_if_live(capture_worker.as_ref(), &mut frozen_frame);
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
                             &mode,
@@ -773,7 +788,7 @@ fn run_daemon() -> Result<()> {
                 }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
                     last_hud_redraw = Instant::now();
-                    refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
+                    refresh_frame_if_live(capture_worker.as_ref(), &mut frozen_frame);
                     // Active resize wins; otherwise compute the
                     // handle the cursor is hovering on any held rect.
                     let active_handle = resizing.map(|op| op.handle).or_else(|| {
@@ -987,9 +1002,10 @@ fn run_daemon() -> Result<()> {
                                 do_take_normal_screenshot(
                                     &mut mode,
                                     &mut overlay,
-                                    &*platform,
+                                    &platform,
                                     primary.id,
                                     &mut frozen_frame,
+                                    &mut capture_worker,
                                     &mut held_rects,
                                     &mut guides,
                                     &mut stuck_measurements,
@@ -1009,9 +1025,10 @@ fn run_daemon() -> Result<()> {
                                 toggle_measurement(
                                     &mut mode,
                                     &mut overlay,
-                                    &*platform,
+                                    &platform,
                                     primary.id,
                                     &mut frozen_frame,
+                                    &mut capture_worker,
                                     &held_rects,
                                     &guides,
                                     &stuck_measurements,
@@ -1071,12 +1088,13 @@ fn run_daemon() -> Result<()> {
                                 last_selected_guide = None;
                                 if !matches!(mode, InteractionMode::Idle) {
                                     toggle_measurement(
-                                        &mut mode,
-                                        &mut overlay,
-                                        &*platform,
-                                        primary.id,
-                                        &mut frozen_frame,
-                                        &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                                         &guides,
                                         &stuck_measurements,
                                         color_alternate,
@@ -1618,12 +1636,13 @@ fn run_daemon() -> Result<()> {
                             last_esc_at = None;
                             pre_clear_freeze = false;
                             toggle_measurement(
-                                &mut mode,
-                                &mut overlay,
-                                &*platform,
-                                primary.id,
-                                &mut frozen_frame,
-                                &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                                 &guides,
                                 &stuck_measurements,
                                 color_alternate,
@@ -1937,12 +1956,13 @@ fn run_daemon() -> Result<()> {
                         pending_guide_shift_acked = false;
                         last_esc_at = None;
                         toggle_measurement(
-                            &mut mode,
-                            &mut overlay,
-                            &*platform,
-                            primary.id,
-                            &mut frozen_frame,
-                            &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                             &guides,
                             &stuck_measurements,
                             color_alternate,
@@ -2045,12 +2065,13 @@ fn run_daemon() -> Result<()> {
                         active_toast = None;
                         toast_until = None;
                         toggle_measurement(
-                            &mut mode,
-                            &mut overlay,
-                            &*platform,
-                            primary.id,
-                            &mut frozen_frame,
-                            &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                             &guides,
                             &stuck_measurements,
                             color_alternate,
@@ -2383,12 +2404,13 @@ fn run_daemon() -> Result<()> {
                     // spawn as the right-click menu's
                     // "Take Normal Screenshot" row.
                     do_take_normal_screenshot(
-                        &mut mode,
-                        &mut overlay,
-                        &*platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &mut held_rects,
                         &mut guides,
                         &mut stuck_measurements,
                         &mut nudge_selection,
@@ -2740,12 +2762,13 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(other) => log::debug!("platform event: {other:?}"),
             MainEvent::Ipc(IpcCmd::Toggle) => {
                 toggle_measurement(
-                    &mut mode,
-                    &mut overlay,
-                    &*platform,
-                    primary.id,
-                    &mut frozen_frame,
-                    &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                     &guides,
                     &stuck_measurements,
                     color_alternate,
@@ -2853,7 +2876,28 @@ fn run_daemon() -> Result<()> {
                             }
                             current_accel = new_accel_opt;
                         }
+                        let was_frozen = current_settings().general.freeze_screen;
                         replace_settings(s);
+                        let is_frozen = current_settings().general.freeze_screen;
+                        // freeze_screen toggled mid-session while
+                        // measure mode is on: spin the capture worker
+                        // up or down to match. Freeze → live needs a
+                        // fresh capture worker; live → freeze must
+                        // stop the existing worker so it isn't still
+                        // pegging CPU producing frames nobody reads.
+                        if was_frozen != is_frozen && !matches!(mode, InteractionMode::Idle) {
+                            if is_frozen {
+                                if let Some(w) = capture_worker.take() {
+                                    w.stop();
+                                }
+                            } else {
+                                capture_worker = Some(CaptureWorker::start(
+                                    Arc::clone(&platform),
+                                    primary.id,
+                                    LIVE_CAPTURE_INTERVAL,
+                                ));
+                            }
+                        }
                         // Push a fresh HUD frame so prefs that
                         // affect overlay rendering (show_cursor,
                         // display_units, wh_indicators, guide
@@ -2864,7 +2908,7 @@ fn run_daemon() -> Result<()> {
                         // a current frame on save instead of
                         // waiting for the next pointer event.
                         if !matches!(mode, InteractionMode::Idle) {
-                            refresh_frame_if_live(&*platform, primary.id, &mut frozen_frame);
+                            refresh_frame_if_live(capture_worker.as_ref(), &mut frozen_frame);
                             if let Some((x, y)) = last_pointer_xy {
                                 last_hud_redraw = Instant::now();
                                 let toast = current_toast(&active_toast, toast_until);
@@ -2914,12 +2958,13 @@ fn run_daemon() -> Result<()> {
                 toast_until = None;
                 if exit_measurement {
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &*platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                         &guides,
                         &stuck_measurements,
                         color_alternate,
@@ -3046,12 +3091,13 @@ fn run_daemon() -> Result<()> {
                     // Drop input capture + transition to true Idle
                     // with content preserved (or hide if empty).
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &*platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &held_rects,
+                                    &mut mode,
+                                    &mut overlay,
+                                    &platform,
+                                    primary.id,
+                                    &mut frozen_frame,
+                                    &mut capture_worker,
+                                    &held_rects,
                         &guides,
                         &stuck_measurements,
                         color_alternate,
@@ -3158,49 +3204,38 @@ fn set_primary_scale_factor(s: f64) {
 /// Errors are logged at debug — a transient capture miss just leaves
 /// the previous frame in place for this redraw.
 ///
-/// Throttled to `LIVE_CAPTURE_MIN_INTERVAL` between calls. macOS's
-/// `CGDisplayCreateImage` is ~50–100 ms on a 4K display — calling it
-/// from every HUD redraw (~60 Hz) blocks the main loop and the
-/// cursor lags noticeably. 5 Hz is fast enough that the snap-to-edge
-/// targets feel "live" while leaving the rest of the frame budget
-/// for HUD render and event handling. Wayland's PipeWire path is
-/// much cheaper but the throttle is harmless there.
+/// Pull the latest frame from the background capture worker into
+/// `frozen_frame` if one is ready. Non-blocking — when the worker
+/// hasn't produced a new frame since the last pull, the call is
+/// effectively free and `frozen_frame` keeps its previous value
+/// (which edge detection then uses against a slightly older snapshot,
+/// invisible to the user during normal measuring).
+///
+/// In freeze-screen mode `capture_worker` is `None`; the call is a
+/// no-op and `frozen_frame` stays pinned to the snapshot captured at
+/// measurement-mode entry. The R-shortcut handler and
+/// `toggle_measurement`'s entry path still use synchronous
+/// `capture_screen_native` calls — those are explicit user-initiated
+/// captures, not the hot path the worker exists to unblock.
 fn refresh_frame_if_live(
-    platform: &dyn Platform,
-    monitor: MonitorId,
+    capture_worker: Option<&CaptureWorker>,
     frozen_frame: &mut Option<NativeFrame>,
 ) {
-    if current_settings().general.freeze_screen {
-        return;
-    }
-    // 100 ms (10 Hz). The `CGWindowListCreateImage` call on macOS is
-    // ~30–60 ms on a 4K display; at 10 Hz that's ~30–60% of the main
-    // loop's time slice between captures, which still leaves the
-    // cursor responsive. Previously sat at 200 ms when we suspected
-    // cursor blocking, but the cursor stays smooth now that
-    // `NSCursor::hide()` (sticky, refcounted) is doing the work
-    // instead of `setHiddenUntilMouseMoves` (flashed visible on
-    // every move).
-    const LIVE_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(100);
-    // Per-call static — cheap to look up, no need to thread state
-    // through every caller (there are several refresh sites).
-    use std::sync::Mutex;
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    {
-        let mut last = LAST.lock().unwrap();
-        let now = Instant::now();
-        if let Some(t) = *last {
-            if now.duration_since(t) < LIVE_CAPTURE_MIN_INTERVAL {
-                return;
-            }
+    if let Some(worker) = capture_worker {
+        if let Some(frame) = worker.try_latest_frame() {
+            *frozen_frame = Some(frame);
         }
-        *last = Some(now);
-    }
-    match platform.capture_screen_native(monitor) {
-        Ok(f) => *frozen_frame = Some(f),
-        Err(e) => log::debug!("live-frame capture skipped: {e}"),
     }
 }
+
+/// Cadence at which the live-mode capture worker calls
+/// `CGWindowListCreateImage`. 100 ms keeps edge detection's input
+/// fresh within ~one cursor-trail distance while leaving the
+/// capture thread spending most of its time idle. The capture itself
+/// is 30–60 ms on a 2× Retina display, so 100 ms is also the natural
+/// floor — going lower would just back-pressure on the previous
+/// capture's tail.
+const LIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Pull the currently-configured guide color + measurement format
 /// from settings and write them into a freshly-built `Hud`. Called
@@ -4875,9 +4910,10 @@ fn finish_held_screenshot(
 fn do_take_normal_screenshot(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
-    platform: &dyn Platform,
+    platform: &Arc<dyn Platform>,
     monitor: MonitorId,
     frozen_frame: &mut Option<NativeFrame>,
+    capture_worker: &mut Option<CaptureWorker>,
     held_rects: &mut Vec<HeldRect>,
     guides: &mut Vec<Guide>,
     stuck_measurements: &mut Vec<StuckMeasurement>,
@@ -4918,6 +4954,7 @@ fn do_take_normal_screenshot(
         platform,
         monitor,
         frozen_frame,
+        capture_worker,
         held_rects,
         guides,
         stuck_measurements,
@@ -5008,9 +5045,10 @@ fn omarchy_font_present() -> bool {
 fn toggle_measurement(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
-    platform: &dyn Platform,
+    platform: &Arc<dyn Platform>,
     monitor: MonitorId,
     frozen_frame: &mut Option<NativeFrame>,
+    capture_worker: &mut Option<CaptureWorker>,
     held_rects: &[HeldRect],
     guides: &[Guide],
     stuck_measurements: &[StuckMeasurement],
@@ -5049,6 +5087,17 @@ fn toggle_measurement(
                 *frozen_frame = None;
             }
         }
+        // Live mode → spawn the background capture worker so cursor
+        // moves don't stall behind `CGWindowListCreateImage`. Freeze
+        // mode → leave it `None`; the frozen frame captured above is
+        // all edge detection needs until the user toggles off.
+        if !current_settings().general.freeze_screen {
+            *capture_worker = Some(CaptureWorker::start(
+                Arc::clone(platform),
+                monitor,
+                LIVE_CAPTURE_INTERVAL,
+            ));
+        }
         *mode = InteractionMode::Hover { cursor: Px::default() };
         overlay.set_input_capturing(true);
         let mut hud = Hud::hover((-100.0, -100.0));
@@ -5062,6 +5111,13 @@ fn toggle_measurement(
         overlay.set_hud(Some(hud));
         overlay.show();
         return;
+    }
+    // Stop the capture worker on every measure-mode OFF transition,
+    // both passthrough-with-content and clean-exit. The thread joins
+    // on the next iteration of its loop, which is at most
+    // LIVE_CAPTURE_INTERVAL away.
+    if let Some(w) = capture_worker.take() {
+        w.stop();
     }
     let has_content = !held_rects.is_empty()
         || !guides.is_empty()
