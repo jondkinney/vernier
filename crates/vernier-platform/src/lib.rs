@@ -329,6 +329,16 @@ pub trait OverlayOps: Send {
     /// `false` → the cursor is hidden so we can draw our own custom
     /// crosshair / move / resize cursor instead.
     fn set_system_pointer_visible(&mut self, visible: bool);
+    /// Swap the visible system pointer between the default arrow and
+    /// the pointing-hand cursor used to indicate a clickable element
+    /// (e.g. the camera-icon pill on a held rect). Has no visible
+    /// effect while the pointer is hidden — backends should latch the
+    /// requested kind and apply it the next time the pointer is
+    /// shown. Default impl is a no-op so non-macOS backends opt in
+    /// at their own pace.
+    fn set_pointing_hand_cursor(&mut self, pointing: bool) {
+        let _ = pointing;
+    }
     /// Confine the system pointer to a (x, y, w, h) rectangle in
     /// surface-local (logical) px, via `wp_pointer_constraints_v1`.
     /// Used to physically clamp the cursor while a stuck-pill drag
@@ -377,6 +387,9 @@ impl OverlayHandle {
     }
     pub fn set_system_pointer_visible(&mut self, visible: bool) {
         self.inner.set_system_pointer_visible(visible)
+    }
+    pub fn set_pointing_hand_cursor(&mut self, pointing: bool) {
+        self.inner.set_pointing_hand_cursor(pointing)
     }
     pub fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32) {
         self.inner.confine_pointer(x, y, w, h)

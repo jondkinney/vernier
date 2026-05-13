@@ -97,6 +97,7 @@ pub(crate) fn create(monitor: MonitorId) -> Result<OverlayHandle> {
             dynamic_hud_image: RefCell::new(None),
             background_image: RefCell::new(None),
             cursor_hidden: RefCell::new(false),
+            pointing_hand: RefCell::new(false),
             last_flags: RefCell::new(0),
             transparent_cursor: RefCell::new(None),
             captures_input: RefCell::new(false),
@@ -350,19 +351,42 @@ impl OverlayOps for MacOverlay {
                         // override a refcounted hide — even with an
                         // arrow cursor in the rect, a hidden NSCursor
                         // stays invisible. show_cursor_on then sets
-                        // the shape (arrow today, pointing-hand
-                        // later) that the newly-visible cursor takes.
+                        // the shape (arrow or pointing-hand) that the
+                        // newly-visible cursor takes.
                         unsafe { NSCursor::unhide() };
                         show_cursor_on(&o.view);
                     } else if !visible && !was_hidden {
                         *o.view.ivars().cursor_hidden.borrow_mut() = true;
                         // Re-establish the global hide so the cursor
-                        // disappears off the held rect again, even on
-                        // monitors / windows where AppKit's cursor-
-                        // rect arbitration has lost track of our
-                        // transparent cursor.
+                        // disappears off the held rect / pill again,
+                        // even on monitors / windows where AppKit's
+                        // cursor-rect arbitration has lost track of
+                        // our transparent cursor.
                         unsafe { NSCursor::hide() };
                         hide_cursor_on(&o.view);
+                    }
+                }
+            });
+        });
+    }
+
+    fn set_pointing_hand_cursor(&mut self, pointing: bool) {
+        let monitor = self.monitor;
+        super::app::run_on_main_async(move || {
+            super::with_main_state(|s| {
+                if let Some(o) = s.overlays.get(&monitor) {
+                    let prev = *o.view.ivars().pointing_hand.borrow();
+                    if prev == pointing {
+                        return;
+                    }
+                    *o.view.ivars().pointing_hand.borrow_mut() = pointing;
+                    // Re-apply only when the system pointer is
+                    // currently shown — show_cursor_on reads the
+                    // pointing_hand flag and picks the right NSCursor.
+                    // When the cursor is hidden the latched flag
+                    // applies on the next visible→true transition.
+                    if !*o.view.ivars().cursor_hidden.borrow() {
+                        show_cursor_on(&o.view);
                     }
                 }
             });
@@ -413,6 +437,13 @@ pub(crate) struct OverlayIvars {
     /// permanently hidden after measurement mode, or make Alt's
     /// momentary unhide a no-op).
     cursor_hidden: RefCell<bool>,
+    /// Which AppKit cursor `show_cursor_on` should set when the
+    /// pointer becomes visible — `false` = `arrowCursor`, `true` =
+    /// `pointingHandCursor`. Daemon flips this whenever the hover
+    /// state crosses a clickable element (the camera-icon pill on
+    /// a held rect, today). Latched even while the cursor is
+    /// hidden so the next show picks up the right kind.
+    pointing_hand: RefCell<bool>,
     /// Last seen NSEvent modifier-flag bits. `flagsChanged:` only
     /// tells us "the modifiers changed"; we diff against this to
     /// emit the right XKB press/release pair through the
@@ -768,7 +799,13 @@ fn show_cursor_on(view: &OverlayView) {
     if let Some(window) = view.window() {
         unsafe { window.invalidateCursorRectsForView(view) };
     }
-    unsafe { NSCursor::arrowCursor().set() };
+    let pointing = *view.ivars().pointing_hand.borrow();
+    let cursor = if pointing {
+        unsafe { NSCursor::pointingHandCursor() }
+    } else {
+        unsafe { NSCursor::arrowCursor() }
+    };
+    unsafe { cursor.set() };
 }
 
 /// Build (once per view) and `.set()` a 16x16 fully transparent

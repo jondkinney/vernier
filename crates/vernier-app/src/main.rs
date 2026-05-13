@@ -649,6 +649,11 @@ fn run_daemon() -> Result<()> {
     // over the overlay. We toggle on hover transitions instead of
     // every frame so set_cursor / set_shape calls don't spam.
     let mut system_pointer_visible: bool = false;
+    // True when the cursor sits over an element that responds to a
+    // click (the camera-icon pill on a held rect). Drives the macOS
+    // pointing-hand cursor so the user gets the standard "this is
+    // clickable" affordance instead of the plain arrow.
+    let mut pointing_hand_cursor: bool = false;
     // Snapshot taken when measurement mode is entered. Edge detection
     // runs against this frozen frame so the HUD strokes we draw don't
     // appear in subsequent captures (the Wayland screencast portal
@@ -782,6 +787,10 @@ fn run_daemon() -> Result<()> {
                     if !system_pointer_visible {
                         overlay.set_system_pointer_visible(true);
                         system_pointer_visible = true;
+                    }
+                    if pointing_hand_cursor {
+                        overlay.set_pointing_hand_cursor(false);
+                        pointing_hand_cursor = false;
                     }
                     let new_hovered = {
                         let m = context_menu.as_ref().unwrap();
@@ -921,6 +930,11 @@ fn run_daemon() -> Result<()> {
                         overlay.set_system_pointer_visible(want);
                         system_pointer_visible = want;
                     }
+                    let want_hand = want && cursor_over_any_camera_pill(cursor_px, &held_rects);
+                    if want_hand != pointing_hand_cursor {
+                        overlay.set_pointing_hand_cursor(want_hand);
+                        pointing_hand_cursor = want_hand;
+                    }
                     let toast = current_toast(&active_toast, toast_until);
                     refresh_hud(
                         &mode,
@@ -998,6 +1012,10 @@ fn run_daemon() -> Result<()> {
                         if !system_pointer_visible {
                             overlay.set_system_pointer_visible(true);
                             system_pointer_visible = true;
+                        }
+                        if pointing_hand_cursor {
+                            overlay.set_pointing_hand_cursor(false);
+                            pointing_hand_cursor = false;
                         }
                         log::info!("context menu opened at ({:.0},{:.0})", ox, oy);
                     }
@@ -1672,13 +1690,13 @@ fn run_daemon() -> Result<()> {
                         alt_held,
                     );
                     // Press / release can change the cursor-over-rect
-                    // state without a subsequent PointerMove (e.g. a
-                    // drag completes inside the just-drawn rect — the
-                    // user expects the system arrow to appear
-                    // immediately even if they don't wiggle the
-                    // mouse). The throttled redraw block below only
-                    // fires from PointerMove, so the system-pointer
-                    // toggle has to run here too.
+                    // state without a subsequent PointerMove (e.g. drag
+                    // completes inside the just-drawn rect — the user
+                    // expects the system arrow to appear immediately
+                    // even if they don't wiggle the mouse). The
+                    // throttled redraw block below only fires from
+                    // PointerMove, so the system-pointer toggle has to
+                    // run here too.
                     {
                         let cursor_px = Px::new(x as i32, y as i32);
                         let active_handle = resizing.map(|op| op.handle).or_else(|| {
@@ -1710,6 +1728,12 @@ fn run_daemon() -> Result<()> {
                         if want != system_pointer_visible {
                             overlay.set_system_pointer_visible(want);
                             system_pointer_visible = want;
+                        }
+                        let want_hand =
+                            want && cursor_over_any_camera_pill(cursor_px, &held_rects);
+                        if want_hand != pointing_hand_cursor {
+                            overlay.set_pointing_hand_cursor(want_hand);
+                            pointing_hand_cursor = want_hand;
                         }
                     }
                     last_hud_redraw = Instant::now();
@@ -1973,6 +1997,12 @@ fn run_daemon() -> Result<()> {
                                 if want != system_pointer_visible {
                                     overlay.set_system_pointer_visible(want);
                                     system_pointer_visible = want;
+                                }
+                                let want_hand =
+                                    want && cursor_over_any_camera_pill(cursor_px, &held_rects);
+                                if want_hand != pointing_hand_cursor {
+                                    overlay.set_pointing_hand_cursor(want_hand);
+                                    pointing_hand_cursor = want_hand;
                                 }
                             }
                             last_hud_redraw = Instant::now();
@@ -5891,6 +5921,18 @@ fn apply_guides_to_edges(
             }
         }
     }
+}
+
+/// True when the cursor is over the W×H / camera-icon pill of any
+/// held rect. The pill is the click target for capturing a sub-screen
+/// screenshot of that rect, so the system pointer becomes a
+/// pointing hand here to advertise clickability.
+fn cursor_over_any_camera_pill(cursor_px: Px, held_rects: &[HeldRect]) -> bool {
+    held_rects.iter().any(|r| {
+        let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+        let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+        cursor_over_pill(cursor_px, rs, re)
+    })
 }
 
 /// True when `cursor` (logical pixels) sits inside the W×H pill area
