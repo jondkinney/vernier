@@ -1,0 +1,102 @@
+name: release-macos
+
+# Fires whenever release.sh publishes a new GitHub Release. Builds
+# the Apple Silicon DMG and attaches it to the release. Also exposed
+# via workflow_dispatch so we can backfill an old tag if this
+# workflow was added later, or rerun a failed build without cutting
+# a new version.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.1.5)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build aarch64 .app + DMG
+    # macos-latest is Apple Silicon (M-series) as of GitHub Actions
+    # 2024+. Pinning to the meta-tag avoids drift when Apple ships a
+    # new macOS major; the build is OS-version-agnostic.
+    runs-on: macos-latest
+    permissions:
+      # gh release upload writes to the release assets.
+      contents: write
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building for tag=$TAG version=$VERSION"
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install packaging tools
+        run: |
+          # create-dmg drives hdiutil + AppleScript to lay out the
+          # drag-to-Applications window. librsvg gives us a clean
+          # 1024px icon render from the source SVG (otherwise the
+          # 1024 slot would be a sips upscale of the 512 PNG).
+          brew install create-dmg librsvg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        env:
+          # Mirror release.sh: strip workspace + cargo paths out of
+          # the binary so backtraces don't carry the runner's
+          # directory layout into the shipped artifact.
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=/Users/runner/.cargo=/cargo
+        run: cargo build --release --bin vernier --target aarch64-apple-darwin
+
+      - name: Stage binary at target/release for packager
+        # package.sh reads target/release/vernier. With an explicit
+        # --target the binary lands under target/aarch64-apple-darwin/
+        # — symlink rather than copy so we keep one source of truth.
+        run: |
+          mkdir -p target/release
+          ln -sf "$PWD/target/aarch64-apple-darwin/release/vernier" target/release/vernier
+
+      - name: Build .app bundle + DMG
+        run: ./packaging/macos/package.sh
+
+      - name: Verify bundle signature
+        run: codesign --verify --verbose=2 target/macos/Vernier.app
+
+      - name: Locate DMG
+        id: dmg
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          DMG="target/macos/Vernier-${VERSION}-aarch64.dmg"
+          if [ ! -f "$DMG" ]; then
+            echo "error: $DMG not found" >&2
+            ls -la target/macos/ >&2
+            exit 1
+          fi
+          shasum -a 256 "$DMG"
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.dmg.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
