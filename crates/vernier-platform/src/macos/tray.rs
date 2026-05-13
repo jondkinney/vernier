@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, Sel};
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
@@ -42,30 +43,39 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
             PlatformError::Other(anyhow::anyhow!("NSStatusItem.button was nil"))
         })?;
 
-        // Try an SF Symbol first ("ruler" matches Vernier's
-        // "measurement tool" identity). Fall back to a plain "V"
-        // title if the symbol isn't available (pre-Big Sur, or if
-        // the bundle isn't recognised by Image I/O). NSStatusBar
-        // buttons need *some* visible content — empty title +
-        // empty image renders a zero-width button on Sequoia,
-        // which is what we were seeing.
-        let symbol_name = NSString::from_str("ruler");
-        let accessibility = NSString::from_str("Vernier");
-        let symbol_image: Option<Retained<NSImage>> = unsafe {
-            NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &symbol_name,
-                Some(&accessibility),
-            )
-        };
-        match symbol_image {
-            Some(img) => {
-                log::info!("macos tray: using SF Symbol 'ruler'");
-                unsafe { img.setTemplate(true) };
-                button.setImage(Some(&img));
-            }
-            None => {
-                log::info!("macos tray: SF Symbol unavailable, falling back to 'V' title");
-                button.setTitle(&NSString::from_str("V"));
+        // Prefer Vernier's custom V glyph (the dashed-tick variant of
+        // the brand mark, designed to live in the menu bar at
+        // ~18 pt). Rasterized from the SVG via tiny-skia, wrapped
+        // as a template NSImage so AppKit tints it for light / dark
+        // menu bars automatically. Falls through to the SF Symbol
+        // "ruler" if anything in the render path fails (missing
+        // assets, allocation), and to a plain "V" title as a last
+        // resort — NSStatusBar buttons render a zero-width button
+        // on Sequoia if both image and title are empty.
+        const TRAY_GLYPH_PT: f64 = 18.0;
+        if let Some(img) = render_tray_template_image(TRAY_GLYPH_PT) {
+            log::info!("macos tray: using custom V glyph");
+            unsafe { img.setTemplate(true) };
+            button.setImage(Some(&img));
+        } else {
+            let symbol_name = NSString::from_str("ruler");
+            let accessibility = NSString::from_str("Vernier");
+            let symbol_image: Option<Retained<NSImage>> = unsafe {
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &symbol_name,
+                    Some(&accessibility),
+                )
+            };
+            match symbol_image {
+                Some(img) => {
+                    log::info!("macos tray: custom glyph failed, using SF Symbol 'ruler'");
+                    unsafe { img.setTemplate(true) };
+                    button.setImage(Some(&img));
+                }
+                None => {
+                    log::info!("macos tray: no image available, falling back to 'V' title");
+                    button.setTitle(&NSString::from_str("V"));
+                }
             }
         }
         button.setToolTip(Some(&NSString::from_str(&menu.tooltip)));
@@ -259,4 +269,57 @@ impl TrayTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         unsafe { msg_send![mtm.alloc::<Self>(), init] }
     }
+}
+
+/// Build the menu-bar template image at the requested point size.
+/// Rasterizes the V-glyph SVG at 2× the requested points so it's
+/// crisp on Retina, then wraps the bytes in a CGImage and hands it
+/// to NSImage with the *logical* size as its declared dimensions
+/// (so AppKit scales the @2x backing automatically). Returns `None`
+/// if any step in the render pipeline fails — caller should fall
+/// through to a glyph the OS can render itself.
+fn render_tray_template_image(size_pt: f64) -> Option<Retained<NSImage>> {
+    use objc2_core_foundation::CFData;
+    use objc2_core_graphics::{
+        CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
+        CGImageAlphaInfo,
+    };
+
+    let pixel_size = (size_pt * 2.0).round().max(1.0) as u32;
+    let rgba = crate::icon::render_tray_icon_rgba(pixel_size);
+    if rgba.len() != (pixel_size * pixel_size * 4) as usize {
+        return None;
+    }
+
+    let data = unsafe { CFData::new(None, rgba.as_ptr(), rgba.len() as isize) }?;
+    let provider = CGDataProvider::with_cf_data(Some(&data))?;
+    let colorspace = CGColorSpace::new_device_rgb()?;
+    // The SVG rasterizer (`rasterize_svg`) demultiplies before
+    // returning, so the bytes are straight (un-premultiplied) RGBA.
+    // `Last` alpha info matches that layout; using
+    // `PremultipliedLast` here would darken the glyph against the
+    // template's tinted backing.
+    let bitmap_info = CGBitmapInfo(CGImageAlphaInfo::Last.0);
+    let cg = unsafe {
+        CGImage::new(
+            pixel_size as usize,
+            pixel_size as usize,
+            8,
+            32,
+            (pixel_size as usize) * 4,
+            Some(&colorspace),
+            bitmap_info,
+            Some(&provider),
+            std::ptr::null(),
+            false,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
+    }?;
+
+    let ns_size = NSSize {
+        width: size_pt,
+        height: size_pt,
+    };
+    let image = unsafe { NSImage::initWithCGImage_size(NSImage::alloc(), &cg, ns_size) };
+    Some(image)
 }
