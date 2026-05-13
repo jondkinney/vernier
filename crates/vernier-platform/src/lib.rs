@@ -154,6 +154,86 @@ pub fn primary_screen_visible_height() -> Option<f32> {
     macos::primary_screen_visible_height()
 }
 
+/// macOS-only: declare *this* process a foreground (Dock-visible,
+/// Cmd-Tab-listable) application AND make it active. Must be called
+/// before AppKit initializes — i.e. before the first
+/// `NSApplication::sharedApplication` invocation by the GUI framework
+/// (eframe, winit, …). Used by the prefs subprocess at startup.
+///
+/// Background: when the daemon spawns the prefs subprocess via
+/// `Command::spawn`, the new process inherits enough of the daemon's
+/// state that Sequoia treats it as non-promotable — every
+/// `setActivationPolicy(.Regular)` / `activate()` call from inside
+/// the subprocess silently no-ops, and `NSRunningApplication
+/// .activateWithOptions` from the daemon side also no-ops because
+/// the target isn't eligible. Calling `TransformProcessType` with
+/// `kProcessTransformToForegroundApplication` BEFORE AppKit comes up
+/// breaks the inheritance: the process is reclassified at the
+/// kernel level, so when AppKit / eframe initializes it sees a fresh
+/// foreground app, the window appears in the Dock, and subsequent
+/// activation calls work.
+#[cfg(target_os = "macos")]
+pub fn promote_to_foreground_application() {
+    use std::os::raw::c_int;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcessSerialNumber {
+        high: u32,
+        low: u32,
+    }
+    const K_CURRENT_PROCESS: u32 = 2;
+    const K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION: u32 = 1;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn TransformProcessType(
+            psn: *const ProcessSerialNumber,
+            transform_type: u32,
+        ) -> c_int;
+    }
+    let psn = ProcessSerialNumber {
+        high: 0,
+        low: K_CURRENT_PROCESS,
+    };
+    let status = unsafe {
+        TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION)
+    };
+    if status != 0 {
+        log::warn!(
+            "promote_to_foreground_application: TransformProcessType returned {status}"
+        );
+        return;
+    }
+    log::info!("macos: promoted process to ForegroundApplication");
+
+    // The transform alone classifies the process as foreground, but
+    // doesn't bring its window to the front — there's no window yet
+    // when this function runs (the GUI framework hasn't initialized
+    // AppKit). Schedule the actual activate for ~400 ms after
+    // startup, by which time eframe / winit will have created the
+    // NSWindow and NSRunningApplication.activateWithOptions has
+    // something to surface. Without this delay every activate call
+    // during AppKit startup is a no-op against a not-yet-existent
+    // window, and the prefs window opens behind every other app
+    // until the user manually clicks it.
+    std::thread::Builder::new()
+        .name("vernier-foreground-activate".into())
+        .spawn(|| {
+            use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let running = unsafe { NSRunningApplication::currentApplication() };
+            unsafe {
+                running.activateWithOptions(
+                    NSApplicationActivationOptions::ActivateAllWindows,
+                );
+            }
+            log::info!(
+                "macos: deferred activate fired (NSRunningApplication.activateWithOptions)"
+            );
+        })
+        .expect("spawn vernier-foreground-activate thread");
+}
+
 /// macOS-only: bring the app owning `pid` to the foreground. Routes
 /// through `NSRunningApplication.activateWithOptions(.AllWindows)`
 /// so every window the prefs process owns gets raised, regardless

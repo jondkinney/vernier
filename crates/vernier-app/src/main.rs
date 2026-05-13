@@ -160,6 +160,15 @@ fn existing_daemon_responsive() -> bool {
 /// launcher after a previous Quit only opens prefs and leaves the
 /// hotkey dead.
 fn run_prefs_window() -> Result<()> {
+    // Sequoia gotcha: a subprocess spawned by an `.accessory` daemon
+    // can't self-activate via AppKit APIs (every
+    // `setActivationPolicy(.Regular)` / `activate()` call silently
+    // no-ops). The kernel-level `TransformProcessType` does work —
+    // call it BEFORE eframe initializes AppKit so the window appears
+    // in the Dock and the activate-from-daemon path actually surfaces
+    // the window. No-op on non-macOS.
+    #[cfg(target_os = "macos")]
+    vernier_platform::promote_to_foreground_application();
     let lock_path = prefs_lock_path()?;
     let _prefs_lock = match acquire_prefs_singleton_lock(&lock_path) {
         Some(l) => l,
