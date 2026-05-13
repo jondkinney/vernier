@@ -95,7 +95,7 @@ impl ksni::Tray for VernierTray {
         String::new()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let rgba = render_tray_icon_rgba(64);
+        let rgba = crate::icon::render_tray_icon_rgba(64);
         vec![ksni::Icon {
             width: 64,
             height: 64,
@@ -246,26 +246,5 @@ fn run_ksni_tray(
 /// SVG sources for the app icon (full color) and the tray icon
 /// (monochrome, `currentColor`-based, recolored to white at render
 /// time). Embedded at compile time so the binary is self-contained.
-const APP_ICON_SVG: &[u8] = include_bytes!("../../../assets/icons/svg/vernier.svg");
-const TRAY_ICON_SVG: &[u8] = include_bytes!("../../../assets/icons/svg/vernier-symbolic.svg");
-
-/// Render the colored Vernier app icon at `size × size`. Used by
-/// the daemon to drop a PNG on disk for desktop / launcher entries
-/// and by the prefs window's About panel.
-pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
-    rasterize_or_transparent(APP_ICON_SVG, size)
-}
-
-/// Render the monochrome tray/menubar icon at `size × size`. The
-/// source SVG uses `currentColor`; substitute white so it reads
-/// against the dark waybar background most distros ship.
-pub fn render_tray_icon_rgba(size: u32) -> Vec<u8> {
-    let recolored = std::str::from_utf8(TRAY_ICON_SVG)
-        .unwrap_or("")
-        .replace("currentColor", "#ffffff");
-    rasterize_or_transparent(recolored.as_bytes(), size)
-}
-
-fn rasterize_or_transparent(svg_bytes: &[u8], size: u32) -> Vec<u8> {
-    crate::rasterize_svg(svg_bytes, size).unwrap_or_else(|| vec![0u8; (size * size * 4) as usize])
-}
+// Icon rasterizers moved to `crate::icon` so they remain available
+// on non-Linux platforms (this whole file is cfg-gated to Linux).

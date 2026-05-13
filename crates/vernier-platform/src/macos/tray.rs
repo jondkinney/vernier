@@ -1,0 +1,262 @@
+//! NSStatusItem-backed menubar icon.
+//!
+//! AppKit gives each process a single status item by convention.
+//! The icon is a template image (auto-tinted for light/dark menu
+//! bars) sourced from `crate::icon::render_tray_icon_rgba`. Menu
+//! items use a single Objective-C target/action that funnels the
+//! activation back through a per-item id stored in the menu
+//! item's `representedObject`.
+
+use std::cell::RefCell;
+
+use objc2::rc::Retained;
+use objc2::runtime::{NSObject, Sel};
+use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::{NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem};
+use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
+
+use crate::{PlatformError, PlatformEvent, Result, TrayHandle, TrayMenu, TrayMenuItem, TrayOps};
+
+pub(crate) struct TrayResources {
+    pub status_item: Retained<NSStatusItem>,
+    pub target: Retained<TrayTarget>,
+}
+
+pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
+    super::app::run_on_main_sync(move || -> Result<TrayHandle> {
+        let mtm = MainThreadMarker::new().expect("tray on main");
+        log::info!("macos tray: creating NSStatusItem on main");
+
+        if super::with_main_state(|s| s.tray.is_some()) {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "macOS allows only one tray status item per process"
+            )));
+        }
+
+        let bar = NSStatusBar::systemStatusBar();
+        // NSStatusItem.variableLength == -1.0.
+        let status_item = unsafe { bar.statusItemWithLength(-1.0) };
+        log::info!("macos tray: status item created");
+
+        let button = status_item.button(mtm).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("NSStatusItem.button was nil"))
+        })?;
+
+        // Try an SF Symbol first ("ruler" matches Vernier's
+        // "measurement tool" identity). Fall back to a plain "V"
+        // title if the symbol isn't available (pre-Big Sur, or if
+        // the bundle isn't recognised by Image I/O). NSStatusBar
+        // buttons need *some* visible content — empty title +
+        // empty image renders a zero-width button on Sequoia,
+        // which is what we were seeing.
+        let symbol_name = NSString::from_str("ruler");
+        let accessibility = NSString::from_str("Vernier");
+        let symbol_image: Option<Retained<NSImage>> = unsafe {
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &symbol_name,
+                Some(&accessibility),
+            )
+        };
+        match symbol_image {
+            Some(img) => {
+                log::info!("macos tray: using SF Symbol 'ruler'");
+                unsafe { img.setTemplate(true) };
+                button.setImage(Some(&img));
+            }
+            None => {
+                log::info!("macos tray: SF Symbol unavailable, falling back to 'V' title");
+                button.setTitle(&NSString::from_str("V"));
+            }
+        }
+        button.setToolTip(Some(&NSString::from_str(&menu.tooltip)));
+
+        let target = TrayTarget::new(mtm);
+        // The status-item button itself triggers `on_status_click`
+        // when the user left-clicks. Menu items run through their
+        // own per-item target/action.
+        unsafe {
+            button.setTarget(Some(&*target));
+            button.setAction(Some(sel!(onStatusClick:)));
+        };
+
+        let ns_menu = build_menu(&menu, &target, mtm);
+        status_item.setMenu(Some(&ns_menu));
+
+        // Explicit visibility — defaults to true, but some
+        // launch paths on Sequoia have left items invisible.
+        // Belt-and-suspenders.
+        status_item.setVisible(true);
+
+        super::with_main_state(|s| {
+            s.tray = Some(TrayResources {
+                status_item: status_item.clone(),
+                target: target.clone(),
+            });
+        });
+        log::info!("macos tray: stored TrayResources, visible={}", status_item.isVisible());
+
+        Ok(TrayHandle::from_backend(MacTray {}))
+    })
+}
+
+fn build_menu(menu: &TrayMenu, target: &TrayTarget, mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let ns_menu = unsafe { NSMenu::new(mtm) };
+    for item in &menu.items {
+        append_item(&ns_menu, item, target, mtm);
+    }
+    ns_menu
+}
+
+fn append_item(
+    parent: &NSMenu,
+    item: &TrayMenuItem,
+    target: &TrayTarget,
+    mtm: MainThreadMarker,
+) {
+    match item {
+        TrayMenuItem::Separator => {
+            let sep = unsafe { NSMenuItem::separatorItem(mtm) };
+            unsafe { parent.addItem(&sep) };
+        }
+        TrayMenuItem::Action {
+            id, label, enabled, ..
+        } => {
+            let mi = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    Some(sel!(onMenuItem:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                mi.setTarget(Some(&*target));
+                mi.setEnabled(*enabled);
+                mi.setRepresentedObject(Some(&NSString::from_str(id)));
+                parent.addItem(&mi);
+            };
+        }
+        TrayMenuItem::Toggle {
+            id,
+            label,
+            enabled,
+            checked,
+        } => {
+            let mi = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    Some(sel!(onMenuItem:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                mi.setTarget(Some(&*target));
+                mi.setEnabled(*enabled);
+                mi.setState(if *checked {
+                    objc2_app_kit::NSControlStateValueOn
+                } else {
+                    objc2_app_kit::NSControlStateValueOff
+                });
+                mi.setRepresentedObject(Some(&NSString::from_str(id)));
+                parent.addItem(&mi);
+            };
+        }
+        TrayMenuItem::Submenu { id: _, label, items } => {
+            let mi = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    None,
+                    &NSString::from_str(""),
+                )
+            };
+            let submenu = unsafe { NSMenu::new(mtm) };
+            for sub in items {
+                append_item(&submenu, sub, target, mtm);
+            }
+            unsafe {
+                mi.setSubmenu(Some(&submenu));
+                parent.addItem(&mi);
+            }
+        }
+    }
+}
+
+fn build_template_image(_mtm: MainThreadMarker) -> Retained<NSImage> {
+    // For v0 we use a plain text title on the status item button
+    // instead of an image, dodging the NSBitmapImageRep ceremony.
+    // Returning a 0×0 NSImage is the simplest "no icon" signal;
+    // the caller sets the button title separately.
+    NSImage::new()
+}
+
+struct MacTray {}
+
+impl TrayOps for MacTray {
+    fn update_menu(&mut self, menu: TrayMenu) -> Result<()> {
+        super::app::run_on_main_sync(move || -> Result<()> {
+            let mtm = MainThreadMarker::new().expect("tray update on main");
+            super::with_main_state(|s| {
+                if let Some(t) = s.tray.as_ref() {
+                    let new_menu = build_menu(&menu, &t.target, mtm);
+                    unsafe { t.status_item.setMenu(Some(&new_menu)) };
+                }
+            });
+            Ok(())
+        })
+    }
+
+    fn set_active(&mut self, active: bool) {
+        super::app::run_on_main_async(move || {
+            super::with_main_state(|s| {
+                if let Some(t) = s.tray.as_ref() {
+                    if let Some(button) = unsafe { t.status_item.button(MainThreadMarker::new().expect("main")) } {
+                        unsafe { button.setAppearsDisabled(!active) };
+                    }
+                }
+            });
+        });
+    }
+}
+
+// --- Target/action delegate -------------------------------------------------
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "VernierTrayTarget"]
+    pub(crate) struct TrayTarget;
+
+    impl TrayTarget {
+        #[unsafe(method(onStatusClick:))]
+        fn on_status_click(&self, _sender: Option<&NSObject>) {
+            // The default NSStatusItem menu handling pops the menu
+            // on left-click already. Emit a `TrayIconLeftClicked`
+            // for parity with the Linux SNI event.
+            if let Some(tx) = super::event_tx() {
+                let _ = tx.send(PlatformEvent::TrayIconLeftClicked { x: 0, y: 0 });
+            }
+        }
+
+        #[unsafe(method(onMenuItem:))]
+        fn on_menu_item(&self, sender: Option<&NSMenuItem>) {
+            let Some(item) = sender else { return };
+            let Some(id) = (unsafe { item.representedObject() }) else {
+                return;
+            };
+            let Ok(s) = id.downcast::<NSString>() else {
+                return;
+            };
+            if let Some(tx) = super::event_tx() {
+                let _ = tx.send(PlatformEvent::TrayMenuActivated { id: s.to_string() });
+            }
+        }
+    }
+);
+
+impl TrayTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        unsafe { msg_send![mtm.alloc::<Self>(), init] }
+    }
+}

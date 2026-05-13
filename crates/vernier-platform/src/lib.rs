@@ -5,7 +5,10 @@
 
 pub mod figma_bridge;
 pub mod font;
+mod hud_render;
+mod icon;
 pub mod placement;
+#[cfg(target_os = "linux")]
 mod tray;
 mod types;
 pub use types::*;
@@ -15,7 +18,7 @@ pub use types::*;
 /// at `size × size`. Used by the daemon to drop a PNG on disk so
 /// app launchers can show the same icon as the tray.
 pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
-    tray::render_app_icon_rgba(size)
+    icon::render_app_icon_rgba(size)
 }
 
 /// Rasterize an SVG (`svg_bytes`) into a `size × size` RGBA8
@@ -59,12 +62,118 @@ pub fn rasterize_svg(svg_bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode a PNG (`png_bytes`) and rescale it into a `size × size`
+/// RGBA8 non-premultiplied buffer suitable for `egui::ColorImage`.
+/// Returns `None` if the PNG can't be parsed or the pixmap can't be
+/// allocated. Used by the prefs window to surface macOS `.app` icons
+/// after `sips` has rasterized them from the bundle's `.icns`.
+///
+/// Mirror of `rasterize_svg`'s output contract — both return
+/// demultiplied RGBA so the caller can hand the bytes straight to
+/// `ColorImage::from_rgba_unmultiplied`.
+pub fn rasterize_png(png_bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    let source = resvg::tiny_skia::Pixmap::decode_png(png_bytes).ok()?;
+    let mut out_pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+    let src_w = source.width() as f32;
+    let src_h = source.height() as f32;
+    let src_max = src_w.max(src_h).max(1.0);
+    let scale = size as f32 / src_max;
+    let dx = (size as f32 - src_w * scale) * 0.5;
+    let dy = (size as f32 - src_h * scale) * 0.5;
+    let paint = resvg::tiny_skia::PixmapPaint {
+        opacity: 1.0,
+        blend_mode: resvg::tiny_skia::BlendMode::Source,
+        // FilterNearest would alias the icon's edges; Bilinear is
+        // the right speed/quality for icon downscales at this size.
+        quality: resvg::tiny_skia::FilterQuality::Bilinear,
+    };
+    out_pixmap.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &paint,
+        resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy),
+        None,
+    );
+    let mut out = out_pixmap.data().to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            continue;
+        }
+        let inv = 255.0 / a as f32;
+        px[0] = ((px[0] as f32 * inv).round() as u32).min(255) as u8;
+        px[1] = ((px[1] as f32 * inv).round() as u32).min(255) as u8;
+        px[2] = ((px[2] as f32 * inv).round() as u32).min(255) as u8;
+    }
+    Some(out)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows_impl;
+
+/// macOS-only: bootstrap the AppKit main thread, then spawn the
+/// daemon body on a worker thread and run NSApp's event loop
+/// forever. Never returns. See `macos::app::bootstrap_main` for
+/// the threading model. Callers on non-macOS targets should
+/// invoke their daemon body directly.
+#[cfg(target_os = "macos")]
+pub fn bootstrap_main<F>(daemon_body: F) -> !
+where
+    F: FnOnce() + Send + 'static,
+{
+    macos::bootstrap_main(daemon_body)
+}
+
+/// macOS-only: extract a `.app` bundle's icon as `size × size` RGBA8
+/// non-premultiplied bytes. Routes through `NSWorkspace.iconForFile`
+/// so it handles `.icns`, asset-catalog (`Assets.car`), and custom
+/// icons uniformly. See `macos::handoff_icon` for details.
+///
+/// MUST be called on the main thread.
+#[cfg(target_os = "macos")]
+pub fn extract_macos_app_icon_rgba(
+    bundle_path: &std::path::Path,
+    size: u32,
+) -> Option<Vec<u8>> {
+    macos::extract_macos_app_icon_rgba(bundle_path, size)
+}
+
+/// macOS-only: primary display's visible (working) height in logical
+/// points. Excludes the menu bar and the Dock, so callers sizing a
+/// new window can ask for at most this height and trust the window
+/// won't poke under either. Returns `None` if NSScreen has no main
+/// display registered yet (rare — typical only at very early app
+/// startup before AppKit has enumerated screens).
+#[cfg(target_os = "macos")]
+pub fn primary_screen_visible_height() -> Option<f32> {
+    macos::primary_screen_visible_height()
+}
+
+/// macOS-only: bring the app owning `pid` to the foreground. Routes
+/// through `NSRunningApplication.activateWithOptions(.AllWindows)`
+/// so every window the prefs process owns gets raised, regardless
+/// of which one was last key. Silently no-ops when there's no
+/// running application for the pid (process exited between the
+/// daemon's `try_wait()` check and this call — race window is tiny
+/// but possible).
+#[cfg(target_os = "macos")]
+pub fn focus_macos_app_by_pid(pid: i32) {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let Some(app) =
+        (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
+    else {
+        log::debug!("focus_macos_app_by_pid: no NSRunningApplication for pid {pid}");
+        return;
+    };
+    unsafe {
+        app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+    }
+}
 
 /// OS abstraction. Returned by [`init`] and shared between threads.
 pub trait Platform: Send + Sync {
@@ -119,6 +228,22 @@ pub trait OverlayOps: Send {
     /// Replace the overlay's heads-up display with `hud`. Pass `None`
     /// to clear the HUD and revert to the bare tint.
     fn set_hud(&mut self, hud: Option<Hud>);
+    /// Paint `frame` as the overlay's opaque background, beneath any
+    /// HUD strokes. Used by measure mode's "freeze screen" feature
+    /// so anything moving underneath the overlay (browser scroll,
+    /// playing video) doesn't visually change while the user
+    /// measures — the user sees the exact pixels Vernier captured
+    /// for edge detection. Pass `None` to clear, restoring the
+    /// transparent-with-tint background.
+    ///
+    /// Default impl is a no-op so backends can opt in incrementally.
+    /// Without an implementation, the overlay stays transparent and
+    /// the user keeps seeing live content (the pre-existing
+    /// behavior), which is functionally fine — edge detection works
+    /// against the frozen frame either way.
+    fn set_background_frame(&mut self, frame: Option<Frame>) {
+        let _ = frame;
+    }
     /// Show or hide the system pointer over this overlay. `true` →
     /// the compositor draws its theme cursor (via wp_cursor_shape v1).
     /// `false` → the cursor is hidden so we can draw our own custom
@@ -166,6 +291,9 @@ impl OverlayHandle {
     }
     pub fn set_hud(&mut self, hud: Option<Hud>) {
         self.inner.set_hud(hud)
+    }
+    pub fn set_background_frame(&mut self, frame: Option<Frame>) {
+        self.inner.set_background_frame(frame)
     }
     pub fn set_system_pointer_visible(&mut self, visible: bool) {
         self.inner.set_system_pointer_visible(visible)
@@ -221,4 +349,44 @@ pub fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
     Err(PlatformError::Unsupported {
         what: "this platform has no vernier backend",
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod png_test {
+    use super::*;
+    #[test]
+    fn rasterize_macos_cached_icon() {
+        let path = "/Users/jon/Library/Caches/vernier/handoff-icons/CleanShot_X.png";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("(skip — cache PNG not present)");
+            return;
+        };
+        let rgba = rasterize_png(&bytes, 128).expect("rasterize_png Some");
+        assert_eq!(rgba.len(), 128 * 128 * 4);
+        // count non-zero alpha pixels — icon should not be fully blank
+        let nonzero = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        eprintln!("nonzero alpha pixels: {nonzero}");
+        assert!(nonzero > 1000);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod icon_extract_test {
+    use super::*;
+    #[test]
+    fn extract_each_installed_app() {
+        for app in &[
+            "/Applications/Setapp/CleanShot X.app",
+            "/Applications/Shottr.app",
+            "/System/Applications/Preview.app",
+        ] {
+            let result = extract_macos_app_icon_rgba(std::path::Path::new(app), 128);
+            eprintln!("{app}: {}", match &result {
+                Some(b) => format!("Some({} bytes, {} non-transparent)",
+                    b.len(),
+                    b.chunks_exact(4).filter(|p| p[3] > 0).count()),
+                None => "None".into(),
+            });
+        }
+    }
 }

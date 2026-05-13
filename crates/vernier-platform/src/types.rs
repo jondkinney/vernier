@@ -309,6 +309,9 @@ pub enum HudContextMenuIcon {
     Restore,
     Clear,
     Close,
+    /// Sliders / "preferences" glyph — three horizontal lines with
+    /// staggered knobs. Used for the "Preferences…" menu item.
+    Settings,
 }
 
 /// A committed rectangle measurement — the data drawn for each
