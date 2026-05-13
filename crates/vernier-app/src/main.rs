@@ -1671,6 +1671,47 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         alt_held,
                     );
+                    // Press / release can change the cursor-over-rect
+                    // state without a subsequent PointerMove (e.g. a
+                    // drag completes inside the just-drawn rect — the
+                    // user expects the system arrow to appear
+                    // immediately even if they don't wiggle the
+                    // mouse). The throttled redraw block below only
+                    // fires from PointerMove, so the system-pointer
+                    // toggle has to run here too.
+                    {
+                        let cursor_px = Px::new(x as i32, y as i32);
+                        let active_handle = resizing.map(|op| op.handle).or_else(|| {
+                            held_rects.iter().find_map(|r| {
+                                let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                                let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                                if cursor_over_pill(cursor_px, rs, re) {
+                                    None
+                                } else {
+                                    cursor_over_rect_handle(cursor_px, rs, re)
+                                }
+                            })
+                        });
+                        let want = want_system_pointer(
+                            cursor_px,
+                            &held_rects,
+                            &guides,
+                            &stuck_measurements,
+                            pending_guide,
+                            dragging_guide,
+                            resizing,
+                            active_handle,
+                            context_menu.is_some(),
+                            alt_held,
+                            stuck_pill_drag_committed,
+                            primary.bounds.w as i32,
+                            primary.bounds.h as i32,
+                        );
+                        if want != system_pointer_visible {
+                            overlay.set_system_pointer_visible(want);
+                            system_pointer_visible = want;
+                        }
+                    }
                     last_hud_redraw = Instant::now();
                     if let ButtonOutcome::ScreenshotPillClicked { rs, re } = outcome {
                         // Hide Vernier's overlay before capture. grim

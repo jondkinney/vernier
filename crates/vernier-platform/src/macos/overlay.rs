@@ -344,9 +344,24 @@ impl OverlayOps for MacOverlay {
                     let was_hidden = *o.view.ivars().cursor_hidden.borrow();
                     if visible && was_hidden {
                         *o.view.ivars().cursor_hidden.borrow_mut() = false;
+                        // Rebalance the sticky `NSCursor::hide()`
+                        // that `set_input_capturing(true)` installed.
+                        // The cursor-rect machinery alone cannot
+                        // override a refcounted hide — even with an
+                        // arrow cursor in the rect, a hidden NSCursor
+                        // stays invisible. show_cursor_on then sets
+                        // the shape (arrow today, pointing-hand
+                        // later) that the newly-visible cursor takes.
+                        unsafe { NSCursor::unhide() };
                         show_cursor_on(&o.view);
                     } else if !visible && !was_hidden {
                         *o.view.ivars().cursor_hidden.borrow_mut() = true;
+                        // Re-establish the global hide so the cursor
+                        // disappears off the held rect again, even on
+                        // monitors / windows where AppKit's cursor-
+                        // rect arbitration has lost track of our
+                        // transparent cursor.
+                        unsafe { NSCursor::hide() };
                         hide_cursor_on(&o.view);
                     }
                 }
