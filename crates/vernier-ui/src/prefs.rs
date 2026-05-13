@@ -236,6 +236,27 @@ impl PrefsApp {
 
 impl App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Cmd+W on macOS: close the prefs window. The daemon
+        // keeps running — this is a window-close, not an app-
+        // quit. Standard behaviour for every macOS document
+        // window and the convention every Mac user reaches for.
+        // Skipped while a shortcut row is in capture mode so the
+        // user can actually bind Cmd+W as a shortcut if they
+        // want to.
+        #[cfg(target_os = "macos")]
+        if self.capturing_shortcut.is_none() {
+            let close = ctx.input(|i| {
+                i.modifiers.mac_cmd
+                    && !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && !i.modifiers.ctrl
+                    && i.key_pressed(egui::Key::W)
+            });
+            if close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
         // Daemon health probe — re-runs every 750ms so the modal
         // overlay below can react if the daemon dies (Quit by the
         // user, OOM, crash, etc.). Skipped during the first 1s of
@@ -768,9 +789,20 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     // the Nerd Font icons since every symbol on the chip is now
     // painter-drawn.
     let letter_paths = [
+        // Linux distros (Arch / Fedora layout).
         "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
         "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+        // macOS system fonts. HelveticaNeue.ttc and Helvetica.ttc
+        // are guaranteed present on every modern macOS; we pick a
+        // bold face out of the TTC by adding the index suffix that
+        // egui's FontData doesn't support — so we fall back to
+        // SFNS (San Francisco) variants which ship as standalone
+        // .otf files, and finally a generic Helvetica.
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/Library/Fonts/Arial Bold.ttf",
     ];
     for path in letter_paths {
         match std::fs::read(path) {
@@ -818,22 +850,23 @@ fn install_glyph_fonts(ctx: &egui::Context) {
         }
     }
 
-    if !shortcut_chain.is_empty() {
-        // Append the egui defaults at the end so nothing in the
-        // shortcut chip falls back to tofu — the Nerd Font is
-        // first, omarchy second, then whatever else the renderer
-        // can find.
-        if let Some(default_prop) = fonts
-            .families
-            .get(&egui::FontFamily::Proportional)
-            .cloned()
-        {
-            shortcut_chain.extend(default_prop);
-        }
-        fonts
-            .families
-            .insert(egui::FontFamily::Name("shortcut".into()), shortcut_chain);
+    // Always append the egui default Proportional fonts and
+    // always register the `"shortcut"` family — otherwise a system
+    // missing every preferred font path (e.g. fresh macOS without
+    // SFNS, or a Linux container without Liberation) would leave
+    // the family unbound, and the Shortcuts pane would panic at
+    // first paint with "FontFamily::Name(\"shortcut\") is not
+    // bound to any fonts".
+    if let Some(default_prop) = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+    {
+        shortcut_chain.extend(default_prop);
     }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("shortcut".into()), shortcut_chain);
 
     ctx.set_fonts(fonts);
 }
@@ -899,16 +932,31 @@ fn load_handoff_icon_texture(
         return None;
     }
     let lower = path.to_ascii_lowercase();
-    if !lower.ends_with(".svg") {
-        // Most app packages ship an SVG under
-        // /usr/share/icons/hicolor/scalable/apps/ and resolve_icon
-        // prefers it; the rare PNG-only app just renders the
-        // placeholder square.
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
     let size = 128u32;
-    let rgba = vernier_platform::rasterize_svg(&bytes, size)?;
+    // Linux: hicolor SVG (resolve_icon prefers them).
+    // macOS: bundle path (`.app`) routed through NSWorkspace, which
+    //   handles `.icns`, asset catalogs, and custom icons uniformly.
+    // PNG: cached / pre-rasterized icon (used as a fast path if we
+    //   ever pre-cache to disk; not currently produced on macOS).
+    // Anything else: placeholder square.
+    let rgba: Vec<u8> = if lower.ends_with(".app") {
+        #[cfg(target_os = "macos")]
+        {
+            vernier_platform::extract_macos_app_icon_rgba(std::path::Path::new(path), size)?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return None;
+        }
+    } else if lower.ends_with(".svg") {
+        let bytes = std::fs::read(path).ok()?;
+        vernier_platform::rasterize_svg(&bytes, size)?
+    } else if lower.ends_with(".png") {
+        let bytes = std::fs::read(path).ok()?;
+        vernier_platform::rasterize_png(&bytes, size)?
+    } else {
+        return None;
+    };
     if rgba.len() != (size as usize) * (size as usize) * 4 {
         return None;
     }
@@ -987,9 +1035,12 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     setting(ui, |ui| {
         field_label(ui, "Distance tool");
         ui.checkbox(&mut s.snap_to_guides, "Snap to guides");
-        caption(ui, 
-            "Edges and drag endpoints magnetize to the nearest reference guide within 8 logical pixels.",
-        );
+        caption(ui, &format!(
+            "Drag endpoints magnetize to the nearest reference guide: 30 px on initial click (when you're \
+             committing to a corner with no visual feedback yet) and 8 px during and at the end of the drag \
+             (so passing a guide on the way past doesn't snag the moving corner). Hold {} to draw freeform.",
+            alt_key_label(),
+        ));
     });
 
     setting(ui, |ui| {
@@ -1027,7 +1078,7 @@ fn screenshots_section(
     // to the satty-integration handoff.
     setting(ui, |ui| {
         ui.horizontal(|ui| {
-            field_label(ui, "Padding");
+            field_label(ui, "Context margin");
             let mut pad = s.padding_px as i32;
             if ui
                 .add(
@@ -1040,8 +1091,9 @@ fn screenshots_section(
                 s.padding_px = pad.max(0) as u32;
             }
         });
-        caption(ui, 
-            "Pixels of transparent space added around the captured region.",
+        caption(ui,
+            "Pixels of extra screen content captured outside the measured region — \
+             useful for annotation context, since the W×H is already in the saved image.",
         );
     });
 
@@ -1077,6 +1129,25 @@ fn screenshots_section(
     // template, clipboard copy, edit notification. Greyed out when
     // the handoff is on — the chosen app owns these instead.
     let detail_enabled = !s.handoff_enabled;
+    // Header is always painted at full opacity so the user can read
+    // *why* the section is dimmed; only the inputs below are gated
+    // on `detail_enabled`.
+    field_label(ui, "Vernier-managed save");
+    if detail_enabled {
+        caption(ui,
+            "Where Vernier writes the captured PNG, the filename template, \
+             and post-capture clipboard / notification behavior. Active \
+             because handoff is off.",
+        );
+    } else {
+        caption(ui, &format!(
+            "Disabled because handoff is on — {} owns where the screenshot \
+             goes, its filename, and any clipboard / edit-action behavior. \
+             Turn the Enable checkbox above off to manage these here.",
+            handoff_label_for(s),
+        ));
+    }
+    ui.add_space(8.0);
     ui.add_enabled_ui(detail_enabled, |ui| {
     setting(ui, |ui| {
         field_label(ui, "Output directory");
@@ -1361,8 +1432,19 @@ fn paint_handoff_dropdown(
     } else {
         "Choose app".to_string()
     };
+    // Default `combo_height` is ~200 px on macOS's stock egui
+    // spacing, but in practice the popup ScrollArea inside ComboBox
+    // ends up clipping rows on macOS (the popup itself appears
+    // shorter than 200 px — possibly some interaction with
+    // backing-scale on Retina). Set a generous explicit max so the
+    // curated apps list (~10 entries cap) always fits: each row is
+    // ~28 px including padding, so 480 px holds the full list plus
+    // breathing room without ever needing to scroll.
+    let row_count = installed_apps.len().max(1) as f32;
+    let popup_height = (row_count * 32.0 + 16.0).max(120.0);
     egui::ComboBox::from_id_salt("handoff_app_picker")
         .selected_text(selected_text)
+        .height(popup_height)
         .show_ui(ui, |ui| {
             if installed_apps.is_empty() {
                 ui.label(
@@ -1378,11 +1460,15 @@ fn paint_handoff_dropdown(
                 return;
             }
             for (app, tex) in installed_apps {
-                let selected = s.handoff_command == app.command;
-                // One clickable row containing the icon + name.
-                // ui.horizontal() returns the inner response; using
-                // selectable_label gives us the highlighted selected
-                // appearance.
+                // Plain (non-selectable) clickable row. The combo
+                // button outside the popup already shows the
+                // currently-picked app, so highlighting "the
+                // selected one" inside the dropdown is redundant —
+                // and selectable_label's `selected` paint would
+                // light up *every* macOS row because all of them
+                // share `handoff_command = "/usr/bin/open"` (the
+                // identity lives in `handoff_args`, not the
+                // command).
                 let row = ui.horizontal(|ui| {
                     if let Some(t) = tex {
                         ui.add(
@@ -1395,7 +1481,9 @@ fn paint_handoff_dropdown(
                         // icon resolved so the labels still line up.
                         ui.add_space(26.0);
                     }
-                    ui.selectable_label(selected, &app.name)
+                    ui.add(
+                        egui::Label::new(&app.name).sense(egui::Sense::click()),
+                    )
                 });
                 if row.inner.clicked() {
                     apply_handoff_app(s, app.clone());
@@ -1631,15 +1719,16 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
         );
     });
 
+    // Inline the button right after the radios — `ui.with_layout`
+    // with a centered cross-axis Align used to vertical-center the
+    // button in the remaining scroll-area space, floating it far
+    // below the content. Plain `ui.button` honors the parent
+    // top-down flow so the button sits a normal 12 px below the last
+    // radio.
     ui.add_space(12.0);
-    ui.with_layout(
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            if ui.button("Restore Defaults").clicked() {
-                *s = AppearanceSettings::default();
-            }
-        },
-    );
+    if ui.button("Restore Defaults").clicked() {
+        *s = AppearanceSettings::default();
+    }
 }
 
 fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
@@ -2052,16 +2141,13 @@ fn shortcuts_section(
     caption(ui, 
         "Nudge shortcuts: hold Shift to step 10 px instead of 1 px (built-in modifier).",
     );
+    // See appearance_section for the rationale on dropping
+    // `with_layout(Align::Center)` here.
     ui.add_space(12.0);
-    ui.with_layout(
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            if ui.button("Restore Defaults").clicked() {
-                *s = ShortcutSettings::default();
-                *capturing = None;
-            }
-        },
-    );
+    if ui.button("Restore Defaults").clicked() {
+        *s = ShortcutSettings::default();
+        *capturing = None;
+    }
 }
 
 enum CaptureOutcome {
@@ -2166,19 +2252,66 @@ enum ArrowDir {
 }
 
 fn shortcut_chip_segments(stored: &str) -> Vec<ChipSeg> {
+    #[cfg(not(target_os = "macos"))]
     let omarchy = omarchy_font_available();
+    // On macOS the modifiers all have well-known Unicode glyphs
+    // that every system font ships. They're what users see in
+    // every native menu's key-equivalent column, so use them
+    // verbatim instead of the painter-drawn outlines that match
+    // the Linux/Hyprland look.
+    #[cfg(target_os = "macos")]
+    let mac_glyph = |g: &str| ChipSeg::Letter(g.to_string());
     stored
         .split('+')
         .filter(|t| !t.is_empty())
         .map(|tok| match tok {
-            "SHIFT" => ChipSeg::Shift,
-            "CTRL" => ChipSeg::Ctrl,
-            "ALT" => ChipSeg::Alt,
+            "SHIFT" => {
+                #[cfg(target_os = "macos")]
+                {
+                    mac_glyph("\u{21E7}")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    ChipSeg::Shift
+                }
+            }
+            "CTRL" => {
+                #[cfg(target_os = "macos")]
+                {
+                    mac_glyph("\u{2303}")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    ChipSeg::Ctrl
+                }
+            }
+            "ALT" => {
+                #[cfg(target_os = "macos")]
+                {
+                    mac_glyph("\u{2325}")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    ChipSeg::Alt
+                }
+            }
             "SUPER" => {
-                if omarchy {
-                    ChipSeg::OmarchyLogo
-                } else {
-                    ChipSeg::Letter("SUPER".to_string())
+                // On macOS the conventional rendering for the
+                // Command modifier is the U+2318 PLACE OF
+                // INTEREST SIGN glyph (⌘). Every system font
+                // ships it, so we go straight to a Letter
+                // segment and skip the omarchy fallback chain.
+                #[cfg(target_os = "macos")]
+                {
+                    mac_glyph("\u{2318}")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if omarchy {
+                        ChipSeg::OmarchyLogo
+                    } else {
+                        ChipSeg::Letter("SUPER".to_string())
+                    }
                 }
             }
             "ENTER" | "RETURN" => ChipSeg::Enter,
@@ -2925,16 +3058,74 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
             "https://github.com/jondkinney/vernier",
         );
         ui.add_space(20.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "Settings file: {}",
-                vernier_core::settings_path().display()
-            ))
-            .color(egui::Color32::from_gray(150))
-            .size(12.0),
+        // Single centered label so the row matches the rest of the
+        // About content (logo, version, blurb, GitHub link — all
+        // centered via the surrounding `ui.vertical_centered`).
+        // Splitting prefix + link into two horizontally-stacked
+        // widgets defeats `vertical_centered` (each child gets the
+        // full row width and left-aligns inside it), so the prefix
+        // and the path live in one LayoutJob with two TextFormats
+        // — muted gray for the prefix, link-blue + underline for
+        // the path. The whole label is clickable; the hover cursor
+        // turns into a hand on the entire row, which is fine —
+        // there's nothing else useful to do with the prefix text
+        // alone, and a single click target is more forgiving than
+        // a narrow underlined hit zone.
+        let path = vernier_core::settings_path();
+        let path_str = path.display().to_string();
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "Settings file: ",
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color: egui::Color32::from_gray(150),
+                ..Default::default()
+            },
         );
+        job.append(
+            &path_str,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color: egui::Color32::from_rgb(0x4f, 0xa3, 0xff),
+                underline: egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4f, 0xa3, 0xff)),
+                ..Default::default()
+            },
+        );
+        let link = ui.add(egui::Label::new(job).sense(egui::Sense::click()));
+        if link.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if link.clicked() {
+            if let Err(e) = open_path_with_default_app(&path) {
+                log::warn!("failed to open {}: {e}", path.display());
+            }
+        }
         ui.add_space(20.0);
     });
+}
+
+/// Spawn the system's default handler for `path`. Detached: we don't
+/// wait for the editor to exit (it's a long-lived user action).
+fn open_path_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/open").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a `cmd.exe` builtin, not a standalone exe.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 /// Wrap a logical settings group in a vertical block followed by
@@ -2944,6 +3135,44 @@ fn setting<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R 
     let r = ui.vertical(|ui| content(ui)).inner;
     ui.add_space(22.0);
     r
+}
+
+/// Best-effort estimate of the primary display's usable height in
+/// logical px — used to clamp the prefs window's initial size so it
+/// doesn't request a height that won't fit on the user's display.
+///
+/// macOS: routes to `vernier_platform::primary_screen_visible_height`
+/// which calls `NSScreen.visibleFrame.size.height` (already excludes
+/// the menu bar and Dock).
+///
+/// Linux / Windows: returns `1260.0` (a no-op clamp). eframe / winit
+/// already resizes the window if it doesn't fit, so we don't need to
+/// pre-query the compositor; the explicit value just disables the
+/// platform-specific clamp.
+fn available_screen_inner_height() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        vernier_platform::primary_screen_visible_height().unwrap_or(1260.0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        1260.0
+    }
+}
+
+/// Platform-appropriate label for the `Alt` / `Option` modifier in
+/// user-facing captions. macOS users expect "Option" (matching
+/// Apple's keyboard labeling); Linux / Windows users expect "Alt".
+/// The underlying keysym is the same; only the spelling changes.
+fn alt_key_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Option"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Alt"
+    }
 }
 
 /// Bold-ish label introducing a setting. Slightly larger than the
@@ -3142,11 +3371,20 @@ pub fn run_prefs(
     on_quit: Box<dyn FnMut() + Send>,
     static_bind_warning: Option<PathBuf>,
 ) -> Result<()> {
+    // Target: 820 × 1260 so the longest pane (Screenshots, on macOS)
+    // fits without scrolling. Clamp the height to the display's
+    // available area minus a small margin, so on shorter screens the
+    // window opens as tall as possible without poking under the menu
+    // bar / Dock. `available_screen_inner_height` is platform-aware:
+    // queries NSScreen.visibleFrame on macOS, falls back to 1260 (=
+    // no clamp) on Linux/Windows where eframe's own resizing handles
+    // the screen-bounds case.
+    let target_height = 1260.0f32.min(available_screen_inner_height());
     let viewport = egui::ViewportBuilder::default()
         .with_title("Vernier Preferences")
         .with_app_id("vernier-prefs")
         .with_min_inner_size([520.0, 360.0])
-        .with_inner_size([720.0, 520.0]);
+        .with_inner_size([820.0, target_height]);
     let options = NativeOptions {
         viewport,
         // Disable vsync: on Wayland the GL swap blocks on a frame
