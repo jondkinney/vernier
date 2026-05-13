@@ -61,15 +61,141 @@ pub const KNOWN_HANDOFF_APPS: &[&str] = &[
     "drawing",   // GNOME annotation app
 ];
 
-/// Return [`HandoffApp`] metadata for every entry in
-/// [`KNOWN_HANDOFF_APPS`] that's installed on `$PATH`. Order matches
-/// the constant. The prefs UI uses this to drive the picker
-/// dropdown.
+/// Curated list of macOS `.app` bundle filenames (without the `.app`
+/// suffix) the prefs UI scans for to populate its handoff dropdown.
+/// Order drives dropdown order.
+///
+/// Same curation principle as `KNOWN_HANDOFF_APPS`: annotation-first
+/// screenshot tools that accept a single image path on launch (via
+/// `open -a "<Name>" file.png`). Heavy raster editors (Pixelmator,
+/// Affinity, Photoshop) are omitted — Browse… is the escape hatch.
+///
+/// Snagit ships under year-stamped bundle names — list a couple
+/// recent versions plus the bare name (older releases) so we catch
+/// installs without needing to scan generically.
+#[cfg(target_os = "macos")]
+pub const KNOWN_HANDOFF_APPS_MACOS: &[&str] = &[
+    "CleanShot X",
+    "Shottr",
+    "Xnapper",
+    "Monosnap",
+    "Annotate",
+    "Skitch",
+    "Snagit 2025",
+    "Snagit 2024",
+    "Snagit",
+    "Lightshot Screenshot",
+    "Droplr",
+    "CloudApp",
+    "Preview", // built-in, basic markup
+];
+
+/// Return [`HandoffApp`] metadata for every installed annotation app
+/// the prefs UI knows about. Order matches the platform-specific
+/// `KNOWN_HANDOFF_APPS*` list. The prefs UI uses this to drive the
+/// picker dropdown.
+///
+/// On Linux, scans `$PATH` against [`KNOWN_HANDOFF_APPS`] and resolves
+/// each match against XDG `.desktop` files for display name + icon.
+/// On macOS, scans the standard application directories (including
+/// `/Applications/Setapp` for Setapp users) for `.app` bundles named
+/// in [`KNOWN_HANDOFF_APPS_MACOS`].
 pub fn find_installed_apps() -> Vec<HandoffApp> {
-    KNOWN_HANDOFF_APPS
-        .iter()
-        .filter_map(|name| lookup_for_binary(Path::new(name)))
-        .collect()
+    #[cfg(target_os = "macos")]
+    {
+        return find_installed_apps_macos();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        KNOWN_HANDOFF_APPS
+            .iter()
+            .filter_map(|name| lookup_for_binary(Path::new(name)))
+            .collect()
+    }
+}
+
+/// macOS counterpart to the PATH-scan version. Walks the standard
+/// application directories looking for `.app` bundles whose folder
+/// name (minus the `.app` suffix) appears in [`KNOWN_HANDOFF_APPS_MACOS`].
+/// Each hit becomes a [`HandoffApp`] that invokes `open -a` with the
+/// absolute bundle path — the absolute path is unambiguous even when
+/// two installed bundles share the display name (e.g. Setapp's
+/// CleanShot X alongside a manually-installed copy).
+#[cfg(target_os = "macos")]
+fn find_installed_apps_macos() -> Vec<HandoffApp> {
+    let dirs = macos_application_dirs();
+    let mut found: Vec<HandoffApp> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for known in KNOWN_HANDOFF_APPS_MACOS {
+        // Order: KNOWN_HANDOFF_APPS_MACOS drives dropdown order; for
+        // each name check directories in `macos_application_dirs`
+        // priority and stop at the first hit so duplicates don't
+        // multiply the list when the same app exists in /Applications
+        // and /Applications/Setapp.
+        for dir in &dirs {
+            let bundle = dir.join(format!("{known}.app"));
+            if bundle.is_dir() && seen.insert((*known).to_string()) {
+                found.push(handoff_for_macos_bundle(&bundle, known));
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Standard locations a macOS app might live in. `/Applications` and
+/// `~/Applications` are the user-facing canonical roots; Setapp puts
+/// its catalog under `/Applications/Setapp`; `/System/Applications`
+/// holds Apple's bundled apps (Preview lives there on modern macOS).
+#[cfg(target_os = "macos")]
+fn macos_application_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/Applications/Setapp"),
+        PathBuf::from("/System/Applications"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Applications"));
+    }
+    dirs
+}
+
+/// Build a [`HandoffApp`] that launches `bundle_path` with the
+/// captured PNG via `/usr/bin/open -a "<bundle_path>" {file}`.
+/// Passing the absolute bundle path (rather than just the display
+/// name) makes the spawn unambiguous regardless of LaunchServices
+/// state. `icon_path` is set to the bundle path itself; the prefs
+/// UI detects the `.app` suffix and routes to
+/// `vernier_platform::extract_macos_app_icon_rgba`, which uses
+/// `NSWorkspace.iconForFile` to render the icon (handles `.icns`,
+/// asset catalogs, and custom icons uniformly).
+#[cfg(target_os = "macos")]
+fn handoff_for_macos_bundle(bundle_path: &Path, display_name: &str) -> HandoffApp {
+    let bundle_str = bundle_path.to_string_lossy().into_owned();
+    HandoffApp {
+        name: display_name.to_string(),
+        command: "/usr/bin/open".to_string(),
+        // shell_quote_for_template wraps the bundle path in
+        // double-quotes if it contains whitespace — `render_args`
+        // tokenizes the args template the same way `.desktop` Exec
+        // lines are parsed, so the quoting round-trips correctly.
+        args: format!("-a {} {{file}}", shell_quote_for_template(&bundle_str)),
+        icon_path: bundle_str,
+    }
+}
+
+
+/// Quote `s` so `render_args`'s `.desktop`-style tokenizer keeps it
+/// as a single argv slot. Only quotes when whitespace is present;
+/// internal double-quotes are escaped the way the tokenizer's
+/// `\\` + `next` pair expects.
+#[cfg(target_os = "macos")]
+fn shell_quote_for_template(s: &str) -> String {
+    if s.chars().any(|c| c.is_whitespace()) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// Resolve `bin` (absolute path or PATH-relative name) to a
@@ -87,6 +213,22 @@ pub fn find_installed_apps() -> Vec<HandoffApp> {
 /// 4. Otherwise, return a minimal entry that just runs `<bin>
 ///    {file}` with no icon.
 pub fn lookup_for_binary(bin: &Path) -> Option<HandoffApp> {
+    // macOS Browse… commonly returns a `.app` bundle path (Finder
+    // treats bundles as files even though they're directories on disk).
+    // Detour through the bundle handoff so the user gets a working
+    // `open -a` invocation instead of hitting the `resolve_binary`
+    // fast-path against a directory and failing the `exists` check
+    // for the wrong reason.
+    #[cfg(target_os = "macos")]
+    {
+        if bin.extension().and_then(|e| e.to_str()) == Some("app") && bin.is_dir() {
+            let display = bin
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "App".to_string());
+            return Some(handoff_for_macos_bundle(bin, &display));
+        }
+    }
     let resolved = resolve_binary(bin)?;
     let basename = bin
         .file_name()
@@ -350,5 +492,45 @@ mod tests {
     fn render_args_handles_quoted_tokens() {
         let argv = render_args("\"--with space\" {file}", "/tmp/x.png");
         assert_eq!(argv, vec!["--with space", "/tmp/x.png"]);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    /// Sanity check: every macOS install ships /System/Applications/Preview.app
+    /// (and "Preview" is in KNOWN_HANDOFF_APPS_MACOS), so detection should
+    /// always return at least one entry. CI runners on macOS satisfy this too.
+    #[test]
+    fn lists_installed_macos_apps_includes_preview() {
+        let apps = find_installed_apps();
+        assert!(
+            apps.iter().any(|a| a.name == "Preview"),
+            "Preview should be detected on macOS; found: {:?}",
+            apps.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn browse_to_app_bundle_yields_open_invocation() {
+        let preview = Path::new("/System/Applications/Preview.app");
+        let app = lookup_for_binary(preview).expect("Preview bundle should resolve");
+        assert_eq!(app.name, "Preview");
+        assert_eq!(app.command, "/usr/bin/open");
+        assert!(
+            app.args.contains("Preview.app") && app.args.contains("{file}"),
+            "args should reference the bundle and include {{file}}: {}",
+            app.args
+        );
+    }
+
+    #[test]
+    fn shell_quote_wraps_paths_with_spaces() {
+        assert_eq!(shell_quote_for_template("/Applications/Shottr.app"), "/Applications/Shottr.app");
+        assert_eq!(
+            shell_quote_for_template("/Applications/Setapp/CleanShot X.app"),
+            "\"/Applications/Setapp/CleanShot X.app\""
+        );
     }
 }
