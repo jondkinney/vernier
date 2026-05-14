@@ -399,42 +399,30 @@ fn run_daemon() -> Result<()> {
     }
     let mut current_accel: Option<Accelerator> = initial_accel_opt;
 
-    // Global "open preferences" hotkey: Cmd+, on macOS (the universal
-    // Mac shortcut for app preferences) and Ctrl+, on every other
-    // platform. Fires regardless of whether measure mode is open;
-    // the handler tears measure mode down, clears persisted state,
-    // and brings the prefs window to front. Not user-configurable
-    // yet — convention is strong enough that "the comma shortcut"
-    // doesn't need a setting.
+    // "Open preferences" hotkey: Cmd+, on macOS (the universal Mac
+    // shortcut for app preferences) and Ctrl+, on every other
+    // platform. Active ONLY while measure mode is on — registered
+    // in toggle_measurement when we enter measure mode and
+    // unregistered when we leave. Binding it globally would steal
+    // Cmd+, from every other app on macOS (most of them ship a
+    // Preferences menu item on that exact shortcut), so the daemon
+    // only owns it while it's the user's active tool. Not
+    // user-configurable yet — the comma-shortcut convention is
+    // strong enough that it doesn't need a setting.
     let prefs_hotkey_accel_str = if cfg!(target_os = "macos") {
         "META+,"
     } else {
         "CTRL+,"
     };
-    let prefs_hotkey: Option<HotkeyId> = Accelerator::parse(prefs_hotkey_accel_str)
-        .and_then(|accel| {
-            if on_hyprland {
-                // Hyprland routes hotkeys through hyprctl, not the
-                // platform's register_hotkey. Skip for now; Hyprland
-                // users can bind `vernier prefs` themselves.
-                None
-            } else {
-                match platform.register_hotkey(accel, "Vernier Preferences") {
-                    Ok(id) => {
-                        log::info!(
-                            "prefs hotkey registered as {prefs_hotkey_accel_str}",
-                        );
-                        Some(id)
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "prefs hotkey registration ({prefs_hotkey_accel_str}) failed: {e}"
-                        );
-                        None
-                    }
-                }
-            }
-        });
+    let prefs_hotkey_accel: Option<Accelerator> = if on_hyprland {
+        // Hyprland routes hotkeys through hyprctl, not the
+        // platform's register_hotkey. Skip; Hyprland users can
+        // bind `vernier prefs` themselves.
+        None
+    } else {
+        Accelerator::parse(prefs_hotkey_accel_str)
+    };
+    let mut prefs_hotkey: Option<HotkeyId> = None;
 
     let (combined_tx, combined_rx) = std::sync::mpsc::channel::<MainEvent>();
 
@@ -681,7 +669,7 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 last_esc_at = None;
-                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate);
+                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
                 ensure_prefs_window(&mut prefs_child);
@@ -728,6 +716,8 @@ fn run_daemon() -> Result<()> {
                         &guides,
                         &stuck_measurements,
                         color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
                     );
                 } else {
                     // Already idle but the overlay may still be in
@@ -747,7 +737,7 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 last_esc_at = None;
-                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate);
+                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
                 let now = Instant::now();
@@ -1133,6 +1123,8 @@ fn run_daemon() -> Result<()> {
                                     &mut toast_until,
                                     &mut last_esc_at,
                                     color_alternate,
+                                    prefs_hotkey_accel,
+                                    &mut prefs_hotkey,
                                 );
                             }
                             MenuAction::EnterBackgroundMode => {
@@ -1148,6 +1140,8 @@ fn run_daemon() -> Result<()> {
                                     &guides,
                                     &stuck_measurements,
                                     color_alternate,
+                                    prefs_hotkey_accel,
+                                    &mut prefs_hotkey,
                                 );
                             }
                             MenuAction::RestoreLastSession => {
@@ -1213,6 +1207,8 @@ fn run_daemon() -> Result<()> {
                                         &guides,
                                         &stuck_measurements,
                                         color_alternate,
+                                        prefs_hotkey_accel,
+                                        &mut prefs_hotkey,
                                     );
                                 }
                                 ensure_prefs_window(&mut prefs_child);
@@ -1808,6 +1804,8 @@ fn run_daemon() -> Result<()> {
                                 &guides,
                                 &stuck_measurements,
                                 color_alternate,
+                                prefs_hotkey_accel,
+                                &mut prefs_hotkey,
                             );
                         } else {
                             // Local-save path: stay in measure mode so
@@ -2134,6 +2132,8 @@ fn run_daemon() -> Result<()> {
                             &guides,
                             &stuck_measurements,
                             color_alternate,
+                            prefs_hotkey_accel,
+                            &mut prefs_hotkey,
                         );
                     }
                     ensure_prefs_window(&mut prefs_child);
@@ -2243,6 +2243,8 @@ fn run_daemon() -> Result<()> {
                             &guides,
                             &stuck_measurements,
                             color_alternate,
+                            prefs_hotkey_accel,
+                            &mut prefs_hotkey,
                         );
                     } else {
                         last_esc_at = Some(now);
@@ -2590,6 +2592,8 @@ fn run_daemon() -> Result<()> {
                         &mut toast_until,
                         &mut last_esc_at,
                         color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
                     );
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.restore
@@ -2940,6 +2944,8 @@ fn run_daemon() -> Result<()> {
                     &guides,
                     &stuck_measurements,
                     color_alternate,
+                    prefs_hotkey_accel,
+                    &mut prefs_hotkey,
                 );
             }
             MainEvent::Ipc(IpcCmd::Quit) => {
@@ -3136,6 +3142,8 @@ fn run_daemon() -> Result<()> {
                         &guides,
                         &stuck_measurements,
                         color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
                     );
                 } else if let Some((x, y)) = last_pointer_xy {
                     last_hud_redraw = Instant::now();
@@ -3269,6 +3277,8 @@ fn run_daemon() -> Result<()> {
                         &guides,
                         &stuck_measurements,
                         color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
                     );
                 }
             }
@@ -5104,6 +5114,8 @@ fn do_take_normal_screenshot(
     toast_until: &mut Option<Instant>,
     last_esc_at: &mut Option<Instant>,
     color_alternate: bool,
+    prefs_hotkey_accel: Option<Accelerator>,
+    prefs_hotkey: &mut Option<HotkeyId>,
 ) {
     let cmd = current_settings()
         .screenshots
@@ -5137,6 +5149,8 @@ fn do_take_normal_screenshot(
         guides,
         stuck_measurements,
         color_alternate,
+        prefs_hotkey_accel,
+        prefs_hotkey,
     );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let _ = std::process::Command::new("setsid")
@@ -5231,6 +5245,8 @@ fn toggle_measurement(
     guides: &[Guide],
     stuck_measurements: &[StuckMeasurement],
     color_alternate: bool,
+    prefs_accel: Option<Accelerator>,
+    prefs_hotkey: &mut Option<HotkeyId>,
 ) {
     let fg = hud_foreground(color_alternate);
     if matches!(mode, InteractionMode::Idle) {
@@ -5278,6 +5294,20 @@ fn toggle_measurement(
         }
         *mode = InteractionMode::Hover { cursor: Px::default() };
         overlay.set_input_capturing(true);
+        // Claim the prefs hotkey only while we're the active tool —
+        // see the comment at the prefs_hotkey_accel declaration. A
+        // missing accel (Hyprland, or a parse failure) means no-op.
+        if prefs_hotkey.is_none() {
+            if let Some(accel) = prefs_accel {
+                match platform.register_hotkey(accel, "Vernier Preferences") {
+                    Ok(id) => {
+                        log::info!("prefs hotkey claimed for measure mode");
+                        *prefs_hotkey = Some(id);
+                    }
+                    Err(e) => log::warn!("prefs hotkey register: {e:#}"),
+                }
+            }
+        }
         let mut hud = Hud::hover((-100.0, -100.0));
         hud.foreground = fg;
         // `toggle_measurement` runs at mode transitions only; Alt's
@@ -5296,6 +5326,16 @@ fn toggle_measurement(
     // LIVE_CAPTURE_INTERVAL away.
     if let Some(w) = capture_worker.take() {
         w.stop();
+    }
+    // Release the prefs hotkey so other apps' Cmd+, works again
+    // outside measure mode. Mirrors the enter-path registration —
+    // see the comment at the prefs_hotkey_accel declaration.
+    if let Some(id) = prefs_hotkey.take() {
+        if let Err(e) = platform.unregister_hotkey(id) {
+            log::warn!("prefs hotkey unregister: {e:#}");
+        } else {
+            log::info!("prefs hotkey released");
+        }
     }
     let has_content = !held_rects.is_empty()
         || !guides.is_empty()
