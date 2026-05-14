@@ -3380,11 +3380,24 @@ pub fn run_prefs(
     // no clamp) on Linux/Windows where eframe's own resizing handles
     // the screen-bounds case.
     let target_height = 1260.0f32.min(available_screen_inner_height());
+    // Pass the V brand mark as the viewport icon so eframe doesn't
+    // fall back to its default 'e' on macOS (where `with_icon`
+    // routes through winit → NSApp.setApplicationIconImage, also
+    // overriding the bundle's CFBundleIconFile for this process).
+    // Without this, even an installed Vernier.app shows the 'e'
+    // glyph in the Dock once the prefs subprocess promotes itself
+    // to a foreground app.
+    let icon_data = {
+        let size = 256u32;
+        let rgba = vernier_platform::render_app_icon_rgba(size);
+        std::sync::Arc::new(egui::IconData { rgba, width: size, height: size })
+    };
     let viewport = egui::ViewportBuilder::default()
         .with_title("Vernier Preferences")
         .with_app_id("vernier-prefs")
         .with_min_inner_size([520.0, 360.0])
-        .with_inner_size([820.0, target_height]);
+        .with_inner_size([820.0, target_height])
+        .with_icon(icon_data);
     let options = NativeOptions {
         viewport,
         // Disable vsync: on Wayland the GL swap blocks on a frame
