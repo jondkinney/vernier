@@ -1,0 +1,92 @@
+name: release-update-site
+
+# Push the new release tag onto the usevernier.com landing page so
+# the eyebrow chip ('v<semver> · Pre-alpha · ...') reflects the
+# release that just published. Uses an SSH deploy key scoped to the
+# vernier-site repo (`VERNIER_SITE_DEPLOY_KEY` secret) rather than a
+# Personal Access Token — the key has no expiry, can't read or
+# write anything outside this one repo, and lives entirely on the
+# vernier ↔ vernier-site axis.
+#
+# Replaces an earlier hourly polling workflow that lived in
+# vernier-site. Triggering from the release itself means
+# usevernier.com updates within ~20 seconds of `gh release create`
+# instead of within an hour.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync (e.g. v0.2.0)'
+        required: true
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Syncing landing page to $TAG (version $VERSION)"
+
+      - name: Set up SSH agent with vernier-site deploy key
+        # webfactory/ssh-agent loads the key into an in-memory
+        # ssh-agent, scopes it to one host (github.com), and tears
+        # the agent down at job end. Avoids the "private key on
+        # disk" footgun that comes with naive `mkdir ~/.ssh && cat
+        # > id_ed25519` patterns.
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VERNIER_SITE_DEPLOY_KEY }}
+
+      - name: Clone vernier-site over SSH
+        run: |
+          git clone git@github.com:jondkinney/vernier-site.git site
+          cd site && git log --oneline -1
+
+      - name: Patch version in index.html
+        id: patch
+        working-directory: site
+        run: |
+          new="${{ steps.tag.outputs.version }}"
+          # The eyebrow chip is the only spot the version appears
+          # ('v<semver> · Pre-alpha · ...'). Match v + standard semver
+          # + the literal trailing ' · Pre-alpha' so a stray version
+          # elsewhere in the HTML doesn't get rewritten.
+          old=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+ · Pre-alpha' index.html \
+                | head -1 \
+                | sed -E 's/^v([0-9.]+) ·.*/\1/')
+          if [ -z "$old" ]; then
+            echo "couldn't locate current version in index.html" >&2
+            exit 1
+          fi
+          echo "site is at $old; release is $new"
+          if [ "$old" = "$new" ]; then
+            echo "already in sync — no-op"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s|v${old} · Pre-alpha|v${new} · Pre-alpha|g" index.html
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "old=$old"     >> "$GITHUB_OUTPUT"
+
+      - name: Commit + push
+        if: steps.patch.outputs.changed == 'true'
+        working-directory: site
+        run: |
+          git config user.name  "vernier-release-bot"
+          git config user.email "vernier-release-bot@users.noreply.github.com"
+          git add index.html
+          git commit -m "Bump landing-page version to v${{ steps.tag.outputs.version }}"
+          git push origin main
