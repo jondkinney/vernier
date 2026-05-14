@@ -6,10 +6,13 @@ use std::os::raw::c_int;
 use std::sync::{Mutex, OnceLock};
 
 use dispatch2::DispatchQueue;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2::rc::Retained;
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, MainThreadMarker, define_class, msg_send};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
 
 use super::install_main_state;
+use crate::PlatformEvent;
 
 /// `ProcessApplicationTransformState` — convert a non-UI process
 /// into a foreground (`kProcessTransformToForegroundApplication`)
@@ -89,6 +92,24 @@ where
     // its menu-bar plumbing.
     unsafe { app.finishLaunching() };
     log::info!("macos: NSApp finished launching, activation=Accessory");
+
+    // Install our NSApplicationDelegate so the standard macOS
+    // "double-click the .app while the daemon is running" gesture
+    // surfaces the prefs window. LaunchServices sends the running
+    // process a `kAEReopenApplication` Apple Event; NSApp routes
+    // that through `applicationShouldHandleReopen:hasVisibleWindows:`
+    // on its delegate. Without a delegate, the event is silently
+    // dropped and `open /Applications/Vernier.app` is a no-op when
+    // we're already running. The delegate forwards the event into
+    // the same TrayMenuActivated channel the "Open Preferences"
+    // tray menu item uses, so the existing main-loop handler does
+    // the work (spawn-or-focus the prefs subprocess).
+    let delegate = VernierAppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    // NSApp keeps only a weak reference to its delegate, so we
+    // have to hold a strong ref for the lifetime of the process.
+    // Stash it next to NSAPP.
+    APP_DELEGATE.set(SendableDelegate(delegate)).ok();
 
     // Park the NSApp handle for shutdown. Other modules look this
     // up to call `terminate:` from a menu click.
@@ -198,3 +219,60 @@ where
 {
     DispatchQueue::main().exec_async(f);
 }
+
+// --- NSApplicationDelegate ---------------------------------------------------
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "VernierAppDelegate"]
+    pub(crate) struct VernierAppDelegate;
+
+    unsafe impl NSObjectProtocol for VernierAppDelegate {}
+
+    unsafe impl NSApplicationDelegate for VernierAppDelegate {
+        /// Called when the user re-launches the running .app (Finder
+        /// double-click, `open /Applications/Vernier.app`, Dock-icon
+        /// click) — i.e. when LaunchServices sends the running
+        /// process a `kAEReopenApplication` event. We always treat
+        /// it as "open Preferences": the daemon has no main window,
+        /// so any re-launch is the user asking for the prefs UI.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn application_should_handle_reopen(
+            &self,
+            _sender: &NSApplication,
+            _has_visible_windows: bool,
+        ) -> bool {
+            if let Some(tx) = super::event_tx() {
+                let _ = tx.send(PlatformEvent::TrayMenuActivated {
+                    id: "open_prefs".to_string(),
+                });
+                log::info!("macos: reopen Apple Event → open_prefs");
+            } else {
+                log::warn!("macos: reopen Apple Event arrived before event channel ready");
+            }
+            // Returning true tells AppKit to perform its default
+            // post-reopen handling (un-minimize a main window). We
+            // have no main window, so the return value is cosmetic,
+            // but `true` keeps us aligned with the AppKit contract.
+            true
+        }
+    }
+);
+
+impl VernierAppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        unsafe { msg_send![mtm.alloc::<Self>(), init] }
+    }
+}
+
+/// Strong-ref holder for the delegate. NSApp's `setDelegate:` only
+/// installs a weak reference, so the delegate would dealloc the
+/// instant `bootstrap_main`'s local goes out of scope without this.
+struct SendableDelegate(Retained<VernierAppDelegate>);
+// Safety: VernierAppDelegate is a MainThreadOnly NSObject subclass.
+// We never read/write it off-main; this storage exists purely to
+// keep the retain count alive for the process lifetime.
+unsafe impl Send for SendableDelegate {}
+unsafe impl Sync for SendableDelegate {}
+static APP_DELEGATE: OnceLock<SendableDelegate> = OnceLock::new();
