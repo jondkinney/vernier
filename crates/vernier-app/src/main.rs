@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vernier_core::{
-    classify_aspect, detect_edges, detect_edges_filtering, shrink_to_content,
-    shrink_to_content_with_bg, EdgeQuad, FrameView, InteractionMode, Measurement, Px, Rgba,
-    RoundingMode, Settings, SnapPoint, Tolerance, Units,
+    classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
+    EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
+    Tolerance, Units,
 };
 use vernier_platform::{
     Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId,
@@ -14,7 +14,6 @@ use vernier_platform::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod capture_worker;
@@ -3333,10 +3332,8 @@ fn replace_settings(s: Settings) {
 /// mechanism for that yet — so live mode there ends up measuring our
 /// own crosshair. The prefs UI locks the toggle on for Linux too,
 /// but this gate is the real enforcement (a hand-edited TOML can't
-/// get around it). The live-mode machinery — the capture worker,
-/// [`live_mode_edges`], the colour filter — is deliberately left
-/// intact behind this single seam; flip the Linux branch to return
-/// the real setting once compositor support lands.
+/// get around it). Re-enable by flipping the Linux branch to return
+/// the real setting once compositor layer-exclusion support lands.
 ///
 /// On macOS the setting is honoured: `CGWindowListCreateImage`
 /// captures below the overlay window, so live mode sees clean
@@ -3457,27 +3454,6 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
     hud.primary_fg = PlatColor::rgba(p.r, p.g, p.b, p.a);
     let a = s.appearance.alternative_color;
     hud.alternate_fg = PlatColor::rgba(a.r, a.g, a.b, a.a);
-    // Static-content colours: a noticeably darker shade of each
-    // foreground so live-mode edge detection (which colour-filters
-    // pixels close to the exact foreground) still sees held-rect
-    // borders + stuck measurements as real edges. -64 per channel
-    // (saturating) puts the shift around delta ~150-190 from the
-    // base colour — well past the 30-px filter tolerance — while
-    // keeping the same hue family so the visual relationship
-    // ("this is a committed measurement in the same color theme")
-    // is preserved.
-    hud.static_primary_fg = PlatColor::rgba(
-        p.r.saturating_sub(64),
-        p.g.saturating_sub(64),
-        p.b.saturating_sub(64),
-        p.a,
-    );
-    hud.static_alternate_fg = PlatColor::rgba(
-        a.r.saturating_sub(64),
-        a.g.saturating_sub(64),
-        a.b.saturating_sub(64),
-        a.a,
-    );
     let unit_suffix = if s.general.display_units {
         match s.appearance.units {
             Units::Px => "px".to_string(),
@@ -5301,8 +5277,6 @@ fn toggle_measurement(
     if matches!(mode, InteractionMode::Idle) {
         // Going ON — recapture the screen for edge detection, restore
         // input grab, and re-render any persisted content alongside.
-        // Drop any cached live-mode edges from a prior session.
-        clear_live_edge_cache();
         match platform.capture_screen_native(monitor) {
             Ok(frame) => {
                 log::info!(
@@ -5388,8 +5362,6 @@ fn toggle_measurement(
             log::info!("prefs hotkey released");
         }
     }
-    // Drop cached live-mode edges so the next session starts clean.
-    clear_live_edge_cache();
     let has_content = !held_rects.is_empty()
         || !guides.is_empty()
         || !stuck_measurements.is_empty();
@@ -5782,142 +5754,10 @@ fn compose_guides(
     out
 }
 
-/// Live-mode edge cache. See [`live_mode_edges`] for why it exists.
-/// Holds the last reading that came from a scan against a frame
-/// whose overlay strokes were *not* over the cursor's row/column.
-fn live_edge_cache() -> &'static Mutex<[Option<HudEdge>; 4]> {
-    static CELL: OnceLock<Mutex<[Option<HudEdge>; 4]>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new([None; 4]))
-}
-
-/// Drop the cached live-mode reading. Called on measure-mode
-/// transitions so a fresh session doesn't show edges left over
-/// from the previous one.
-fn clear_live_edge_cache() {
-    if let Ok(mut c) = live_edge_cache().lock() {
-        *c = [None; 4];
-    }
-}
-
-/// Sample the captured frame at the surface cursor and report
-/// whether that pixel is one of `skip_colors` — i.e. whether the
-/// live capture's overlay strokes have caught up to the cursor and
-/// now sit directly on it. When true, edge detection's anchor pixel
-/// would be the overlay's own axis line rather than the content,
-/// and *any* scan would be contaminated.
-fn anchor_on_overlay(
-    frame: &NativeFrame,
-    skip_colors: &[Rgba],
-    surface_x: f64,
-    surface_y: f64,
-) -> bool {
-    let surface_w = frame.bounds.w as f64;
-    let surface_h = frame.bounds.h as f64;
-    if surface_w <= 0.0 || surface_h <= 0.0 {
-        return false;
-    }
-    let scale_x = frame.width as f64 / surface_w;
-    let scale_y = frame.height as f64 / surface_h;
-    let fx = (surface_x * scale_x).round();
-    let fy = (surface_y * scale_y).round();
-    if fx < 0.0 || fy < 0.0 {
-        return false;
-    }
-    let view = FrameView {
-        pixels: &frame.pixels,
-        width: frame.width,
-        height: frame.height,
-        stride: frame.stride,
-    };
-    match view.pixel(fx as u32, fy as u32) {
-        Some(here) => skip_colors.iter().any(|c| c.rgb_delta(here) <= 30),
-        None => false,
-    }
-}
-
-/// Edge detection for live mode.
-///
-/// The live screencast captures Vernier's own overlay, and the axis
-/// crosshair is *opaque* — it occludes the content it's drawn over.
-/// Colour-filtering the foreground can skip the axis-line pixels
-/// during a scan, but two things still break a naive scan once the
-/// captured frame's overlay sits on the cursor:
-///
-///  * The *anchor* pixel is sampled at the cursor itself — if the
-///    axis line is there, the anchor is the line's colour, not the
-///    content's, and the scan reports the line/content boundary as
-///    a false edge.
-///  * The content beneath the axis lines was never captured, so the
-///    cursor's own row/column can't be measured at all.
-///
-/// The saving grace: the screencast lags the daemon by tens of ms,
-/// so while the cursor is *moving* the captured frame still shows
-/// the overlay at a *previous* cursor position — the current
-/// row/column is clear and the anchor lands on real content. We
-/// detect the "overlay has caught up" case directly by sampling the
-/// anchor pixel ([`anchor_on_overlay`]); when it's clean we scan and
-/// cache the reading, and when it's contaminated we reuse the last
-/// cached reading rather than scanning. This matches how a
-/// measurement tool is used: move onto the target, stop, read.
-///
-/// The foreground colours are still passed to
-/// [`detect_edges_filtering`] so the spot where a moving scan
-/// crosses the *perpendicular* old axis line is skipped rather than
-/// read as a false edge.
-fn live_mode_edges(
-    frozen_frame: Option<&NativeFrame>,
-    x: f64,
-    y: f64,
-    tolerance: u32,
-) -> [Option<HudEdge>; 4] {
-    let s = current_settings();
-    let p = s.appearance.primary_color;
-    let a = s.appearance.alternative_color;
-    let skip_colors = [
-        Rgba::new(p.r, p.g, p.b, 255),
-        Rgba::new(a.r, a.g, a.b, 255),
-    ];
-    let cached = || {
-        live_edge_cache()
-            .lock()
-            .map(|c| *c)
-            .unwrap_or([None; 4])
-    };
-    // Anchor sits on an overlay stroke → the captured frame's axis
-    // lines have caught up to the cursor. A scan would only measure
-    // our own crosshair; reuse the last clean reading instead.
-    let anchor_contaminated = frozen_frame
-        .map(|f| anchor_on_overlay(f, &skip_colors, x, y))
-        .unwrap_or(false);
-    if anchor_contaminated {
-        return cached();
-    }
-    // Anchor is clean — scan, and cache the result so the reading
-    // survives once the cursor goes stationary and the overlay
-    // catches up.
-    let scanned = frozen_frame
-        .and_then(|f| detect_hud_edges(f, &skip_colors, x, y, tolerance))
-        .unwrap_or([None; 4]);
-    if scanned.iter().any(|e| e.is_some()) {
-        if let Ok(mut c) = live_edge_cache().lock() {
-            *c = scanned;
-        }
-        scanned
-    } else {
-        // Genuinely featureless area — keep the last good reading
-        // rather than collapsing the HUD.
-        cached()
-    }
-}
-
 /// Run `detect_hud_edges` against the frozen frame, then fold any
 /// committed guides in as additional edge candidates. Guides clamp
 /// the axis lines: if a guide is nearer than the detected pixel edge
 /// on a given side, the line snaps to the guide instead.
-///
-/// Freeze mode runs a plain scan against the pinned snapshot, which
-/// predates the overlay and so needs no filtering or caching. Live
-/// mode routes through [`live_mode_edges`].
 fn edges_for_hud(
     frozen_frame: Option<&NativeFrame>,
     x: f64,
@@ -5925,13 +5765,9 @@ fn edges_for_hud(
     tolerance: u32,
     guides: &[Guide],
 ) -> [Option<HudEdge>; 4] {
-    let mut edges = if effective_freeze_screen() {
-        frozen_frame
-            .and_then(|f| detect_hud_edges(f, &[], x, y, tolerance))
-            .unwrap_or([None; 4])
-    } else {
-        live_mode_edges(frozen_frame, x, y, tolerance)
-    };
+    let mut edges = frozen_frame
+        .and_then(|f| detect_hud_edges(f, x, y, tolerance))
+        .unwrap_or([None; 4]);
     apply_guides_to_edges(&mut edges, guides, x, y);
     edges
 }
@@ -6486,16 +6322,8 @@ fn cursor_in_held_rect(cursor: Px, rect_start: Px, rect_end: Px) -> bool {
 /// Capture the latest screen frame and run edge detection at the
 /// surface-local cursor `(x, y)`. The result is in surface coordinates
 /// so the HUD can render directly.
-///
-/// `skip_colors` filter pixels of the listed colours out of the scan
-/// (they're treated as transparent). Used in live mode to keep
-/// Vernier's own overlay strokes — axis lines, tick caps, drag
-/// rect, in-progress held outline — from reading as edges in the
-/// captured frame. Pass `&[]` for freeze mode, where the captured
-/// frame predates the overlay and there's nothing to filter.
 fn detect_hud_edges(
     frame: &NativeFrame,
-    skip_colors: &[Rgba],
     surface_x: f64,
     surface_y: f64,
     tolerance: u32,
@@ -6518,12 +6346,7 @@ fn detect_hud_edges(
         height: frame.height,
         stride: frame.stride,
     };
-    let edges = detect_edges_filtering(
-        &view,
-        frame_cursor,
-        Tolerance(tolerance),
-        skip_colors,
-    );
+    let edges = detect_edges(&view, frame_cursor, Tolerance(tolerance));
     Some(convert_edges_to_surface(&edges, scale_x, scale_y))
 }
 

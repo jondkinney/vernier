@@ -80,35 +80,14 @@ pub type EdgeQuad = [Option<EdgeCandidate>; 4];
 /// direction (or `None` if the scan ran off the frame without finding an
 /// edge). The order matches [`Direction::ALL`].
 pub fn detect_edges(frame: &FrameView, cursor: Px, tolerance: Tolerance) -> EdgeQuad {
-    detect_edges_filtering(frame, cursor, tolerance, &[])
-}
-
-/// Like [`detect_edges`] but pixels within tolerance of any
-/// `skip_colors` are treated as if they matched the anchor — useful
-/// when the captured frame contains overlay strokes (Vernier's own
-/// axis lines, tick caps, etc.) painted in known colours that we
-/// want the scan to walk straight through. The match tolerance is
-/// tight (delta ≤ 30) so close-but-not-equal shades (e.g. the
-/// darkened static-content color used for held-rect borders) are
-/// NOT filtered and still register as edges.
-///
-/// Pass `&[]` for the freeze-mode path; the captured frame predates
-/// the overlay, so there's nothing to filter and skip handling is a
-/// no-op for that mode.
-pub fn detect_edges_filtering(
-    frame: &FrameView,
-    cursor: Px,
-    tolerance: Tolerance,
-    skip_colors: &[Rgba],
-) -> EdgeQuad {
     let Some(anchor) = pixel_for_cursor(frame, cursor) else {
         return [None, None, None, None];
     };
     [
-        scan(frame, cursor, Direction::Left, anchor, tolerance, skip_colors),
-        scan(frame, cursor, Direction::Right, anchor, tolerance, skip_colors),
-        scan(frame, cursor, Direction::Up, anchor, tolerance, skip_colors),
-        scan(frame, cursor, Direction::Down, anchor, tolerance, skip_colors),
+        scan(frame, cursor, Direction::Left, anchor, tolerance),
+        scan(frame, cursor, Direction::Right, anchor, tolerance),
+        scan(frame, cursor, Direction::Up, anchor, tolerance),
+        scan(frame, cursor, Direction::Down, anchor, tolerance),
     ]
 }
 
@@ -125,15 +104,7 @@ fn scan(
     dir: Direction,
     anchor: Rgba,
     tol: Tolerance,
-    skip_colors: &[Rgba],
 ) -> Option<EdgeCandidate> {
-    // Tight tolerance — the renderer paints overlay strokes with
-    // anti-alias OFF (see hud_render::render_dynamic_strokes), so
-    // a pixel is either the exact foreground color or it's
-    // underlying content. A bigger tolerance would risk filtering
-    // out a deliberately-shifted "static foreground" colour the
-    // renderer uses for held-rect borders.
-    const SKIP_COLOR_TOL: u32 = 30;
     let (dx, dy) = dir.step();
     let mut x = cursor.x;
     let mut y = cursor.y;
@@ -148,12 +119,6 @@ fn scan(
         let Some(here) = frame.pixel(x as u32, y as u32) else {
             return None;
         };
-        if skip_colors
-            .iter()
-            .any(|c| c.rgb_delta(here) <= SKIP_COLOR_TOL)
-        {
-            continue;
-        }
         let delta = anchor.rgb_delta(here);
         // Strict `>` (not `>=`) so Tolerance(0) means "stop on any
         // color change at all" rather than "stop immediately" — at
