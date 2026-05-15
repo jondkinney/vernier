@@ -74,6 +74,17 @@ jobs:
           ln -sf "$PWD/target/aarch64-apple-darwin/release/vernier" target/release/vernier
 
       - name: Build .app bundle + DMG
+        env:
+          # Signing/notarization secrets, consumed by
+          # packaging/macos/sign-and-notarize.sh. If any are unset
+          # the script no-ops and the build falls back to ad-hoc
+          # signing — useful for forks that haven't configured
+          # secrets yet.
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          VERNIER_SIGNING_PASSWORD: ${{ secrets.VERNIER_SIGNING_PASSWORD }}
         run: ./packaging/macos/package.sh
 
       - name: Verify bundle signature

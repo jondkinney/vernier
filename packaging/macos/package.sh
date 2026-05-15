@@ -109,9 +109,20 @@ touch "$BUNDLE_DIR"
 # launch the binary from a downloaded DMG with an opaque "cannot be
 # opened" error. `--deep` covers the single Mach-O inside MacOS/ since
 # we don't have nested frameworks yet.
-echo "==> Codesigning (identity: ${CODESIGN_IDENTITY})"
-codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
-codesign --verify --verbose=2 "$BUNDLE_DIR"
+#
+# Skipped when MACOS_CERTIFICATE_P12_BASE64 is set, because
+# sign-and-notarize.sh below replaces this with a real Developer ID
+# signature anyway.
+if [[ -z "${MACOS_CERTIFICATE_P12_BASE64:-}" ]]; then
+    echo "==> Codesigning (identity: ${CODESIGN_IDENTITY})"
+    codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE_DIR"
+    codesign --verify --verbose=2 "$BUNDLE_DIR"
+fi
+
+# Real Developer ID signing + Apple notarization. No-ops when the
+# signing secrets aren't in the environment, so local builds stay
+# ad-hoc-signed without extra config.
+"$REPO_ROOT/packaging/macos/sign-and-notarize.sh" --app "$BUNDLE_DIR"
 
 # ---------------------------------------------------------------- DMG
 echo "==> Creating ${DMG_PATH}"
@@ -132,6 +143,11 @@ create-dmg \
     --no-internet-enable \
     "$DMG_PATH" \
     "$BUNDLE_DIR"
+
+# Sign + notarize + staple the DMG itself so the download works
+# offline and Gatekeeper accepts it without an online check. No-op
+# locally without secrets.
+"$REPO_ROOT/packaging/macos/sign-and-notarize.sh" --dmg "$DMG_PATH"
 
 echo
 echo "Done."

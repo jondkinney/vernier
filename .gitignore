@@ -2,3 +2,12 @@
 **/*.rs.bk
 *.swp
 .DS_Store
+
+# Signing material — never commit a cert, key, or env file even if
+# one happens to land in the repo dir during a release dry-run.
+*.p12
+*.cer
+*.pem
+*.key
+.env
+.env.*
