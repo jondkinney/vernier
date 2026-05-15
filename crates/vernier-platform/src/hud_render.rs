@@ -241,6 +241,36 @@ pub(crate) fn render_dynamic_into(
     render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
 }
 
+/// Like [`render_static_into`] but does NOT clear the canvas first —
+/// strokes blend (premul SrcOver) onto whatever pixels are already
+/// there. Pair with [`render_dynamic_onto`] for backends that want to
+/// pre-composite background + static into a single cached buffer and
+/// avoid an extra full-buffer SrcOver per frame.
+pub(crate) fn render_static_onto(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
+    render_static_layer(canvas, buf_w, buf_h, scale, hud);
+}
+
+/// Like [`render_dynamic_into`] but does NOT clear the canvas first.
+/// On Wayland the SHM canvas is memcpy'd from a pre-baked bg+static
+/// buffer and the dynamic strokes go on top in-place — saves a
+/// full-buffer zero-fill + a full-buffer SrcOver per frame vs the
+/// `_into` + `draw_pixmap` form.
+pub(crate) fn render_dynamic_onto(
+    canvas: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    scale: u32,
+    hud: &Hud,
+) {
+    render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
+}
+
 /// Digest of the [`Hud`] fields that affect the static layer. A change
 /// in the digest is the signal to re-rasterize the static cache; a
 /// match means the cached buffer is still valid. Hash collisions only

@@ -480,6 +480,36 @@ struct OverlayInst {
     /// State changed while `frame_pending` was set; on the next
     /// callback we'll redraw with the latest state.
     redraw_pending: bool,
+    /// Pre-baked "bg + static" composite. Per cursor-only frame the
+    /// SHM canvas is memcpy'd from this buffer and the dynamic
+    /// strokes go on top in-place — so the per-frame cost is one
+    /// full-buffer copy + the (sparse) dynamic stroke set, instead
+    /// of bg-fill + two full-buffer SrcOver composites. Rebuilt
+    /// only when [`combined_cache_key`] changes (held rects /
+    /// guides / stuck measurements / colors / measurement format /
+    /// background tint). Length matches `pixmap_buf_w *
+    /// pixmap_buf_h * 4`; empty before the first hud-bearing draw.
+    ///
+    /// On a 4K HiDPI surface (~42 MB buffer) each full-buffer pass
+    /// runs ~3–6 ms even on fast desktop DDR — keeping the per
+    /// cursor frame to a single such pass is what makes measure
+    /// mode feel native here.
+    ///
+    /// [`combined_cache_key`]: Self::combined_cache_key
+    combined_bg_static_pixmap: Vec<u8>,
+    /// Cache key for [`combined_bg_static_pixmap`]: the static-
+    /// layer digest paired with the HUD background colour. Either
+    /// changing invalidates the pre-baked composite. `None` =
+    /// "no valid cache, rebuild on next draw" (set after a
+    /// resize).
+    ///
+    /// [`combined_bg_static_pixmap`]: Self::combined_bg_static_pixmap
+    combined_cache_key: Option<(u64, Color)>,
+    /// Buffer dimensions the cached pixmap was rendered at. A
+    /// configure that changes `width * buffer_scale` invalidates
+    /// the cache.
+    pixmap_buf_w: i32,
+    pixmap_buf_h: i32,
 }
 
 fn run_event_loop(
@@ -744,6 +774,10 @@ impl WaylandState {
                 hud: None,
                 frame_pending: false,
                 redraw_pending: false,
+                combined_bg_static_pixmap: Vec::new(),
+                combined_cache_key: None,
+                pixmap_buf_w: 0,
+                pixmap_buf_h: 0,
             },
         );
 
@@ -884,8 +918,94 @@ impl WaylandState {
         if !inst.visible_intent {
             // Hidden: clear to transparent.
             canvas.fill(0);
-        } else if let Some(hud) = inst.hud.as_ref() {
-            render_hud_into(canvas, buf_w as u32, buf_h as u32, scale as u32, hud);
+        } else if inst.hud.is_some() {
+            // Resize the cached pixmap to match the SHM buffer dims
+            // before borrowing `hud`. A configure that changes
+            // `width * buffer_scale` lands here too and invalidates
+            // the cache.
+            let pixmap_bytes = (buf_w as usize) * (buf_h as usize) * 4;
+            if inst.pixmap_buf_w != buf_w
+                || inst.pixmap_buf_h != buf_h
+                || inst.combined_bg_static_pixmap.len() != pixmap_bytes
+            {
+                inst.combined_bg_static_pixmap.clear();
+                inst.combined_bg_static_pixmap.resize(pixmap_bytes, 0);
+                inst.pixmap_buf_w = buf_w;
+                inst.pixmap_buf_h = buf_h;
+                inst.combined_cache_key = None;
+            }
+
+            let hud = inst.hud.as_ref().expect("hud.is_some checked above");
+            let new_key = (static_hash(hud), hud.background);
+
+            // Rebuild the bg+static composite when either input
+            // changes. Rare path — held content edits, color
+            // tweaks, freeze toggle. The hot path (cursor moves)
+            // hits the cache and skips this entire block.
+            if Some(new_key) != inst.combined_cache_key {
+                let bg = rgba8888_premul(hud.background);
+                if bg == [0, 0, 0, 0] {
+                    inst.combined_bg_static_pixmap.fill(0);
+                } else {
+                    for chunk in
+                        inst.combined_bg_static_pixmap.chunks_exact_mut(4)
+                    {
+                        chunk.copy_from_slice(&bg);
+                    }
+                }
+                render_static_onto(
+                    &mut inst.combined_bg_static_pixmap,
+                    buf_w as u32,
+                    buf_h as u32,
+                    scale as u32,
+                    hud,
+                );
+                inst.combined_cache_key = Some(new_key);
+            }
+
+            // Hot path: one full-buffer memcpy (the pre-baked
+            // bg+static) plus sparse dynamic strokes drawn directly
+            // onto the canvas. That matches the pre-split path's
+            // per-frame cost (one fill + sparse strokes) while
+            // amortizing the static stroke pass across frames.
+            if canvas.len() == inst.combined_bg_static_pixmap.len() {
+                canvas.copy_from_slice(&inst.combined_bg_static_pixmap);
+            } else {
+                // Defensive: `pixmap_bytes` was validated against
+                // both `inst.combined_bg_static_pixmap.len()` and
+                // the buffer dims a few lines up; a mismatch here
+                // means the SHM buffer disagreed about its own
+                // size. Fall back to a bg-only fill so the frame
+                // still commits.
+                log::warn!(
+                    "canvas/cache size mismatch (canvas={}, cache={}) — \
+                     painting bg only this frame",
+                    canvas.len(),
+                    inst.combined_bg_static_pixmap.len(),
+                );
+                let bg = rgba8888_premul(hud.background);
+                if bg == [0, 0, 0, 0] {
+                    canvas.fill(0);
+                } else {
+                    for chunk in canvas.chunks_exact_mut(4) {
+                        chunk.copy_from_slice(&bg);
+                    }
+                }
+            }
+            // Dynamic strokes (axis crosshair, tick caps, W×H pill,
+            // drag rect, in-progress held outline) on top of the
+            // static layer. The `+` marker is gated by
+            // `hud.show_cursor`, which we mask to `false` in the
+            // `OverlaySetHud` handler — it's drawn by the OS
+            // pointer cursor instead, so the screencast portal
+            // strips it from live captures.
+            render_dynamic_onto(
+                canvas,
+                buf_w as u32,
+                buf_h as u32,
+                scale as u32,
+                hud,
+            );
         } else {
             // Plain tint, no HUD.
             let pixel = rgba8888_premul(inst.tint);
@@ -1469,10 +1589,13 @@ fn to_rgba8(
 }
 
 
-// HUD rasterization moved to `crate::hud_render`. The only entry
-// point Wayland needs is `render_hud_into`; pixel-format and
-// premultiplication helpers used elsewhere in this file stay here.
-use crate::hud_render::{rgba8888_premul, render_hud_into};
+// HUD rasterization lives in `crate::hud_render`. The Wayland backend
+// caches the pre-baked bg+static composite and per cursor frame just
+// memcpys it into the SHM canvas then strokes the dynamic layer on
+// top in-place — one full-buffer pass plus sparse strokes, which is
+// the cost ceiling we need at 4K HiDPI where each extra full-buffer
+// composite costs several ms.
+use crate::hud_render::{render_dynamic_onto, render_static_onto, rgba8888_premul, static_hash};
 fn video_format_to_pixel_format(
     vf: pipewire::spa::param::video::VideoFormat,
 ) -> Result<PixelFormat> {
