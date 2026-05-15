@@ -321,32 +321,8 @@ enum Cmd {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SystemPointerKind {
-    /// Daemon intent: don't show a system arrow. On Wayland this
-    /// maps to the blank cursor surface so `set_cursor(None)`'s
-    /// fallback to the compositor's default cursor doesn't leak
-    /// (an I-beam or arrow that the screencast portal might not
-    /// strip).
     Hidden,
-    /// Daemon wants the compositor's default arrow (e.g. over a
-    /// clickable pill or while the context menu is open).
     Default,
-    /// Vernier's measurement `+` cursor painted as the OS pointer
-    /// (via `wl_pointer.set_cursor`) so the screencast portal's
-    /// `CursorMode::Hidden` strips it cleanly. Hyprland's portal
-    /// honours this for small cursor surfaces. Selected by
-    /// [`WaylandState::resolve_pointer_kind`] when the daemon's
-    /// `Hidden` intent meets `hud.show_cursor == true`.
-    MeasurementCross,
-}
-
-/// Pre-rendered cursor surface. Built once at init; reused for
-/// every `pointer.set_cursor` call. `_buffer` holds the SCTK slot
-/// alive so the compositor can re-read the same pixels.
-struct CursorSurface {
-    surface: wl_surface::WlSurface,
-    _buffer: smithay_client_toolkit::shm::slot::Buffer,
-    hotspot_x: i32,
-    hotspot_y: i32,
 }
 
 struct WaylandOverlay {
@@ -464,22 +440,6 @@ struct WaylandState {
     /// Per-overlay desired system-pointer state. Updated by main.rs;
     /// applied to the latest pointer Enter serial.
     overlay_pointer_kind: HashMap<OverlayKey, SystemPointerKind>,
-    /// Per-overlay `hud.show_cursor` snapshot used by
-    /// [`Self::resolve_pointer_kind`] to upgrade the daemon's
-    /// `Hidden` intent into `MeasurementCross` when the user has
-    /// the "Show cursor" preference enabled.
-    overlay_show_cursor: HashMap<OverlayKey, bool>,
-    /// Pre-rendered `+` cursor surface. None on the unhappy path
-    /// where SHM allocation failed; we fall through to the blank
-    /// cursor / `set_cursor(None)` in that case.
-    measurement_cursor: Option<CursorSurface>,
-    /// Pre-rendered 1×1 transparent cursor used for the
-    /// `SystemPointerKind::Hidden` case. `set_cursor(None)` would
-    /// otherwise fall back to whatever default cursor the
-    /// compositor wants to show (often an I-beam over text), which
-    /// the screencast portal might not strip from the stream and
-    /// would then trip our own edge detection.
-    blank_cursor: Option<CursorSurface>,
 
     overlays: HashMap<OverlayKey, OverlayInst>,
     next_overlay_id: u64,
@@ -576,7 +536,7 @@ fn run_event_loop(
     // 64 MB initial pool covers a 4096×4096 RGBA buffer (mmap; uses physical
     // memory only when written). SCTK grows on demand if a larger surface
     // appears, but starting large avoids reallocs on hot paths.
-    let mut pool = SlotPool::new(4096 * 4096 * 4, &shm)
+    let pool = SlotPool::new(4096 * 4096 * 4, &shm)
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("create shm pool: {e}")))?;
     let empty_region = Region::new(&compositor)
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("create empty region: {e}")))?;
@@ -590,20 +550,6 @@ fn run_event_loop(
     };
 
     let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
-    let measurement_cursor = match build_measurement_cursor(&compositor, &mut pool, &qh) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            log::warn!("measurement cursor: build failed: {e:#}");
-            None
-        }
-    };
-    let blank_cursor = match build_blank_cursor(&compositor, &mut pool, &qh) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            log::warn!("blank cursor: build failed: {e:#}");
-            None
-        }
-    };
     let mut state = WaylandState {
         registry,
         output_state,
@@ -623,9 +569,6 @@ fn run_event_loop(
         pointer_shape_devices: HashMap::new(),
         last_pointer_enter: None,
         overlay_pointer_kind: HashMap::new(),
-        overlay_show_cursor: HashMap::new(),
-        measurement_cursor,
-        blank_cursor,
         overlays: HashMap::new(),
         next_overlay_id: 1,
         monitors_pub,
@@ -694,38 +637,11 @@ impl WaylandState {
                 self.set_input_capturing(key, capturing);
             }
             Cmd::OverlaySetHud(key, hud) => {
-                // The `+` cursor marker is the one overlay element
-                // whose pixels would otherwise punch through the
-                // foreground-coloured axis lines and confuse edge
-                // detection's anchor. Route it through the OS
-                // pointer cursor so the screencast portal's
-                // `CursorMode::Hidden` strips it from live captures.
-                // Axis lines + tick caps + pill still render on the
-                // overlay layer (this is where they show up in
-                // captures) and the daemon filters their foreground
-                // colour out of edge detection in live mode.
-                let want_cursor = hud
-                    .as_ref()
-                    .map(|h| h.show_cursor)
-                    .unwrap_or(false);
-                let masked = hud.map(|mut h| {
-                    h.show_cursor = false;
-                    h
-                });
-                let visible_intent = match self.overlays.get_mut(&key) {
-                    Some(inst) => {
-                        inst.hud = masked;
-                        inst.visible_intent
+                if let Some(inst) = self.overlays.get_mut(&key) {
+                    inst.hud = hud;
+                    if inst.visible_intent {
+                        self.draw_overlay(key);
                     }
-                    None => return,
-                };
-                self.overlay_show_cursor.insert(key, want_cursor);
-                if let Some((pointer, serial)) = self.last_pointer_enter.clone() {
-                    let resolved = self.resolve_pointer_kind(key);
-                    self.apply_pointer_kind(&pointer, serial, resolved);
-                }
-                if visible_intent {
-                    self.draw_overlay(key);
                 }
             }
             Cmd::OverlayDestroy(key) => {
@@ -736,7 +652,6 @@ impl WaylandState {
                     drop(inst);
                 }
                 self.overlay_pointer_kind.remove(&key);
-                self.overlay_show_cursor.remove(&key);
             }
             Cmd::OverlaySetSystemPointer(key, kind) => {
                 self.set_overlay_system_pointer(key, kind);
@@ -920,15 +835,6 @@ impl WaylandState {
                 .set_keyboard_interactivity(KeyboardInteractivity::None);
         }
         inst.layer.commit();
-        // Re-apply the pointer kind so toggling into measure mode
-        // immediately swaps the system arrow for the measurement
-        // crosshair (or out of it on exit), even when the pointer
-        // is already inside the overlay and no fresh Enter event
-        // is on its way.
-        if let Some((pointer, serial)) = self.last_pointer_enter.clone() {
-            let resolved = self.resolve_pointer_kind(key);
-            self.apply_pointer_kind(&pointer, serial, resolved);
-        }
     }
 
     /// Lookup the monitor of the first known overlay. Used to attribute
@@ -939,8 +845,7 @@ impl WaylandState {
     }
 
     /// Apply a SystemPointerKind to the given pointer/serial — either
-    /// hide the OS cursor, set the wp_cursor_shape "default" shape,
-    /// or attach the pre-rendered measurement-`+` surface.
+    /// hide the OS cursor or set the wp_cursor_shape "default" shape.
     fn apply_pointer_kind(
         &self,
         pointer: &wl_pointer::WlPointer,
@@ -949,83 +854,24 @@ impl WaylandState {
     ) {
         match kind {
             SystemPointerKind::Hidden => {
-                if let Some(bc) = &self.blank_cursor {
-                    pointer.set_cursor(
-                        serial,
-                        Some(&bc.surface),
-                        bc.hotspot_x,
-                        bc.hotspot_y,
-                    );
-                } else {
-                    pointer.set_cursor(serial, None, 0, 0);
-                }
+                pointer.set_cursor(serial, None, 0, 0);
             }
             SystemPointerKind::Default => {
                 if let Some(device) = self.pointer_shape_devices.get(&pointer.id()) {
                     device.set_shape(serial, Shape::Default);
                 } else {
+                    // No cursor-shape support — leave the cursor as-is
+                    // rather than hiding it (compositor's default).
                     pointer.set_cursor(serial, None, 0, 0);
                 }
             }
-            SystemPointerKind::MeasurementCross => {
-                if let Some(mc) = &self.measurement_cursor {
-                    pointer.set_cursor(
-                        serial,
-                        Some(&mc.surface),
-                        mc.hotspot_x,
-                        mc.hotspot_y,
-                    );
-                } else {
-                    pointer.set_cursor(serial, None, 0, 0);
-                }
-            }
-        }
-    }
-
-    /// Resolve the daemon's per-overlay [`SystemPointerKind`] request
-    /// against the implicit defaults. The daemon stays platform-
-    /// agnostic and toggles between `Hidden` (no system arrow — we
-    /// want our HUD shown via the cursor plane) and `Default` (system
-    /// arrow wanted, e.g. over a clickable pill or while the context
-    /// menu is open).
-    ///
-    /// When the daemon hasn't issued an explicit
-    /// `set_system_pointer_visible` yet, fall back to the same
-    /// implicit default the daemon uses internally: `Hidden` while
-    /// the overlay is capturing input (measure mode wants the
-    /// dynamic-HUD cursor), `Default` otherwise.
-    fn resolve_pointer_kind(&self, key: OverlayKey) -> SystemPointerKind {
-        let requested = match self.overlay_pointer_kind.get(&key).copied() {
-            Some(k) => k,
-            None => {
-                let capturing = self
-                    .overlays
-                    .get(&key)
-                    .map(|i| i.input_capturing)
-                    .unwrap_or(false);
-                if capturing {
-                    SystemPointerKind::Hidden
-                } else {
-                    SystemPointerKind::Default
-                }
-            }
-        };
-        let show_cursor = self
-            .overlay_show_cursor
-            .get(&key)
-            .copied()
-            .unwrap_or(false);
-        match (requested, show_cursor) {
-            (SystemPointerKind::Hidden, true) => SystemPointerKind::MeasurementCross,
-            (kind, _) => kind,
         }
     }
 
     fn set_overlay_system_pointer(&mut self, key: OverlayKey, kind: SystemPointerKind) {
         self.overlay_pointer_kind.insert(key, kind);
         if let Some((pointer, serial)) = self.last_pointer_enter.clone() {
-            let resolved = self.resolve_pointer_kind(key);
-            self.apply_pointer_kind(&pointer, serial, resolved);
+            self.apply_pointer_kind(&pointer, serial, kind);
         }
     }
 
@@ -1331,12 +1177,12 @@ impl PointerHandler for WaylandState {
     ) {
         for ev in events {
             let surf_id = ev.surface.id();
-            let (monitor, overlay_key) = match self
+            let (monitor, capturing, overlay_key) = match self
                 .overlays
                 .iter()
                 .find(|(_, inst)| inst.layer.wl_surface().id() == surf_id)
             {
-                Some((k, inst)) => (inst.monitor, *k),
+                Some((k, inst)) => (inst.monitor, inst.input_capturing, *k),
                 None => continue,
             };
             // On Enter, cache the serial/pointer so later Cmd::SetSystemPointer
@@ -1351,14 +1197,15 @@ impl PointerHandler for WaylandState {
                         self.pointer_shape_devices.insert(pid, device);
                     }
                 }
-                // Don't pre-populate `overlay_pointer_kind` here:
-                // `resolve_pointer_kind` already falls back to the
-                // right value based on the overlay's current
-                // `input_capturing` state. Inserting an explicit
-                // Default during passive mode would stick around
-                // and override the implicit Hidden the daemon
-                // expects once measure mode begins.
-                let kind = self.resolve_pointer_kind(overlay_key);
+                let kind = self
+                    .overlay_pointer_kind
+                    .get(&overlay_key)
+                    .copied()
+                    .unwrap_or(if capturing {
+                        SystemPointerKind::Hidden
+                    } else {
+                        SystemPointerKind::Default
+                    });
                 self.apply_pointer_kind(pointer, serial, kind);
             }
             let (x, y) = ev.position;
@@ -1700,125 +1547,6 @@ impl PointerConstraintsHandler for WaylandState {
 }
 // (delegate_pointer! already wires Dispatch for the wp_cursor_shape
 // manager + device through SCTK's CursorShapeManager.)
-
-// =========================================================================
-// Cursor helpers
-// =========================================================================
-
-/// Pre-render the `+` measurement cursor into an SHM buffer attached
-/// to its own `wl_surface`. Used as the OS pointer cursor via
-/// `wl_pointer.set_cursor` whenever the daemon wants its cursor
-/// crosshair visible — Hyprland honours `CursorMode::Hidden` for
-/// small cursor surfaces, so painting the `+` here keeps it off the
-/// live screencast and out of edge detection.
-fn build_measurement_cursor(
-    compositor: &CompositorState,
-    pool: &mut SlotPool,
-    qh: &QueueHandle<WaylandState>,
-) -> anyhow::Result<CursorSurface> {
-    // 32×32 surface px leaves margin around the 6-logical-px arm
-    // length so round line caps don't get clipped. Buffer-scale 2
-    // matches typical HiDPI without needing per-monitor handling
-    // (cursor surfaces are downscaled cleanly on 1× displays).
-    const SURFACE_PX: i32 = 32;
-    const BUFFER_SCALE: i32 = 2;
-    let buf_w = SURFACE_PX * BUFFER_SCALE;
-    let buf_h = SURFACE_PX * BUFFER_SCALE;
-    let stride = buf_w * 4;
-
-    let (buffer, canvas) = pool
-        .create_buffer(buf_w, buf_h, stride, wl_shm::Format::Abgr8888)
-        .map_err(|e| anyhow::anyhow!("create cursor shm buffer: {e}"))?;
-    canvas.fill(0);
-
-    let scale_f = BUFFER_SCALE as f32;
-    let mut pixmap = tiny_skia::PixmapMut::from_bytes(canvas, buf_w as u32, buf_h as u32)
-        .ok_or_else(|| anyhow::anyhow!("wrap cursor buffer as tiny-skia pixmap"))?;
-    let cx = buf_w as f32 / 2.0;
-    let cy = buf_h as f32 / 2.0;
-    let arm = 6.0 * scale_f;
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(cx - arm, cy);
-    pb.line_to(cx + arm, cy);
-    pb.move_to(cx, cy - arm);
-    pb.line_to(cx, cy + arm);
-    if let Some(path) = pb.finish() {
-        let mut outline = tiny_skia::Paint::default();
-        outline.set_color_rgba8(255, 255, 255, 255);
-        outline.anti_alias = true;
-        pixmap.stroke_path(
-            &path,
-            &outline,
-            &tiny_skia::Stroke {
-                width: 8.0,
-                line_cap: tiny_skia::LineCap::Round,
-                ..Default::default()
-            },
-            tiny_skia::Transform::identity(),
-            None,
-        );
-        let mut core = tiny_skia::Paint::default();
-        core.set_color_rgba8(0, 0, 0, 255);
-        core.anti_alias = true;
-        pixmap.stroke_path(
-            &path,
-            &core,
-            &tiny_skia::Stroke {
-                width: 2.0,
-                line_cap: tiny_skia::LineCap::Round,
-                ..Default::default()
-            },
-            tiny_skia::Transform::identity(),
-            None,
-        );
-    }
-
-    let surface = compositor.create_surface(qh);
-    buffer
-        .attach_to(&surface)
-        .map_err(|e| anyhow::anyhow!("attach cursor buffer: {e}"))?;
-    surface.set_buffer_scale(BUFFER_SCALE);
-    surface.damage_buffer(0, 0, buf_w, buf_h);
-    surface.commit();
-
-    Ok(CursorSurface {
-        surface,
-        _buffer: buffer,
-        hotspot_x: SURFACE_PX / 2,
-        hotspot_y: SURFACE_PX / 2,
-    })
-}
-
-/// 1×1 fully-transparent cursor surface for
-/// [`SystemPointerKind::Hidden`]. Using a client-attached
-/// transparent surface gives a genuine "no visible pointer" that
-/// the screencast portal still treats as the cursor (and therefore
-/// strips), unlike `set_cursor(None)` which lets the compositor's
-/// default cursor leak through.
-fn build_blank_cursor(
-    compositor: &CompositorState,
-    pool: &mut SlotPool,
-    qh: &QueueHandle<WaylandState>,
-) -> anyhow::Result<CursorSurface> {
-    let (buffer, canvas) = pool
-        .create_buffer(1, 1, 4, wl_shm::Format::Abgr8888)
-        .map_err(|e| anyhow::anyhow!("create blank cursor buffer: {e}"))?;
-    canvas.fill(0);
-
-    let surface = compositor.create_surface(qh);
-    buffer
-        .attach_to(&surface)
-        .map_err(|e| anyhow::anyhow!("attach blank cursor buffer: {e}"))?;
-    surface.damage_buffer(0, 0, 1, 1);
-    surface.commit();
-
-    Ok(CursorSurface {
-        surface,
-        _buffer: buffer,
-        hotspot_x: 0,
-        hotspot_y: 0,
-    })
-}
 
 // =========================================================================
 // Pixel helpers
