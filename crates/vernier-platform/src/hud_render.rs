@@ -328,6 +328,8 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
     hud.alternative_guide_color.hash(&mut h);
     hud.primary_fg.hash(&mut h);
     hud.alternate_fg.hash(&mut h);
+    hud.static_primary_fg.hash(&mut h);
+    hud.static_alternate_fg.hash(&mut h);
 
     let fmt = &hud.measurement_format;
     fmt.unit_suffix.hash(&mut h);
@@ -444,13 +446,18 @@ fn render_static_strokes(
     );
 
     // Held rects are additive — drawn first. Each accumulated drag
-    // stays visible.
+    // stays visible. Held rect borders + stuck measurements (the
+    // user-placed reference content) use the darker
+    // `static_*_fg` shade rather than the bare `*_fg`, so live-mode
+    // edge detection's foreground-colour filter (which targets
+    // `primary_fg` / `alternate_fg` exactly) treats them as real
+    // edges and lets the scan snap to them.
     for (i, rect) in hud.held_rects.iter().enumerate() {
         let dim_bbox = pill_layout.rect_dim_bboxes.get(i).copied();
         let rect_fg = if rect.color_alternate {
-            hud.alternate_fg
+            hud.static_alternate_fg
         } else {
-            hud.primary_fg
+            hud.static_primary_fg
         };
         let mut rect_paint = Paint::default();
         rect_paint.set_color_rgba8(rect_fg.r, rect_fg.g, rect_fg.b, rect_fg.a);
@@ -478,8 +485,8 @@ fn render_static_strokes(
             &mut pills,
             &hud.stuck_measurements,
             &pill_layout.stuck_bboxes,
-            hud.primary_fg,
-            hud.alternate_fg,
+            hud.static_primary_fg,
+            hud.static_alternate_fg,
             &hud.measurement_format,
             buf_w as f32,
             buf_h as f32,

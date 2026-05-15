@@ -1044,11 +1044,31 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     });
 
     setting(ui, |ui| {
-        ui.checkbox(&mut s.freeze_screen, "Freeze screen");
-        caption(ui, 
-            "On (default): the captured frame is locked when measure mode opens; press R to refresh manually. \
-             Off: edge detection follows live screen content as the cursor moves.",
-        );
+        // Live (non-frozen) capture isn't usable on Linux/Wayland
+        // yet: the compositor's screencast includes Vernier's own
+        // overlay, and no compositor exposes a way to exclude a
+        // layer surface from the capture — so edge detection ends
+        // up measuring our own crosshair. Lock the toggle on there
+        // until that support lands. (The daemon enforces this
+        // independently via `effective_freeze_screen`, so editing
+        // the TOML by hand has no effect either.)
+        if cfg!(target_os = "linux") {
+            s.freeze_screen = true;
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(&mut s.freeze_screen, "Freeze screen"),
+            );
+            caption(ui,
+                "The captured frame is locked when measure mode opens; press R to refresh \
+                 manually. Live (non-frozen) capture isn't supported on this platform yet.",
+            );
+        } else {
+            ui.checkbox(&mut s.freeze_screen, "Freeze screen");
+            caption(ui,
+                "On (default): the captured frame is locked when measure mode opens; press R to refresh manually. \
+                 Off: edge detection follows live screen content as the cursor moves.",
+            );
+        }
     });
 
     setting(ui, |ui| {

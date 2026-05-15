@@ -166,6 +166,17 @@ pub struct Hud {
     /// Foreground alternate color (black default). Paired with
     /// `primary_fg` for the per-element color toggle.
     pub alternate_fg: Color,
+    /// Darkened variant of [`Self::primary_fg`] used for held-rect
+    /// borders and stuck measurements (placed reference content,
+    /// `color_alternate = false`). Lives at a `rgb_delta` of at
+    /// least 60 from `primary_fg` so the live-mode edge-detection
+    /// colour filter (which targets `primary_fg` exactly) treats
+    /// it as a real edge rather than overlay chrome. Daemon
+    /// derives it in [`vernier_app::populate_hud_appearance`].
+    pub static_primary_fg: Color,
+    /// Paired with [`Self::static_primary_fg`] for the
+    /// `color_alternate = true` branch.
+    pub static_alternate_fg: Color,
     /// How distance / dimension values render in pills (units +
     /// rounding mode). Defaults to integer logical pixels with a
     /// "px" suffix.
@@ -432,6 +443,14 @@ impl Hud {
             alternative_guide_color: Color::rgba(0xFF, 0xA9, 0x4A, 0xF0),
             primary_fg: Color::rgba(0xFF, 0x5C, 0x5C, 0xF5),
             alternate_fg: Color::rgba(0x10, 0x10, 0x10, 0xF5),
+            // Defaults mirror `primary_fg` / `alternate_fg` so any
+            // call site that doesn't populate them (tests, macOS
+            // path) still gets the original visuals. The daemon's
+            // `populate_hud_appearance` overrides these with
+            // darkened variants when the live-mode filter needs
+            // them differentiated.
+            static_primary_fg: Color::rgba(0xFF, 0x5C, 0x5C, 0xF5),
+            static_alternate_fg: Color::rgba(0x10, 0x10, 0x10, 0xF5),
             measurement_format: HudMeasurementFormat::default(),
             show_cursor: true,
             corner_indicator: None,
