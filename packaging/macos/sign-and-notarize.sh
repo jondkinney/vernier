@@ -1,28 +1,31 @@
 #!/usr/bin/env bash
 #
-# Sign + notarize + staple a macOS .app bundle or .dmg for Vernier.
+# Sign (and, for a .dmg, notarize + staple) a macOS artifact for Vernier.
 #
-# Designed to run on a GitHub Actions macos-latest runner. A throwaway
-# keychain holds the Developer ID Application cert for the duration of
-# the job and is torn down on exit (success or failure).
+# Designed to run on a GitHub Actions macos runner. A throwaway keychain
+# holds the Developer ID Application cert for the duration of the job
+# and is torn down on exit (success or failure).
 #
 # Usage:
 #   sign-and-notarize.sh --app target/macos/Vernier.app
-#   sign-and-notarize.sh --dmg target/macos/Vernier-0.1.6-aarch64.dmg
+#       Code-sign the bundle (Developer ID + hardened runtime). No
+#       notarization here — the .app is notarized as part of the DMG.
+#   sign-and-notarize.sh --dmg target/macos/Vernier-<ver>-aarch64.dmg
+#       Sign, notarize (Apple inspects the nested .app too), and
+#       staple the DMG. One notary round-trip covers everything.
 #
 # Required env vars (all set as GitHub Actions secrets):
 #   MACOS_CERTIFICATE_P12_BASE64   base64 of the exported Developer ID
-#                                  Application .p12 file
+#                                  Application .p12 (cert + private key)
 #   MACOS_CERTIFICATE_PASSWORD     password used when exporting the .p12
-#   MACOS_NOTARY_APPLE_ID          Apple ID email (jonkinney@gmail.com)
-#   MACOS_NOTARY_TEAM_ID           10-char team ID (e.g. ABCD123456)
+#   MACOS_NOTARY_APPLE_ID          Apple ID email
+#   MACOS_NOTARY_TEAM_ID           10-char team ID
 #   VERNIER_SIGNING_PASSWORD       app-specific password from
 #                                  appleid.apple.com, used by notarytool
 #
 # Local development: leave MACOS_CERTIFICATE_P12_BASE64 unset and this
-# script no-ops with a notice. package.sh's ad-hoc signature stays in
-# place, so the resulting bundle still launches after the usual
-# right-click → Open dance.
+# script no-ops with a notice — package.sh's ad-hoc signature stays in
+# place so the build still launches after the right-click → Open dance.
 
 set -euo pipefail
 
@@ -34,7 +37,7 @@ while [[ $# -gt 0 ]]; do
         --app) TARGET="$2"; KIND="app"; shift 2 ;;
         --dmg) TARGET="$2"; KIND="dmg"; shift 2 ;;
         -h|--help)
-            sed -n '2,28p' "$0"
+            sed -n '2,29p' "$0"
             exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -128,7 +131,12 @@ echo "==> Signing identity: $IDENTITY"
 # CGWindowList go through runtime TCC prompts, not entitlements).
 # Add the flag here if that ever changes.
 
-# --- sign ----------------------------------------------------------
+# --- sign the .app, then stop ---------------------------------------
+# The .app pass only code-signs. package.sh drops the signed bundle
+# into the DMG, and the --dmg pass notarizes the DMG as a whole —
+# Apple inspects the nested .app within that single submission. One
+# notary round-trip instead of two; the dragged-out app still clears
+# Gatekeeper via Apple's online ticket lookup on first launch.
 if [[ "$KIND" == "app" ]]; then
     # Inside-out: nested executables/frameworks/dylibs first, then the
     # outer wrapper. Vernier ships a single Mach-O today, so the loop
@@ -163,66 +171,93 @@ if [[ "$KIND" == "app" ]]; then
         "$TARGET"
 
     codesign --verify --deep --strict --verbose=2 "$TARGET"
-else
-    # DMGs aren't executable code, so no hardened runtime — but
-    # --timestamp is still required for notarization to accept it.
-    echo "==> Signing DMG"
-    codesign --force --timestamp \
-        --keychain "$KEYCHAIN_PATH" \
-        --sign "$IDENTITY" \
-        "$TARGET"
-
-    codesign --verify --verbose=2 "$TARGET"
+    echo "Done: $TARGET signed (notarization happens on the DMG)."
+    exit 0
 fi
+
+# --- sign the DMG --------------------------------------------------
+# DMGs aren't executable code, so no hardened runtime — but
+# --timestamp is still required for notarization to accept it.
+echo "==> Signing DMG"
+codesign --force --timestamp \
+    --keychain "$KEYCHAIN_PATH" \
+    --sign "$IDENTITY" \
+    "$TARGET"
+codesign --verify --verbose=2 "$TARGET"
 
 # --- notarize ------------------------------------------------------
-# notarytool will not accept a raw .app — it has to be wrapped in a
-# zip, dmg, or pkg. DMGs go in as-is.
-SUBMIT_PATH="$TARGET"
-if [[ "$KIND" == "app" ]]; then
-    SUBMIT_PATH="$WORK_DIR/$(basename "$TARGET").zip"
-    rm -f "$SUBMIT_PATH"
-    ditto -c -k --keepParent "$TARGET" "$SUBMIT_PATH"
-fi
-
-echo "==> Submitting to Apple notary service: $SUBMIT_PATH"
-# --wait blocks (typically 1–5 minutes for a small app). On reject
-# the failure log lives behind the submission UUID; surface enough
-# of it that the build log alone tells us what to fix.
-if ! xcrun notarytool submit "$SUBMIT_PATH" \
+# Submit once, then poll `notarytool info` in our own loop. We do NOT
+# use `notarytool submit --wait`: that is a single long-lived poller
+# that aborts the whole build on ANY transient network blip, and
+# Apple's queue routinely keeps us polling for the better part of an
+# hour. Polling ourselves means one failed status check just sleeps
+# and retries — a runner network hiccup can't kill the run.
+notary() {
+    xcrun notarytool "$@" \
         --apple-id "$MACOS_NOTARY_APPLE_ID" \
         --team-id "$MACOS_NOTARY_TEAM_ID" \
-        --password "$VERNIER_SIGNING_PASSWORD" \
-        --wait \
-        --output-format json \
-        > "$WORK_DIR/notary-result.json"; then
-    echo "error: notarytool submit failed" >&2
-    cat "$WORK_DIR/notary-result.json" >&2 || true
-    exit 1
-fi
-cat "$WORK_DIR/notary-result.json"
+        --password "$VERNIER_SIGNING_PASSWORD"
+}
 
-NOTARY_STATUS="$(grep -o '"status":[^,}]*' "$WORK_DIR/notary-result.json" | head -1 | awk -F'"' '{print $4}')"
-NOTARY_ID="$(grep -o '"id":[^,}]*' "$WORK_DIR/notary-result.json" | head -1 | awk -F'"' '{print $4}')"
-if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
-    echo "error: notarization status: $NOTARY_STATUS" >&2
-    if [[ -n "$NOTARY_ID" ]]; then
-        echo "==> Fetching notary log for $NOTARY_ID" >&2
-        xcrun notarytool log "$NOTARY_ID" \
-            --apple-id "$MACOS_NOTARY_APPLE_ID" \
-            --team-id "$MACOS_NOTARY_TEAM_ID" \
-            --password "$VERNIER_SIGNING_PASSWORD" >&2 || true
+echo "==> Submitting to Apple notary service: $TARGET"
+SUBMIT_JSON=""
+for attempt in 1 2 3; do
+    if SUBMIT_JSON="$(notary submit "$TARGET" --output-format json 2>/dev/null)"; then
+        break
     fi
+    echo "    submit attempt $attempt/3 failed to reach Apple; retrying in 30s..." >&2
+    SUBMIT_JSON=""
+    sleep 30
+done
+if [[ -z "$SUBMIT_JSON" ]]; then
+    echo "error: notarytool could not upload to Apple after 3 attempts." >&2
+    echo "       Looks like a runner network problem — re-run the workflow." >&2
     exit 1
 fi
+SUBMIT_ID="$(printf '%s' "$SUBMIT_JSON" | grep -o '"id":[^,}]*' | head -1 | awk -F'"' '{print $4}' || true)"
+if [[ -z "$SUBMIT_ID" ]]; then
+    echo "error: could not parse a submission id from notarytool output:" >&2
+    printf '%s\n' "$SUBMIT_JSON" >&2
+    exit 1
+fi
+echo "    submission id: $SUBMIT_ID"
+
+# Poll for a verdict. A failed `info` call (transient network) just
+# logs and retries — it cannot kill the build. Apple's queue is the
+# slow part; give it up to 45 minutes overall.
+POLL_DEADLINE=$(( $(date +%s) + 45 * 60 ))
+NOTARY_STATUS=""
+while true; do
+    if (( $(date +%s) > POLL_DEADLINE )); then
+        echo "error: notarization did not finish within 45 minutes." >&2
+        echo "       Submission $SUBMIT_ID is still valid at Apple; check it with" >&2
+        echo "       'xcrun notarytool info $SUBMIT_ID ...' and re-run the workflow." >&2
+        exit 1
+    fi
+    if INFO_JSON="$(notary info "$SUBMIT_ID" --output-format json 2>/dev/null)"; then
+        NOTARY_STATUS="$(printf '%s' "$INFO_JSON" | grep -o '"status":[^,}]*' | head -1 | awk -F'"' '{print $4}' || true)"
+        case "$NOTARY_STATUS" in
+            Accepted)
+                echo "    notarization Accepted"
+                break ;;
+            "In Progress"|"")
+                echo "    waiting on Apple notary service (In Progress)..."
+                sleep 30 ;;
+            *)
+                echo "error: Apple rejected notarization (status: ${NOTARY_STATUS})." >&2
+                echo "==> notary log for $SUBMIT_ID:" >&2
+                notary log "$SUBMIT_ID" >&2 || true
+                exit 1 ;;
+        esac
+    else
+        echo "    notary status poll failed to reach Apple; retrying in 30s..." >&2
+        sleep 30
+    fi
+done
 
 # --- staple --------------------------------------------------------
 echo "==> Stapling notarization ticket"
 xcrun stapler staple "$TARGET"
 xcrun stapler validate "$TARGET"
-
-if [[ "$KIND" == "app" ]]; then
-    spctl -a -vvv -t exec "$TARGET"
-fi
 
 echo "Done: $TARGET signed, notarized, and stapled."

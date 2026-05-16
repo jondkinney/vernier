@@ -119,9 +119,9 @@ if [[ -z "${MACOS_CERTIFICATE_P12_BASE64:-}" ]]; then
     codesign --verify --verbose=2 "$BUNDLE_DIR"
 fi
 
-# Real Developer ID signing + Apple notarization. No-ops when the
-# signing secrets aren't in the environment, so local builds stay
-# ad-hoc-signed without extra config.
+# Real Developer ID signing for the bundle. No-ops when the signing
+# secrets aren't in the environment, so local builds stay ad-hoc-signed
+# without extra config. Notarization happens once, on the DMG below.
 "$REPO_ROOT/packaging/macos/sign-and-notarize.sh" --app "$BUNDLE_DIR"
 
 # ---------------------------------------------------------------- DMG
@@ -144,8 +144,9 @@ create-dmg \
     "$DMG_PATH" \
     "$BUNDLE_DIR"
 
-# Sign + notarize + staple the DMG itself so the download works
-# offline and Gatekeeper accepts it without an online check. No-op
+# Sign, notarize, and staple the DMG. Apple inspects the nested
+# (already-signed) Vernier.app as part of this single submission, so
+# the whole release is covered in one notary round-trip. No-op
 # locally without secrets.
 "$REPO_ROOT/packaging/macos/sign-and-notarize.sh" --dmg "$DMG_PATH"
 
