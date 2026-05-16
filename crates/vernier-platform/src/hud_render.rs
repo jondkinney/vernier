@@ -9,11 +9,7 @@
 
 #![allow(dead_code)]
 
-use crate::{
-    Color, CursorKind, Guide, GuideAxis, HeldRect, Hud, HudAxis, HudContextMenu,
-    HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind, HudMeasurementFormat,
-    HudRounding, HudToast, StuckMeasurement,
-};
+use crate::{Color, Hud, HudAxis, HudKind};
 
 // Re-export the shared hud_font so existing call sites keep working.
 // The actual font + caching lives in `crate::font` so the

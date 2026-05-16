@@ -51,8 +51,8 @@ use wayland_client::{
 };
 
 use crate::{
-    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud, HudAxis,
-    HudKind, MonitorId, MonitorInfo, NativeFrame, OverlayHandle, OverlayOps, PixelFormat, Platform,
+    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud,
+    MonitorId, MonitorInfo, NativeFrame, OverlayHandle, OverlayOps, PixelFormat, Platform,
     PlatformError, PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
 };
 
