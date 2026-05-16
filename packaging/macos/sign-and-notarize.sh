@@ -74,13 +74,19 @@ KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
 # our temporary keychain even after we delete the file.
 ORIGINAL_KEYCHAINS="$(security list-keychains -d user | tr -d '"' | xargs)"
 
+# Capture the triggering exit status first, then `exit "$rc"` at the
+# end. Without that, the EXIT trap's last command (`rm`, which
+# succeeds) becomes the script's exit status on bash 3.2 — so a
+# crashed run would falsely report success to package.sh.
 cleanup() {
+    local rc=$?
     if [[ -f "$KEYCHAIN_PATH" ]]; then
         # shellcheck disable=SC2086
         security list-keychains -d user -s $ORIGINAL_KEYCHAINS 2>/dev/null || true
         security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
     fi
     rm -f "$P12_PATH"
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -118,14 +124,9 @@ if [[ -z "$IDENTITY" ]]; then
 fi
 echo "==> Signing identity: $IDENTITY"
 
-# Optional entitlements file. Vernier doesn't need any today
-# (ScreenCaptureKit / CGWindowList go through runtime TCC prompts,
-# not entitlements), but leaving the hook means we can drop a file
-# in later without editing this script.
-ENTITLEMENTS_ARGS=()
-if [[ -f packaging/macos/Vernier.entitlements ]]; then
-    ENTITLEMENTS_ARGS=(--entitlements packaging/macos/Vernier.entitlements)
-fi
+# No --entitlements: Vernier needs none (ScreenCaptureKit /
+# CGWindowList go through runtime TCC prompts, not entitlements).
+# Add the flag here if that ever changes.
 
 # --- sign ----------------------------------------------------------
 if [[ "$KIND" == "app" ]]; then
@@ -147,21 +148,18 @@ if [[ "$KIND" == "app" ]]; then
             -type f \( -perm -u+x -o -name "*.dylib" \) -print0 2>/dev/null || true)
     fi
 
-    # Sign the main binary explicitly before the wrapper so a bad
-    # entitlements file fails fast instead of after we've sealed the
-    # bundle.
+    # Sign the main binary explicitly before the wrapper — inside-out
+    # order, so the wrapper seals an already-signed executable.
     echo "==> Signing main executable"
     codesign --force --options runtime --timestamp \
         --keychain "$KEYCHAIN_PATH" \
         --sign "$IDENTITY" \
-        "${ENTITLEMENTS_ARGS[@]}" \
         "$TARGET/Contents/MacOS/vernier"
 
     echo "==> Signing app bundle"
     codesign --force --options runtime --timestamp \
         --keychain "$KEYCHAIN_PATH" \
         --sign "$IDENTITY" \
-        "${ENTITLEMENTS_ARGS[@]}" \
         "$TARGET"
 
     codesign --verify --deep --strict --verbose=2 "$TARGET"
