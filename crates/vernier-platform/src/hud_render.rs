@@ -1479,10 +1479,16 @@ fn draw_hover_indicators(
             pill_x = pill_x.min(surface_w - pill_w - 1.0).max(0.0);
             pill_y = pill_y.min(surface_h - pill_h - 1.0).max(0.0);
 
-            // Slightly translucent dark gray (not pure black). The background still shows through a
-            // little, which keeps the pill from looking overweight.
+            // Fully opaque dark gray (not pure black). Unlike the
+            // committed-measurement pills — which are translucent so
+            // screenshot content shows through a little — the live
+            // readout is the highest-priority element: it always
+            // renders above everything else, and an opaque background
+            // guarantees it stays legible even when it lands on top
+            // of another pill (a translucent fill would let that pill
+            // ghost through).
             let mut bg_paint = Paint::default();
-            bg_paint.set_color_rgba8(40, 40, 40, 230);
+            bg_paint.set_color_rgba8(40, 40, 40, 255);
             bg_paint.anti_alias = true;
             if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
                 pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
