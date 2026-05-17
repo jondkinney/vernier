@@ -188,7 +188,17 @@ fn cg_display_id_for(monitor: MonitorId) -> CGDirectDisplayID {
 fn overlay_window_id_for(monitor: MonitorId) -> Option<u32> {
     super::app::run_on_main_sync(move || {
         super::with_main_state(|s| {
-            s.overlays.get(&monitor).map(|o| o.window.windowNumber() as u32)
+            s.overlays.get(&monitor).and_then(|o| {
+                // `OnScreenBelowWindow` against an orderOut (hidden)
+                // overlay captures only the desktop wallpaper. The
+                // window id is a usable capture-exclusion reference
+                // ONLY while the overlay is on screen; when it's
+                // hidden, return None so the caller falls back to
+                // CGDisplayCreateImage (full screen, all windows).
+                o.window
+                    .isVisible()
+                    .then(|| o.window.windowNumber() as u32)
+            })
         })
     })
 }
