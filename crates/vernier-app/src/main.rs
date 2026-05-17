@@ -1069,6 +1069,7 @@ fn run_daemon() -> Result<()> {
                                         cy,
                                         current_tol_value(tol_level),
                                         &guides,
+                                        &held_rects,
                                     );
                                     let m = freeze_axis_measurement(
                                         GuideAxis::Horizontal,
@@ -1090,6 +1091,7 @@ fn run_daemon() -> Result<()> {
                                         cy,
                                         current_tol_value(tol_level),
                                         &guides,
+                                        &held_rects,
                                     );
                                     let m = freeze_axis_measurement(
                                         GuideAxis::Vertical,
@@ -1629,6 +1631,7 @@ fn run_daemon() -> Result<()> {
                                     y,
                                     current_tol_value(tol_level),
                                     &guides,
+                                    &held_rects,
                                 );
                                 match axis {
                                     GuideAxis::Horizontal => snap_to_nearest_y_edge(y, &edges) as i32,
@@ -2403,6 +2406,7 @@ fn run_daemon() -> Result<()> {
                             y,
                             current_tol_value(tol_level),
                             &guides,
+                            &held_rects,
                         );
                         let measurement = freeze_axis_measurement(
                             axis,
@@ -5482,7 +5486,7 @@ fn refresh_hud(
         if alt_held {
             (x, y)
         } else {
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
             match axis {
                 GuideAxis::Horizontal => (x, snap_to_nearest_y_edge(y, &edges)),
                 GuideAxis::Vertical => (snap_to_nearest_x_edge(x, &edges), y),
@@ -5661,7 +5665,7 @@ fn refresh_hud(
             let edges = if align_mode {
                 [None; 4]
             } else {
-                edges_for_hud(frozen_frame, x, y, tolerance, guides)
+                edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects)
             };
             let mut hud = Hud {
                 kind: HudKind::Hover { cursor: (x, y), edges },
@@ -5705,7 +5709,7 @@ fn refresh_hud(
                 // Below the drag threshold the rect would just be a
                 // 1×1 dot — fall back to the live measurement HUD so a
                 // mis-click looks identical to hovering.
-                let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+                let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
                 hud.kind = HudKind::Hover { cursor: (x, y), edges };
             }
             hud.toast = toast.cloned();
@@ -5764,11 +5768,13 @@ fn edges_for_hud(
     y: f64,
     tolerance: u32,
     guides: &[Guide],
+    held_rects: &[HeldRect],
 ) -> [Option<HudEdge>; 4] {
     let mut edges = frozen_frame
         .and_then(|f| detect_hud_edges(f, x, y, tolerance))
         .unwrap_or([None; 4]);
     apply_guides_to_edges(&mut edges, guides, x, y);
+    apply_held_rects_to_edges(&mut edges, held_rects, x, y);
     edges
 }
 
@@ -5979,6 +5985,91 @@ fn apply_guides_to_edges(
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, guide.position as f64),
+                            distance_px: dist,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Merge the four sides of every committed held rect into the edge
+/// quad as snap targets, mirroring [`apply_guides_to_edges`].
+///
+/// Held rects are Vernier overlay geometry — they're never part of
+/// the frozen screen capture `detect_hud_edges` scans — so without
+/// this a live measurement sails straight through a rectangle the
+/// user just drew. A rect's vertical sides only count while the
+/// cursor sits within its vertical span (likewise its horizontal
+/// sides within the horizontal span), so a side acts as an edge only
+/// where a pixel-detection ray would actually have crossed it.
+///
+/// Each snap lands one logical pixel *outside* the rect border,
+/// stepping back into the anchor region — the same one-pixel step
+/// `convert_edges_to_surface` applies to detected pixel edges — so
+/// the measurement line stops just short of the border instead of
+/// drawing on top of it.
+fn apply_held_rects_to_edges(
+    edges: &mut [Option<HudEdge>; 4],
+    held_rects: &[HeldRect],
+    x: f64,
+    y: f64,
+) {
+    for rect in held_rects {
+        let min_x = rect.rect_start.0.min(rect.rect_end.0);
+        let max_x = rect.rect_start.0.max(rect.rect_end.0);
+        let min_y = rect.rect_start.1.min(rect.rect_end.1);
+        let max_y = rect.rect_start.1.max(rect.rect_end.1);
+        // Left/right sides snap horizontally — only while the cursor
+        // is level with the rect.
+        if y >= min_y && y <= max_y {
+            for side_x in [min_x, max_x] {
+                let dx = side_x - x;
+                if dx <= -1.0 {
+                    // Side is left of the cursor: step the snap one px
+                    // right (toward the cursor) so it stops before the
+                    // border, not on it.
+                    let dist = ((-dx) as u32).saturating_sub(1);
+                    if edges[0].map_or(true, |e| e.distance_px > dist) {
+                        edges[0] = Some(HudEdge {
+                            axis: HudAxis::Left,
+                            position: (side_x + 1.0, y),
+                            distance_px: dist,
+                        });
+                    }
+                } else if dx >= 1.0 {
+                    let dist = (dx as u32).saturating_sub(1);
+                    if edges[1].map_or(true, |e| e.distance_px > dist) {
+                        edges[1] = Some(HudEdge {
+                            axis: HudAxis::Right,
+                            position: (side_x - 1.0, y),
+                            distance_px: dist,
+                        });
+                    }
+                }
+            }
+        }
+        // Top/bottom sides snap vertically — only while the cursor is
+        // within the rect's horizontal span.
+        if x >= min_x && x <= max_x {
+            for side_y in [min_y, max_y] {
+                let dy = side_y - y;
+                if dy <= -1.0 {
+                    let dist = ((-dy) as u32).saturating_sub(1);
+                    if edges[2].map_or(true, |e| e.distance_px > dist) {
+                        edges[2] = Some(HudEdge {
+                            axis: HudAxis::Up,
+                            position: (x, side_y + 1.0),
+                            distance_px: dist,
+                        });
+                    }
+                } else if dy >= 1.0 {
+                    let dist = (dy as u32).saturating_sub(1);
+                    if edges[3].map_or(true, |e| e.distance_px > dist) {
+                        edges[3] = Some(HudEdge {
+                            axis: HudAxis::Down,
+                            position: (x, side_y - 1.0),
                             distance_px: dist,
                         });
                     }
@@ -6464,7 +6555,7 @@ fn handle_pointer_button(
             // Don't paint the rect yet — wait for the user to actually
             // move past `DRAG_THRESHOLD_PX`. A bare click should look
             // like a hover, not a 1×1 box.
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
@@ -6479,7 +6570,7 @@ fn handle_pointer_button(
         if !has_drag_distance(start.pixel, cursor_px) {
             log::info!("click without drag — no measurement");
             *mode = InteractionMode::Hover { cursor: cursor_px };
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
