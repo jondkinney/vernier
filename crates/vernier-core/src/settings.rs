@@ -32,10 +32,23 @@ pub struct GeneralSettings {
     /// Hide the system-tray icon. The daemon still runs; the user
     /// drives it through the global hotkey + `vernier toggle`.
     pub hide_tray_icon: bool,
+    /// Clipboard format used when the copy-dimensions shortcut
+    /// copies a held rectangle's width and height.
+    pub copy_dimensions_format: CopyFormat,
+    /// Unit the CSS / SASS clipboard formats use (`px` or `rem`).
+    pub copy_dimensions_unit: ClipboardUnit,
+    /// Base font size, in px, the `rem` clipboard unit divides by.
+    pub copy_dimensions_rem_base: u32,
+    /// Put the width and height on separate lines in clipboard output.
+    pub copy_dimensions_linebreak: bool,
     /// Append the unit suffix (`px` / `pt`) to dimension pills.
     /// When false, pills show bare numbers — useful when the user
     /// wants the screen to stay clean and already knows the unit.
     pub display_units: bool,
+    /// How dimension values are computed for display: fractional
+    /// logical pixels, rounded logical pixels, or physical (device)
+    /// pixels. See [`RoundingMode`].
+    pub rounding_mode: RoundingMode,
     /// Prefix area-pill values with `W:` and `H:` labels:
     /// `W: 1024 × H: 768` instead of `1024 × 768`.
     pub display_wh_indicators: bool,
@@ -43,9 +56,14 @@ pub struct GeneralSettings {
     pub aspect_mode: crate::AspectMode,
     /// Show the aspect-ratio pill underneath area-tool rectangles.
     pub aspect_in_area_tool: bool,
+    /// Show the aspect-ratio pill on the live distance-tool readout.
+    pub aspect_in_distance_tool: bool,
     /// Snap distance / area drags to placed reference guides.
     /// Disable for free-cursor measurement near guides.
     pub snap_to_guides: bool,
+    /// Snap the live distance measurement to the edges of held
+    /// rectangles, the same way it snaps to reference guides.
+    pub snap_to_objects: bool,
     /// Freeze the captured frame at measurement-mode entry. When
     /// false, the daemon refreshes the frame on every pointer move
     /// so edge detection follows live content.
@@ -65,11 +83,21 @@ impl Default for GeneralSettings {
         Self {
             launch_at_login: false,
             hide_tray_icon: false,
+            copy_dimensions_format: CopyFormat::WidthCommaHeight,
+            copy_dimensions_unit: ClipboardUnit::Px,
+            copy_dimensions_rem_base: 16,
+            copy_dimensions_linebreak: false,
             display_units: true,
+            // Physical (device) pixels by default: an exact integer
+            // count on every display scale — no fractional values to
+            // round, and identical to logical pixels on 1x displays.
+            rounding_mode: RoundingMode::ScreenPixels,
             display_wh_indicators: false,
             aspect_mode: crate::AspectMode::Automatic,
             aspect_in_area_tool: true,
+            aspect_in_distance_tool: false,
             snap_to_guides: true,
+            snap_to_objects: true,
             freeze_screen: true,
             show_cursor: true,
         }
@@ -266,10 +294,6 @@ pub struct AppearanceSettings {
     /// to this; once committed, that guide keeps the color it was
     /// placed with regardless of further toggles.
     pub alternative_guide_color: ColorRgba,
-    /// How distance / coordinate values are displayed in pills.
-    pub units: Units,
-    /// Coordinate rounding mode applied before display.
-    pub rounding_mode: RoundingMode,
 }
 
 impl Default for AppearanceSettings {
@@ -282,15 +306,6 @@ impl Default for AppearanceSettings {
             // and the red HUD primary — easy to distinguish at a
             // glance which color a given guide was placed in.
             alternative_guide_color: ColorRgba::new(0xFF, 0xA9, 0x4A, 0xF0),
-            units: Units::Px,
-            // Integer display by default — fractional logical-px values
-            // are a side effect of physical-pixel edge snapping on
-            // Retina (a snap to a half-logical-pixel boundary is
-            // internally accurate but visually noisy). Underlying
-            // coordinates keep full precision regardless of this
-            // setting, so the rounding only affects what the HUD pill
-            // shows, not what gets exported / saved.
-            rounding_mode: RoundingMode::PointsRounded,
         }
     }
 }
@@ -310,17 +325,6 @@ impl ColorRgba {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Units {
-    /// Logical pixels (matches the user's display scale — what most
-    /// CSS / design tools call a "pixel").
-    Px,
-    /// Points — same numeric value as `Px` on most monitors but
-    /// labeled with "pt" so designers using point-based tooling get
-    /// a familiar unit.
-    Pt,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoundingMode {
     /// Display values as logical (point) pixels, fractional values
     /// allowed to one decimal place. `100.5px`.
@@ -335,8 +339,6 @@ pub enum RoundingMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IntegrationSettings {
-    /// Which clipboard format `Enter` (copy-dimensions) uses.
-    pub copy_dimensions_format: CopyFormat,
     /// Divide on-screen measurements by the current Figma viewport
     /// zoom so dimensions reflect canvas pixels at any zoom level.
     /// Requires the companion Figma plugin (`figma-plugin/`) to be
@@ -357,7 +359,6 @@ pub struct IntegrationSettings {
 impl Default for IntegrationSettings {
     fn default() -> Self {
         Self {
-            copy_dimensions_format: CopyFormat::WidthCommaHeight,
             figma_zoom_correction: true,
             figma_bridge_port: 8765,
             figma_browser_classes: vec![
@@ -395,25 +396,78 @@ pub enum CopyFormat {
     SassHeightFirst,
 }
 
+/// Unit the CSS / SASS clipboard formats render dimensions in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardUnit {
+    /// CSS pixels: `width: 1024px;`.
+    Px,
+    /// Root-em: the pixel value divided by the configured base font
+    /// size — `width: 64rem;` at a 16 px base.
+    Rem,
+}
+
 impl CopyFormat {
     pub fn label(self) -> &'static str {
         match self {
-            Self::WidthCommaHeight => "Width, Height",
-            Self::HeightCommaWidth => "Height, Width",
+            Self::WidthCommaHeight => "width, height",
+            Self::HeightCommaWidth => "height, width",
             Self::CssWidthFirst => "CSS (width first)",
             Self::CssHeightFirst => "CSS (height first)",
             Self::SassWidthFirst => "SASS (width first)",
             Self::SassHeightFirst => "SASS (height first)",
         }
     }
-    pub fn render(self, width: u32, height: u32) -> String {
+    /// Render width × height for the clipboard. `unit` and `rem_base`
+    /// only affect the CSS / SASS variants — the comma variants are
+    /// always raw pixel integers. `linebreak` puts the width and the
+    /// height on separate lines.
+    pub fn render(
+        self,
+        width: u32,
+        height: u32,
+        unit: ClipboardUnit,
+        rem_base: u32,
+        linebreak: bool,
+    ) -> String {
+        let w = css_dimension(width, unit, rem_base);
+        let h = css_dimension(height, unit, rem_base);
+        let sep = if linebreak { "\n" } else { " " };
         match self {
-            Self::WidthCommaHeight => format!("{width},{height}"),
-            Self::HeightCommaWidth => format!("{height},{width}"),
-            Self::CssWidthFirst => format!("width: {width}px; height: {height}px;"),
-            Self::CssHeightFirst => format!("height: {height}px; width: {width}px;"),
-            Self::SassWidthFirst => format!("$width: {width}px; $height: {height}px;"),
-            Self::SassHeightFirst => format!("$height: {height}px; $width: {width}px;"),
+            Self::WidthCommaHeight => {
+                if linebreak {
+                    format!("{width}\n{height}")
+                } else {
+                    format!("{width},{height}")
+                }
+            }
+            Self::HeightCommaWidth => {
+                if linebreak {
+                    format!("{height}\n{width}")
+                } else {
+                    format!("{height},{width}")
+                }
+            }
+            Self::CssWidthFirst => format!("width: {w};{sep}height: {h};"),
+            Self::CssHeightFirst => format!("height: {h};{sep}width: {w};"),
+            Self::SassWidthFirst => format!("$width: {w};{sep}$height: {h};"),
+            Self::SassHeightFirst => format!("$height: {h};{sep}$width: {w};"),
+        }
+    }
+}
+
+/// Format a pixel value as a CSS dimension token in the chosen unit.
+/// `Rem` divides by the base font size and trims trailing zeros, so
+/// `768 / 16` reads `48rem` rather than `48.0000rem`.
+fn css_dimension(value_px: u32, unit: ClipboardUnit, rem_base: u32) -> String {
+    match unit {
+        ClipboardUnit::Px => format!("{value_px}px"),
+        ClipboardUnit::Rem => {
+            let base = if rem_base == 0 { 16.0 } else { rem_base as f32 };
+            let mut s = format!("{:.4}", value_px as f32 / base);
+            if s.contains('.') {
+                s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+            }
+            format!("{s}rem")
         }
     }
 }
@@ -422,27 +476,20 @@ impl CopyFormat {
 #[serde(default)]
 pub struct ShortcutSettings {
     /// Toggle measure mode. Stored as a textual accelerator
-    /// (`CTRL+SHIFT+ALT+SUPER+F`); the platform layer parses on init.
+    /// (`CTRL+SHIFT+SUPER+F`); the platform layer parses on init.
     pub toggle: String,
-    /// Clear all held content and hide the overlay.
-    /// (For just-hide-and-keep behavior, use the toggle measure
-    /// mode hotkey: it preserves content so a follow-up toggle
-    /// brings everything back exactly as it was.)
+    /// Exit measure mode in a single press. Held content is
+    /// preserved — held rects / guides / stuck measurements stay
+    /// visible in the passthrough overlay — so this never wipes a
+    /// session. (Clearing content is an explicit action via the
+    /// right-click "Clear" menu item.)
     #[serde(alias = "background_mode")]
     pub clear_and_hide: String,
-    /// When true (default), `clear_and_hide` requires a double
-    /// tap within `clear_and_hide_double_press_window_ms` to fire
-    /// — first press shows a "Press X again to clear and exit"
-    /// toast. Useful for users whose physical key for this
-    /// shortcut overlaps with a modifier (e.g. Caps mapped to
-    /// both Ctrl and Esc) and who'd otherwise wipe their session
-    /// by accident. Untick for instant single-press behavior.
-    pub clear_and_hide_double_press: bool,
-    /// Window (milliseconds) within which the second press has
-    /// to land for the action to fire. Only meaningful when
-    /// `clear_and_hide_double_press` is true. Bounds: clamped to
-    /// 100..=3000ms at runtime.
-    pub clear_and_hide_double_press_window_ms: u32,
+    /// Clear every held rect / guide / stuck measurement and exit
+    /// measure mode in a single press. Only matched while measure
+    /// mode is active, so it can't collide with the same combo bound
+    /// in another app.
+    pub clear_and_exit: String,
     /// Restore last saved session.
     pub restore_session: String,
     /// Capture the held rect (the menu Camera item).
@@ -483,7 +530,7 @@ pub struct ShortcutSettings {
     pub nudge_down: String,
     /// Run the External Screenshot Tool action (the right-click
     /// menu's "Take Normal Screenshot"). Triggers the same ESC
-    /// clear-and-hide sequence + detached spawn of
+    /// exit + detached spawn of
     /// `screenshots.external_screenshot_command` while in measure
     /// mode.
     pub take_normal_screenshot: String,
@@ -492,10 +539,9 @@ pub struct ShortcutSettings {
 impl Default for ShortcutSettings {
     fn default() -> Self {
         Self {
-            toggle: "CTRL+SHIFT+ALT+SUPER+F".to_string(),
+            toggle: "CTRL+SHIFT+SUPER+F".to_string(),
             clear_and_hide: "ESC".to_string(),
-            clear_and_hide_double_press: true,
-            clear_and_hide_double_press_window_ms: 1500,
+            clear_and_exit: "CTRL+F".to_string(),
             restore_session: "SHIFT+R".to_string(),
             capture: "ENTER".to_string(),
             crosshair_mode: "SHIFT".to_string(),
@@ -556,14 +602,9 @@ impl Default for ToleranceLevel {
         Self::Medium
     }
 }
-impl Default for Units {
-    fn default() -> Self {
-        Self::Px
-    }
-}
 impl Default for RoundingMode {
     fn default() -> Self {
-        Self::Points
+        Self::ScreenPixels
     }
 }
 impl Default for CopyFormat {

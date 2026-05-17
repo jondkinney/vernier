@@ -52,6 +52,7 @@ pub struct HandoffApp {
 /// stays focused on tools that take a single PNG path on the
 /// command line and open straight into an annotate-and-save view.
 pub const KNOWN_HANDOFF_APPS: &[&str] = &[
+    "tensaku",   // Wayland-native annotate-and-save (Satty fork)
     "satty",     // Wayland-native, modern annotate-and-save
     "swappy",    // Sway/wlroots annotation companion
     "flameshot", // Cross-platform, popular X11 tool

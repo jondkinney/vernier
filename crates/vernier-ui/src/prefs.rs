@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
 use vernier_core::{
-    AppearanceSettings, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
+    AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
-    ToleranceSettings, Units,
+    ToleranceSettings,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,7 @@ enum Section {
 enum ShortcutId {
     Toggle,
     ClearAndHide,
+    ClearAndExit,
     Restore,
     Capture,
     Crosshair,
@@ -288,6 +289,9 @@ impl App for PrefsApp {
                             ShortcutId::Toggle => self.edited.shortcuts.toggle = s,
                             ShortcutId::ClearAndHide => {
                                 self.edited.shortcuts.clear_and_hide = s
+                            }
+                            ShortcutId::ClearAndExit => {
+                                self.edited.shortcuts.clear_and_exit = s
                             }
                             ShortcutId::Restore => self.edited.shortcuts.restore_session = s,
                             ShortcutId::Capture => self.edited.shortcuts.capture = s,
@@ -975,6 +979,10 @@ fn apply_handoff_app(s: &mut ScreenshotSettings, app: HandoffApp) {
 }
 
 fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
+    // The freeze-screen caption tells the user which key refreshes
+    // the frozen frame — read the actual configured accelerator
+    // rather than hard-coding `R`, since it's rebindable in Shortcuts.
+    let refresh_key = settings.shortcuts.refresh_capture.clone();
     let s = &mut settings.general;
     setting(ui, |ui| {
         ui.checkbox(&mut s.launch_at_login, "Launch at login");
@@ -995,16 +1003,77 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.add_space(10.0);
 
     setting(ui, |ui| {
-        ui.checkbox(&mut s.display_units, "Display units (px / pt)");
-        caption(ui, 
-            "Append the unit suffix configured under Appearance to dimension pills. Off shows bare numbers.",
+        field_label(ui, "Clipboard format");
+        for fmt in [
+            CopyFormat::WidthCommaHeight,
+            CopyFormat::HeightCommaWidth,
+            CopyFormat::CssWidthFirst,
+            CopyFormat::CssHeightFirst,
+            CopyFormat::SassWidthFirst,
+            CopyFormat::SassHeightFirst,
+        ] {
+            ui.radio_value(&mut s.copy_dimensions_format, fmt, fmt.label());
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Unit:");
+            ui.radio_value(&mut s.copy_dimensions_unit, ClipboardUnit::Px, "px");
+            ui.radio_value(&mut s.copy_dimensions_unit, ClipboardUnit::Rem, "rem");
+        });
+        ui.add_enabled_ui(s.copy_dimensions_unit == ClipboardUnit::Rem, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Base font size:");
+                let mut base = s.copy_dimensions_rem_base as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut base).range(1..=200).suffix(" px"))
+                    .changed()
+                {
+                    s.copy_dimensions_rem_base = base.max(1) as u32;
+                }
+            });
+        });
+        ui.checkbox(
+            &mut s.copy_dimensions_linebreak,
+            "Line break between width and height",
+        );
+        caption(ui,
+            "Format used when the copy-dimensions shortcut puts a held rectangle's width and height on the clipboard. The unit applies to the CSS and SASS formats — rem divides by the base font size.",
         );
     });
+
     setting(ui, |ui| {
-        ui.checkbox(&mut s.display_wh_indicators, "Display W/H indicators");
-        caption(ui, 
-            "Prefix area pills with `W:` and `H:` labels (e.g. `W: 1024 \u{00D7} H: 768`).",
+        field_label(ui, "Units");
+        ui.radio_value(
+            &mut s.rounding_mode,
+            RoundingMode::Points,
+            "Points (logical, fractional)",
         );
+        ui.radio_value(
+            &mut s.rounding_mode,
+            RoundingMode::PointsRounded,
+            "Points (rounded to integer)",
+        );
+        ui.radio_value(
+            &mut s.rounding_mode,
+            RoundingMode::ScreenPixels,
+            "Screen pixels (multiplied by display scale)",
+        );
+        ui.checkbox(&mut s.display_units, "Display units");
+        ui.checkbox(&mut s.display_wh_indicators, "Display width/height indicators");
+        caption(ui,
+            "How dimensions are reported on scaled displays. Screen pixels is the exact device-pixel count, identical to logical pixels on 1\u{00D7} displays; the Points modes divide by the display scale. Display units appends a `px` suffix; W/H indicators prefix area pills with `W:` / `H:`.",
+        );
+    });
+
+    setting(ui, |ui| {
+        field_label(ui, "Cursor");
+        ui.checkbox(&mut s.show_cursor, "Show");
+        caption(ui, &format!(
+            "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
+             leaving the axis lines, ticks, and W\u{00D7}H pill rendering. \
+             Hold {} to hide the cursor momentarily for a clean read.",
+            alt_key_label(),
+        ));
     });
 
     setting(ui, |ui| {
@@ -1029,16 +1098,19 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
             vernier_core::AspectMode::Reduced,
             "Always show the reduced fraction",
         );
+        ui.checkbox(&mut s.aspect_in_distance_tool, "Enable in distance tool");
         ui.checkbox(&mut s.aspect_in_area_tool, "Enable in area tool");
     });
 
     setting(ui, |ui| {
         field_label(ui, "Distance tool");
         ui.checkbox(&mut s.snap_to_guides, "Snap to guides");
+        ui.checkbox(&mut s.snap_to_objects, "Snap to selected objects");
         caption(ui, &format!(
-            "Drag endpoints magnetize to the nearest reference guide: 30 px on initial click (when you're \
-             committing to a corner with no visual feedback yet) and 8 px during and at the end of the drag \
-             (so passing a guide on the way past doesn't snag the moving corner). Hold {} to draw freeform.",
+            "Snap to guides magnetizes drag endpoints to the nearest reference guide \
+             (30 px on the initial click, 8 px during and at the end of the drag). \
+             Snap to selected objects stops the live measurement on the edges of held \
+             rectangles. Hold {} to measure freeform.",
             alt_key_label(),
         ));
     });
@@ -1058,26 +1130,19 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
                 false,
                 egui::Checkbox::new(&mut s.freeze_screen, "Freeze screen"),
             );
-            caption(ui,
-                "The captured frame is locked when measure mode opens; press R to refresh \
-                 manually. Live (non-frozen) capture isn't supported on this platform yet.",
-            );
+            caption(ui, &format!(
+                "Required on Wayland: the compositor's screencast captures Vernier's own \
+                 overlay along with the screen, so live measurements were inaccurate. Live \
+                 mode needs upstream support for excluding overlay layers from the capture. \
+                 Press `{refresh_key}` while measuring to refresh the frozen frame.",
+            ));
         } else {
             ui.checkbox(&mut s.freeze_screen, "Freeze screen");
-            caption(ui,
-                "On (default): the captured frame is locked when measure mode opens; press R to refresh manually. \
+            caption(ui, &format!(
+                "On (default): the captured frame is locked when measure mode opens; press `{refresh_key}` to refresh manually. \
                  Off: edge detection follows live screen content as the cursor moves.",
-            );
+            ));
         }
-    });
-
-    setting(ui, |ui| {
-        ui.checkbox(&mut s.show_cursor, "Show cursor");
-        caption(ui, 
-            "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
-             leaving the axis lines, ticks, and W×H pill rendering. \
-             Hold SUPER to hide the cursor momentarily for a clean read.",
-        );
     });
 }
 
@@ -1489,7 +1554,17 @@ fn paint_handoff_dropdown(
                 // share `handoff_command = "/usr/bin/open"` (the
                 // identity lives in `handoff_args`, not the
                 // command).
+                //
+                // The whole row is the click target: `set_min_width`
+                // stretches it to the popup edge, then `interact`
+                // re-senses that full rect — so the icon, the label,
+                // and the gap between them all register a click. A
+                // bare `ui.horizontal` only reports clicks on the
+                // inner widgets, not the row band. `on_hover_cursor`
+                // gives the pointer-hand feedback.
                 let row = ui.horizontal(|ui| {
+                    let w = ui.available_width();
+                    ui.set_min_width(w);
                     if let Some(t) = tex {
                         ui.add(
                             egui::Image::new(t)
@@ -1501,11 +1576,18 @@ fn paint_handoff_dropdown(
                         // icon resolved so the labels still line up.
                         ui.add_space(26.0);
                     }
-                    ui.add(
-                        egui::Label::new(&app.name).sense(egui::Sense::click()),
-                    )
+                    // Non-selectable: a selectable label senses the
+                    // pointer itself (showing an i-beam and eating the
+                    // click for text selection) before the row's
+                    // `interact` ever sees it. Off, it's inert and the
+                    // click falls through to the row.
+                    ui.add(egui::Label::new(&app.name).selectable(false));
                 });
-                if row.inner.clicked() {
+                let row = row
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if row.clicked() {
                     apply_handoff_app(s, app.clone());
                     // Picking from the list is the user's "I want
                     // this integration" gesture — enable as well so
@@ -1711,40 +1793,9 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
         color_picker(ui, &mut s.alternative_guide_color);
     });
 
-    ui.separator();
-    ui.add_space(10.0);
-
-    setting(ui, |ui| {
-        field_label(ui, "Units");
-        ui.radio_value(&mut s.units, Units::Px, "Pixels (px)");
-        ui.radio_value(&mut s.units, Units::Pt, "Points (pt)");
-    });
-
-    setting(ui, |ui| {
-        field_label(ui, "Coordinate rounding");
-        ui.radio_value(
-            &mut s.rounding_mode,
-            RoundingMode::Points,
-            "Points (logical, fractional)",
-        );
-        ui.radio_value(
-            &mut s.rounding_mode,
-            RoundingMode::PointsRounded,
-            "Points (rounded to integer)",
-        );
-        ui.radio_value(
-            &mut s.rounding_mode,
-            RoundingMode::ScreenPixels,
-            "Screen pixels (multiplied by display scale)",
-        );
-    });
-
-    // Inline the button right after the radios — `ui.with_layout`
-    // with a centered cross-axis Align used to vertical-center the
-    // button in the remaining scroll-area space, floating it far
-    // below the content. Plain `ui.button` honors the parent
-    // top-down flow so the button sits a normal 12 px below the last
-    // radio.
+    // The button floats a normal 12 px below the last color setting;
+    // `ui.button` honors the parent top-down flow rather than
+    // vertical-centering it in the remaining scroll-area space.
     ui.add_space(12.0);
     if ui.button("Restore Defaults").clicked() {
         *s = AppearanceSettings::default();
@@ -1753,25 +1804,6 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
 
 fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
     paint_figma_card(ui, s);
-    ui.add_space(18.0);
-
-    setting(ui, |ui| {
-        field_label(
-            ui,
-            "Copy-dimensions clipboard format (used when you press Enter on a held rect)",
-        );
-        for fmt in [
-            CopyFormat::WidthCommaHeight,
-            CopyFormat::HeightCommaWidth,
-            CopyFormat::CssWidthFirst,
-            CopyFormat::CssHeightFirst,
-            CopyFormat::SassWidthFirst,
-            CopyFormat::SassHeightFirst,
-        ] {
-            ui.radio_value(&mut s.copy_dimensions_format, fmt, fmt.label());
-        }
-    });
-
 }
 
 /// Top card on the Integrations pane: heading, description, live
@@ -1969,48 +2001,27 @@ fn shortcuts_section(
     );
     shortcut_row(
         ui,
-        "Clear measurements & hide",
-        "Wipe every held rect, guide, and stuck measurement and exit \
-         measure mode. To just hide the overlay while keeping everything \
-         intact, use the toggle measure mode hotkey instead — that \
-         round-trips your session unchanged.",
+        "Exit measure mode",
+        "Leave measure mode in a single press. Held rects, guides, and \
+         stuck measurements are preserved — they stay visible in the \
+         passthrough overlay, so this never wipes your session. To clear \
+         content, use the right-click \"Clear\" menu item.",
         &mut s.clear_and_hide,
         ShortcutId::ClearAndHide,
         capturing,
     );
-    // Double-press option + window — indented so it visually
-    // attaches to the row above. 212px gutter matches the chip
-    // column's left edge.
-    ui.horizontal(|ui| {
-        ui.add_space(212.0);
-        ui.checkbox(
-            &mut s.clear_and_hide_double_press,
-            "Require double press",
-        )
-        .on_hover_text(
-            "When checked, the first press shows a confirmation toast \
-             and the action only fires on a second press within the \
-             window below. Useful if your physical key for this shortcut \
-             overlaps a modifier (e.g. Caps mapped to Ctrl + Esc) and \
-             you'd otherwise wipe your session by accident.",
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(212.0);
-        ui.add_enabled_ui(s.clear_and_hide_double_press, |ui| {
-            ui.label("Press within:");
-            ui.add(
-                egui::DragValue::new(&mut s.clear_and_hide_double_press_window_ms)
-                    .speed(20.0)
-                    .range(100..=3000)
-                    .suffix(" ms"),
-            )
-            .on_hover_text(
-                "Maximum gap (in milliseconds) between the first and \
-                 second press. Clamped to 100–3000 ms.",
-            );
-        });
-    });
+    ui.add_space(8.0);
+    shortcut_row(
+        ui,
+        "Clear & exit",
+        "Clear every held rect, guide, and stuck measurement, then \
+         leave measure mode — in a single press. Only active while \
+         you're measuring, so it won't clash with the same combo in \
+         your other apps.",
+        &mut s.clear_and_exit,
+        ShortcutId::ClearAndExit,
+        capturing,
+    );
     ui.add_space(8.0);
     shortcut_row(
         ui,

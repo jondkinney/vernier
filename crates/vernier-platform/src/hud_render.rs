@@ -604,9 +604,7 @@ fn render_dynamic_strokes(
                 &paint,
                 &stroke,
                 &tick_stroke,
-                hud.measurement_format.wh_indicators,
-                &hud.measurement_format.unit_suffix,
-                hud.measurement_format.dimension_divisor,
+                &hud.measurement_format,
                 hud.show_cursor,
             );
         } else if hud.move_cursor_at.is_some() {
@@ -627,9 +625,7 @@ fn render_dynamic_strokes(
                 &paint,
                 &stroke,
                 &tick_stroke,
-                hud.measurement_format.wh_indicators,
-                &hud.measurement_format.unit_suffix,
-                hud.measurement_format.dimension_divisor,
+                &hud.measurement_format,
                 hud.show_cursor,
             );
         }
@@ -660,9 +656,7 @@ fn render_dynamic_strokes(
                 &paint,
                 &stroke,
                 &tick_stroke,
-                hud.measurement_format.wh_indicators,
-                &hud.measurement_format.unit_suffix,
-                hud.measurement_format.dimension_divisor,
+                &hud.measurement_format,
                 hud.show_cursor,
             );
         }
@@ -1296,9 +1290,7 @@ fn draw_hover_indicators(
     paint: &tiny_skia::Paint,
     stroke: &tiny_skia::Stroke,
     tick_stroke: &tiny_skia::Stroke,
-    wh_indicators: bool,
-    unit_suffix: &str,
-    dimension_divisor: f64,
+    fmt: &crate::HudMeasurementFormat,
     show_cursor: bool,
 ) {
     use tiny_skia::*;
@@ -1432,26 +1424,14 @@ fn draw_hover_indicators(
                 }
             }
 
-            // Width / height in LOGICAL pixels. Buffer span / scale,
-            // then divided by the configured dimension divisor (1.0
-            // by default, > 1.0 when Figma zoom-correction is active).
-            let div = if dimension_divisor > 0.0 { dimension_divisor as f32 } else { 1.0 };
-            let w_px = (((right_x - left_x) / scale_f) / div).round() as u32;
-            let h_px = (((down_y - up_y) / scale_f) / div).round() as u32;
-
-            // "W × H" with the Unicode multiplication sign. The
-            // optional unit suffix (e.g. "px") trails the second
-            // number, or each number when `wh_indicators` is on —
-            // matches the held-rect pill so the live and committed
-            // readouts agree.
-            let text = if wh_indicators {
-                format!(
-                    "W: {}{} \u{00D7} H: {}{}",
-                    w_px, unit_suffix, h_px, unit_suffix
-                )
-            } else {
-                format!("{} \u{00D7} {}{}", w_px, h_px, unit_suffix)
-            };
+            // Width / height as a fractional logical-pixel span
+            // (buffer span / scale). The unit + rounding mode (and the
+            // Figma dimension divisor) are applied by `format_wh` —
+            // the exact path committed held rects use — so the live
+            // and committed readouts always agree.
+            let w_logical_f = ((right_x - left_x) / scale_f) as f64;
+            let h_logical_f = ((down_y - up_y) / scale_f) as f64;
+            let text = fmt.format_wh(w_logical_f, h_logical_f);
             let px_size = TEXT_LOGICAL_PX * scale_f;
             // Measure text via fontdue. If the font is missing we still
             // render the pill (just empty) at a sensible width using the
@@ -1500,6 +1480,49 @@ fn draw_hover_indicators(
                 baseline_y: pill_y + pad_y + ascent,
                 px_size,
             });
+
+            // Aspect-ratio pill, stacked directly under the W×H pill
+            // and gated by the "Enable in distance tool" pref. Mirrors
+            // the held-rect aspect pill but follows the live cursor.
+            // Reuses `bg_paint` (opaque), `pad_x`/`pad_y`, `ascent`,
+            // `pill_h`, and `px_size` from the W×H pill above.
+            if fmt.aspect_in_distance {
+                let aw = w_logical_f.round() as u32;
+                let ah = h_logical_f.round() as u32;
+                if let Some(aspect_text) =
+                    estimate_aspect_text(aw, ah, fmt.aspect_mode)
+                {
+                    let atext_w = if let Some(font) = hud_font() {
+                        measure_text_width(font, &aspect_text, px_size)
+                    } else {
+                        aspect_text.len() as f32 * px_size * 0.55
+                    };
+                    let apill_w = atext_w.ceil() + pad_x * 2.0;
+                    let apill_x = (pill_x + (pill_w - apill_w) * 0.5)
+                        .floor()
+                        .min(surface_w - apill_w - 1.0)
+                        .max(0.0);
+                    let apill_y = (pill_y + pill_h + 6.0 * scale_f)
+                        .floor()
+                        .min(surface_h - pill_h - 1.0)
+                        .max(0.0);
+                    if let Some(path) = pill_path(apill_x, apill_y, apill_w, pill_h) {
+                        pixmap.fill_path(
+                            &path,
+                            &bg_paint,
+                            FillRule::Winding,
+                            Transform::identity(),
+                            None,
+                        );
+                    }
+                    pills.push(PillLayout {
+                        text: aspect_text,
+                        text_x: apill_x + pad_x,
+                        baseline_y: apill_y + pad_y + ascent,
+                        px_size,
+                    });
+                }
+            }
     }
 }
 
@@ -1559,22 +1582,7 @@ fn draw_area_rect(
     let w_logical = w_logical_f.round() as u32;
     let h_logical = h_logical_f.round() as u32;
 
-    let dim_text = if fmt.wh_indicators {
-        format!(
-            "W: {}{} \u{00D7} H: {}{}",
-            fmt.format_number(w_logical_f),
-            fmt.unit_suffix,
-            fmt.format_number(h_logical_f),
-            fmt.unit_suffix,
-        )
-    } else {
-        format!(
-            "{} \u{00D7} {}{}",
-            fmt.format_number(w_logical_f),
-            fmt.format_number(h_logical_f),
-            fmt.unit_suffix
-        )
-    };
+    let dim_text = fmt.format_wh(w_logical_f, h_logical_f);
     let pill_below = w_logical < 70 || h_logical < 35;
     // Resolve the dim pill bbox: pre-computed (logical px) for
     // committed rects, default for transient live rects.
@@ -2019,20 +2027,31 @@ fn draw_toast(
 ) {
     use tiny_skia::*;
     let px_size = TOAST_TEXT_LOGICAL_PX * scale_f;
-    let (text_w, ascent, descent) = if let Some(font) = hud_font() {
-        let w = measure_text_width(font, text, px_size);
-        let (a, d) = font
-            .horizontal_line_metrics(px_size)
-            .map(|m| (m.ascent, -m.descent))
-            .unwrap_or((px_size * 0.8, px_size * 0.2));
-        (w, a, d)
+    // The toast text can carry `\n` (e.g. a copied multi-line CSS
+    // snippet). Lay each line out on its own baseline: the background
+    // sizes to the widest line and the full stack height, and one
+    // `PillLayout` is queued per line — `render_pill_text` is
+    // single-line, so a bare `\n` would otherwise render as tofu.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (text_w, ascent, descent, line_h) = if let Some(font) = hud_font() {
+        let w = lines
+            .iter()
+            .map(|l| measure_text_width(font, l, px_size))
+            .fold(0.0_f32, |a, b| a.max(b));
+        let lm = font.horizontal_line_metrics(px_size);
+        let a = lm.map(|m| m.ascent).unwrap_or(px_size * 0.8);
+        let d = lm.map(|m| -m.descent).unwrap_or(px_size * 0.2);
+        let lh = lm.map(|m| m.new_line_size).unwrap_or(px_size * 1.3);
+        (w, a, d, lh)
     } else {
-        (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+        let widest = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+        (widest as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2, px_size * 1.3)
     };
     let pad_x = 22.0 * scale_f;
     let pad_y = 12.0 * scale_f;
+    let line_count = lines.len().max(1) as f32;
     let pill_w = text_w.ceil() + pad_x * 2.0;
-    let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+    let pill_h = (ascent + descent + (line_count - 1.0) * line_h).ceil() + pad_y * 2.0;
     let pill_x = ((buf_w - pill_w) * 0.5).floor().max(0.0);
     // Lower-third anchor: pill top at ~2/3 of the buffer height so the
     // pill body sits inside the bottom third regardless of resolution.
@@ -2041,15 +2060,21 @@ fn draw_toast(
     let mut bg = Paint::default();
     bg.set_color_rgba8(20, 20, 20, 235);
     bg.anti_alias = true;
-    if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+    // Fixed corner radius (not a capsule) — a tall multi-line toast
+    // with `pill_path`'s height-derived radius reads as a huge ellipse.
+    if let Some(path) =
+        rounded_rect_path(pill_x, pill_y, pill_w, pill_h, 12.0 * scale_f)
+    {
         pixmap.fill_path(&path, &bg, FillRule::Winding, Transform::identity(), None);
     }
-    pills.push(PillLayout {
-        text: text.to_string(),
-        text_x: (pill_x + pad_x).round(),
-        baseline_y: (pill_y + pad_y + ascent).round(),
-        px_size,
-    });
+    for (i, line) in lines.iter().enumerate() {
+        pills.push(PillLayout {
+            text: line.to_string(),
+            text_x: (pill_x + pad_x).round(),
+            baseline_y: (pill_y + pad_y + ascent + i as f32 * line_h).round(),
+            px_size,
+        });
+    }
 }
 
 // format_number / format_value live on crate::HudMeasurementFormat now

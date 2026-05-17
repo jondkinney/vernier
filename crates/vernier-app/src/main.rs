@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use vernier_core::{
     classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
     EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
-    Tolerance, Units,
+    Tolerance,
 };
 use vernier_platform::{
     Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId,
@@ -487,6 +487,9 @@ fn run_daemon() -> Result<()> {
     let mut toast_until: Option<Instant> = None;
     const TOAST_TOLERANCE_MS: u64 = 900;
     const TOAST_SCREENSHOT_MS: u64 = 1200;
+    // Copy-to-clipboard toast — lingers longer than the others so
+    // there's time to read a multi-line CSS / SASS snippet.
+    const TOAST_COPY_MS: u64 = 1800;
     // Reference guides accumulate across keypresses. `pending_guide`
     // is the in-flight BASE axis the next click will stick to the
     // cursor; the effective axis can be flipped by holding SHIFT
@@ -578,18 +581,6 @@ fn run_daemon() -> Result<()> {
     // on the same guide within DOUBLE_CLICK_WINDOW deletes it.
     let mut last_guide_click: Option<(usize, Instant)> = None;
     const GUIDE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
-    // Last clear-and-hide press time. When the user has opted
-    // into double-press confirmation, a second press within the
-    // configured window (`clear_and_hide_double_press_window_ms`)
-    // fires the action. Otherwise the first press fires it.
-    let mut last_esc_at: Option<Instant> = None;
-    // True between a 1st ESC press and either: (a) a 2nd ESC within
-    // the close-and-clear window (full clear+exit), or (b) the
-    // window expiring (true freeze via toggle_measurement). While
-    // set, refresh_hud renders as if Idle (no live measurement),
-    // but the layer surface keeps its input grab so the 2nd ESC
-    // can still land.
-    let mut pre_clear_freeze: bool = false;
     // Currently-held nudge direction (if any) and a generation
     // counter that the spawned timer thread checks before firing.
     // Bumping the generation invalidates the timer for that
@@ -664,11 +655,9 @@ fn run_daemon() -> Result<()> {
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "toggle_overlay" => {
                 // Wipe transient state so an explicit toggle doesn't
-                // leave us in a half-frozen / pending-guide limbo.
-                pre_clear_freeze = false;
+                // leave us in a pending-guide limbo.
                 pending_guide = None;
                 pending_guide_shift_acked = false;
-                last_esc_at = None;
                 toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
@@ -690,10 +679,8 @@ fn run_daemon() -> Result<()> {
                 if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
                     log::warn!("save session before prefs hotkey: {e:#}");
                 }
-                pre_clear_freeze = false;
                 pending_guide = None;
                 pending_guide_shift_acked = false;
-                last_esc_at = None;
                 nudge_selection = None;
                 last_selected_guide = None;
                 active_toast = None;
@@ -733,10 +720,8 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::HotkeyPressed(_)) => {
                 // Same reset as the tray toggle path — explicit
                 // toggle is the user's "get me out of any sub-mode".
-                pre_clear_freeze = false;
                 pending_guide = None;
                 pending_guide_shift_acked = false;
-                last_esc_at = None;
                 toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
@@ -812,7 +797,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -941,7 +925,6 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         alt_held,
-                        pre_clear_freeze,
                         stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -953,13 +936,6 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::PointerButton {
                 button, pressed, x, y, ..
             }) => {
-                // During the close-and-clear window we look visually
-                // idle — drop pointer events so a stray click during
-                // the freeze doesn't drop a new held rect / context
-                // menu that ghost-appears after the window expires.
-                if pre_clear_freeze {
-                    continue;
-                }
                 // Right-click toggles the floating context menu. An
                 // active drag / resize blocks it (don't disrupt
                 // in-flight gestures).
@@ -1026,7 +1002,6 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         alt_held,
-                        pre_clear_freeze,
                         stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -1120,10 +1095,8 @@ fn run_daemon() -> Result<()> {
                                     &mut last_selected_guide,
                                     &mut pending_guide,
                                     &mut pending_guide_shift_acked,
-                                    &mut pre_clear_freeze,
                                     &mut active_toast,
                                     &mut toast_until,
-                                    &mut last_esc_at,
                                     color_alternate,
                                     prefs_hotkey_accel,
                                     &mut prefs_hotkey,
@@ -1188,10 +1161,8 @@ fn run_daemon() -> Result<()> {
                                 // overlay isn't left in passthrough with
                                 // stale content, then exit measure mode,
                                 // then spawn / activate the prefs window.
-                                pre_clear_freeze = false;
                                 pending_guide = None;
                                 pending_guide_shift_acked = false;
-                                last_esc_at = None;
                                 held_rects.clear();
                                 guides.clear();
                                 stuck_measurements.clear();
@@ -1247,7 +1218,6 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         alt_held,
-                        pre_clear_freeze,
                         stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -1305,7 +1275,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1358,7 +1327,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1457,7 +1425,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -1502,7 +1469,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1534,7 +1500,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1598,7 +1563,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1663,7 +1627,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1794,8 +1757,6 @@ fn run_daemon() -> Result<()> {
                             pending_guide_shift_acked = false;
                             active_toast = None;
                             toast_until = None;
-                            last_esc_at = None;
-                            pre_clear_freeze = false;
                             toggle_measurement(
                                     &mut mode,
                                     &mut overlay,
@@ -1852,7 +1813,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -1883,7 +1843,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2023,7 +1982,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -2088,7 +2046,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -2120,10 +2077,8 @@ fn run_daemon() -> Result<()> {
                     // check handles every state (Hover, Drawing, Held)
                     // by transitioning to Idle.
                     if !matches!(mode, InteractionMode::Idle) {
-                        pre_clear_freeze = false;
                         pending_guide = None;
                         pending_guide_shift_acked = false;
-                        last_esc_at = None;
                         toggle_measurement(
                                     &mut mode,
                                     &mut overlay,
@@ -2169,7 +2124,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2178,126 +2132,86 @@ fn run_daemon() -> Result<()> {
                         );
                     }
                 } else if pressed_accel.is_some()
+                    && pressed_accel == shortcut_accels.clear_and_exit
+                {
+                    // Configured clear-and-exit shortcut (default
+                    // Ctrl+F): wipe every held rect, guide, and stuck
+                    // measurement and leave measure mode.
+                    // Caught while the overlay still holds the
+                    // keyboard, so it's a plain single press — the
+                    // deliberate multi-key combo is what keeps it from
+                    // being an accidental wipe.
+                    if let Err(e) =
+                        save_session(&held_rects, &guides, &stuck_measurements)
+                    {
+                        log::warn!("save session: {e:#}");
+                    }
+                    log::info!(
+                        "clear-and-exit — clearing {} rect(s), {} guide(s), \
+                         {} stuck",
+                        held_rects.len(),
+                        guides.len(),
+                        stuck_measurements.len(),
+                    );
+                    held_rects.clear();
+                    guides.clear();
+                    stuck_measurements.clear();
+                    nudge_selection = None;
+                    last_selected_guide = None;
+                    pending_guide = None;
+                    pending_guide_shift_acked = false;
+                    active_toast = None;
+                    toast_until = None;
+                    toggle_measurement(
+                        &mut mode,
+                        &mut overlay,
+                        &platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut capture_worker,
+                        &held_rects,
+                        &guides,
+                        &stuck_measurements,
+                        color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
+                    );
+                } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.clear_and_hide
                 {
-                    // Configured clear-and-hide shortcut (default
-                    // Esc). When `clear_and_hide_double_press` is
-                    // on (default), the action requires a second
-                    // press within the configured window; the first
-                    // press shows a confirmation toast and visually
-                    // freezes the overlay (no live measurement). When
-                    // off, a single press fires immediately. Either
-                    // way the action saves session (if persistence
-                    // is on), wipes every held rect / guide / stuck
-                    // measurement, and toggles measure mode off.
-                    let s = current_settings();
-                    // Skip the two-press confirmation when there's
-                    // nothing to lose — no held rects, no guides, no
-                    // stuck measurements means a single Esc just
-                    // exits measure mode cleanly. The double-press
-                    // exists to protect persisted content from being
-                    // wiped by an accidental Esc; with nothing on
-                    // screen there's no content to protect, and the
-                    // "Press Esc again" toast is just friction.
-                    let has_persisted_content = !held_rects.is_empty()
-                        || !guides.is_empty()
-                        || !stuck_measurements.is_empty();
-                    let need_double =
-                        s.shortcuts.clear_and_hide_double_press && has_persisted_content;
-                    let window = Duration::from_millis(
-                        s.shortcuts.clear_and_hide_double_press_window_ms.clamp(100, 3000) as u64,
-                    );
-                    let now = Instant::now();
-                    let is_double = last_esc_at
-                        .map(|t| now.duration_since(t) <= window)
-                        .unwrap_or(false);
-                    let fire = !need_double || is_double;
-                    if fire {
-                        if let Err(e) =
-                            save_session(&held_rects, &guides, &stuck_measurements)
-                        {
-                            log::warn!("save session: {e:#}");
-                        }
-                        log::info!(
-                            "clear-and-hide×2 — clearing {} rect(s), {} guide(s), {} stuck",
-                            held_rects.len(),
-                            guides.len(),
-                            stuck_measurements.len(),
-                        );
-                        last_esc_at = None;
-                        pre_clear_freeze = false;
-                        held_rects.clear();
-                        nudge_selection = None;
-                        last_selected_guide = None;
-                        guides.clear();
-                        stuck_measurements.clear();
-                        pending_guide = None;
-                        pending_guide_shift_acked = false;
-                        active_toast = None;
-                        toast_until = None;
-                        toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
-                            &guides,
-                            &stuck_measurements,
-                            color_alternate,
-                            prefs_hotkey_accel,
-                            &mut prefs_hotkey,
-                        );
-                    } else {
-                        last_esc_at = Some(now);
-                        // Visually freeze immediately: refresh_hud will
-                        // render only persisted content (no live
-                        // measurement crosshair) for the duration of
-                        // the close-and-clear window. Input grab stays
-                        // so the 2nd ESC can land. The
-                        // ClearAndHideWindowExpired event fires after
-                        // `window` to drop the grab if no 2nd press
-                        // arrives.
-                        pre_clear_freeze = true;
-                        let key_label = shortcut_accels
-                            .clear_and_hide
-                            .as_ref()
-                            .map(|a| a.to_string_key())
-                            .unwrap_or_else(|| "Esc".into());
-                        active_toast = Some(HudToast {
-                            text: format!("Press {key_label} again to clear and exit"),
-                        });
-                        toast_until = Some(now + window);
-                        spawn_toast_timer(&combined_tx, window, false);
-                        spawn_clear_and_hide_window_timer(&combined_tx, window, now);
-                        if let Some((x, y)) = last_pointer_xy {
-                            last_hud_redraw = Instant::now();
-                            let toast = current_toast(&active_toast, toast_until);
-                            refresh_hud(
-                                &mode,
-                                &mut overlay,
-                                frozen_frame.as_ref(),
-                                x,
-                                y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                pre_clear_freeze,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
-                            );
-                        }
+                    // Configured exit shortcut (default Esc): leave
+                    // measure mode in a single press. Held content is
+                    // preserved — `toggle_measurement` keeps held
+                    // rects / guides / stuck measurements visible in
+                    // passthrough mode — so an accidental press can
+                    // never wipe a session. Clearing is an explicit
+                    // action via the right-click "Clear" menu item.
+                    if let Err(e) =
+                        save_session(&held_rects, &guides, &stuck_measurements)
+                    {
+                        log::warn!("save session: {e:#}");
                     }
+                    log::info!("exit shortcut — leaving measure mode");
+                    pending_guide = None;
+                    pending_guide_shift_acked = false;
+                    nudge_selection = None;
+                    last_selected_guide = None;
+                    active_toast = None;
+                    toast_until = None;
+                    toggle_measurement(
+                        &mut mode,
+                        &mut overlay,
+                        &platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut capture_worker,
+                        &held_rects,
+                        &guides,
+                        &stuck_measurements,
+                        color_alternate,
+                        prefs_hotkey_accel,
+                        &mut prefs_hotkey,
+                    );
                 } else if pressed_accel.is_some()
                     && (pressed_accel == shortcut_accels.guide_horizontal
                         || pressed_accel == shortcut_accels.guide_vertical)
@@ -2339,7 +2253,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2378,7 +2291,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2441,7 +2353,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2482,7 +2393,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2523,7 +2433,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2559,7 +2468,6 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     alt_held,
-                                    pre_clear_freeze,
                                     stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -2591,10 +2499,8 @@ fn run_daemon() -> Result<()> {
                         &mut last_selected_guide,
                         &mut pending_guide,
                         &mut pending_guide_shift_acked,
-                        &mut pre_clear_freeze,
                         &mut active_toast,
                         &mut toast_until,
-                        &mut last_esc_at,
                         color_alternate,
                         prefs_hotkey_accel,
                         &mut prefs_hotkey,
@@ -2651,7 +2557,6 @@ fn run_daemon() -> Result<()> {
                             color_alternate,
                             align_mode,
                             alt_held,
-                            pre_clear_freeze,
                             stuck_pill_drag_committed,
                             primary.bounds.w as i32,
                             primary.bounds.h as i32,
@@ -2682,21 +2587,31 @@ fn run_daemon() -> Result<()> {
                     if let Some(rect) = target {
                         let w = (rect.rect_end.0 - rect.rect_start.0).abs().round() as u32;
                         let h = (rect.rect_end.1 - rect.rect_start.1).abs().round() as u32;
-                        let fmt = current_settings().integrations.copy_dimensions_format;
-                        let text = fmt.render(w, h);
+                        let g = current_settings().general;
+                        let text = g.copy_dimensions_format.render(
+                            w,
+                            h,
+                            g.copy_dimensions_unit,
+                            g.copy_dimensions_rem_base,
+                            g.copy_dimensions_linebreak,
+                        );
                         if let Err(e) = write_clipboard_text(&text) {
                             log::warn!("copy dimensions: {e:#}");
                         } else {
                             log::info!("copied dimensions: {text:?}");
                             active_toast = Some(HudToast {
-                                text: format!("Copied: {text}"),
+                                text: if g.copy_dimensions_linebreak {
+                                    format!("Copied to clipboard:\n\n{text}")
+                                } else {
+                                    format!("Copied to clipboard: {text}")
+                                },
                             });
                             toast_until = Some(
-                                Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS),
+                                Instant::now() + Duration::from_millis(TOAST_COPY_MS),
                             );
                             spawn_toast_timer(
                                 &combined_tx,
-                                Duration::from_millis(TOAST_TOLERANCE_MS),
+                                Duration::from_millis(TOAST_COPY_MS),
                                 false,
                             );
                             if let Some((x, y)) = last_pointer_xy {
@@ -2717,7 +2632,6 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     alt_held,
-                                    pre_clear_freeze,
                                     stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -2800,7 +2714,6 @@ fn run_daemon() -> Result<()> {
                                         color_alternate,
                                         align_mode,
                                         alt_held,
-                                        pre_clear_freeze,
                                         stuck_pill_drag_committed,
                                         primary.bounds.w as i32,
                                         primary.bounds.h as i32,
@@ -2886,7 +2799,6 @@ fn run_daemon() -> Result<()> {
                         toast_until,
                         &guides,
                         pending_guide,
-                        pre_clear_freeze,
                         stuck_pill_drag_committed,
                         &stuck_measurements,
                         primary.bounds.w as i32,
@@ -3105,7 +3017,6 @@ fn run_daemon() -> Result<()> {
                                     color_alternate,
                                     align_mode,
                                     alt_held,
-                                    pre_clear_freeze,
                                     stuck_pill_drag_committed,
                                     primary.bounds.w as i32,
                                     primary.bounds.h as i32,
@@ -3166,7 +3077,6 @@ fn run_daemon() -> Result<()> {
                         color_alternate,
                         align_mode,
                         alt_held,
-                        pre_clear_freeze,
                         stuck_pill_drag_committed,
                         primary.bounds.w as i32,
                         primary.bounds.h as i32,
@@ -3211,7 +3121,6 @@ fn run_daemon() -> Result<()> {
                                 color_alternate,
                                 align_mode,
                                 alt_held,
-                                pre_clear_freeze,
                                 stuck_pill_drag_committed,
                                 primary.bounds.w as i32,
                                 primary.bounds.h as i32,
@@ -3244,7 +3153,6 @@ fn run_daemon() -> Result<()> {
                     toast_until,
                     &guides,
                     pending_guide,
-                    pre_clear_freeze,
                     stuck_pill_drag_committed,
                     &stuck_measurements,
                     primary.bounds.w as i32,
@@ -3252,39 +3160,6 @@ fn run_daemon() -> Result<()> {
                     context_menu.as_ref(),
                     &mut last_hud_redraw,
                 );
-            }
-            MainEvent::ClearAndHideWindowExpired { esc_at } => {
-                // The 2s close-and-clear window from a 1st ESC press
-                // has elapsed without a 2nd ESC. A 2nd ESC would have
-                // cleared `last_esc_at` (and called toggle_measurement
-                // itself for the full clear+exit), so seeing the
-                // original timestamp still set is the cancel-token
-                // signaling "no 2nd press came".
-                if last_esc_at != Some(esc_at) {
-                    continue;
-                }
-                last_esc_at = None;
-                pre_clear_freeze = false;
-                active_toast = None;
-                toast_until = None;
-                if !matches!(mode, InteractionMode::Idle) {
-                    // Drop input capture + transition to true Idle
-                    // with content preserved (or hide if empty).
-                    toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
-                        &guides,
-                        &stuck_measurements,
-                        color_alternate,
-                        prefs_hotkey_accel,
-                        &mut prefs_hotkey,
-                    );
-                }
             }
         }
     }
@@ -3367,17 +3242,14 @@ fn hud_foreground(alt: bool) -> vernier_platform::Color {
 fn current_measurement_format() -> HudMeasurementFormat {
     let s = current_settings();
     let unit_suffix = if s.general.display_units {
-        match s.appearance.units {
-            Units::Px => "px".to_string(),
-            Units::Pt => "pt".to_string(),
-        }
+        "px".to_string()
     } else {
         String::new()
     };
     let (dimension_divisor, _) = current_figma_correction(&s);
     HudMeasurementFormat {
         unit_suffix,
-        rounding: match s.appearance.rounding_mode {
+        rounding: match s.general.rounding_mode {
             RoundingMode::Points => HudRounding::Points,
             RoundingMode::PointsRounded => HudRounding::PointsRounded,
             RoundingMode::ScreenPixels => HudRounding::ScreenPixels,
@@ -3385,6 +3257,7 @@ fn current_measurement_format() -> HudMeasurementFormat {
         scale_factor: primary_scale_factor(),
         wh_indicators: s.general.display_wh_indicators,
         aspect_in_area: s.general.aspect_in_area_tool,
+        aspect_in_distance: s.general.aspect_in_distance_tool,
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
     }
@@ -3459,17 +3332,14 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
     let a = s.appearance.alternative_color;
     hud.alternate_fg = PlatColor::rgba(a.r, a.g, a.b, a.a);
     let unit_suffix = if s.general.display_units {
-        match s.appearance.units {
-            Units::Px => "px".to_string(),
-            Units::Pt => "pt".to_string(),
-        }
+        "px".to_string()
     } else {
         String::new()
     };
     let (dimension_divisor, corner_indicator) = current_figma_correction(&s);
     hud.measurement_format = HudMeasurementFormat {
         unit_suffix,
-        rounding: match s.appearance.rounding_mode {
+        rounding: match s.general.rounding_mode {
             RoundingMode::Points => HudRounding::Points,
             RoundingMode::PointsRounded => HudRounding::PointsRounded,
             RoundingMode::ScreenPixels => HudRounding::ScreenPixels,
@@ -3477,6 +3347,7 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
         scale_factor: primary_scale_factor(),
         wh_indicators: s.general.display_wh_indicators,
         aspect_in_area: s.general.aspect_in_area_tool,
+        aspect_in_distance: s.general.aspect_in_distance_tool,
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
     };
@@ -4006,6 +3877,7 @@ fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
 #[derive(Debug, Clone, Default)]
 struct ParsedShortcuts {
     clear_and_hide: Option<Accelerator>,
+    clear_and_exit: Option<Accelerator>,
     restore: Option<Accelerator>,
     capture: Option<Accelerator>,
     /// Single-modifier "press-and-hold" binding for Crosshair
@@ -4140,7 +4012,6 @@ fn apply_nudge_step(
     toast_until: Option<Instant>,
     guides: &[Guide],
     pending_guide: Option<GuideAxis>,
-    pre_clear_freeze: bool,
     stuck_pill_drag_committed: bool,
     stuck_measurements: &[StuckMeasurement],
     screen_w: i32,
@@ -4190,7 +4061,6 @@ fn apply_nudge_step(
             color_alternate,
             align_mode,
             alt_held,
-            pre_clear_freeze,
             stuck_pill_drag_committed,
             screen_w,
             screen_h,
@@ -4244,6 +4114,7 @@ fn log_shortcut_accels(p: &ParsedShortcuts) {
 fn parse_shortcut_accels(s: &Settings) -> ParsedShortcuts {
     ParsedShortcuts {
         clear_and_hide: Accelerator::parse(&s.shortcuts.clear_and_hide),
+        clear_and_exit: Accelerator::parse(&s.shortcuts.clear_and_exit),
         restore: Accelerator::parse(&s.shortcuts.restore_session),
         capture: Accelerator::parse(&s.shortcuts.capture),
         crosshair: parse_modifier_only(&s.shortcuts.crosshair_mode),
@@ -4433,26 +4304,6 @@ fn spawn_toast_timer(
         .ok();
 }
 
-/// Spawn a detached thread that sleeps for the close-and-clear window
-/// and then enqueues `MainEvent::ClearAndHideWindowExpired`. The
-/// `esc_at` is the timestamp of the 1st ESC; the handler will compare
-/// it against `last_esc_at` and ignore the event if a 2nd ESC has
-/// already cleared the marker.
-fn spawn_clear_and_hide_window_timer(
-    tx: &std::sync::mpsc::Sender<MainEvent>,
-    delay: Duration,
-    esc_at: Instant,
-) {
-    let tx = tx.clone();
-    std::thread::Builder::new()
-        .name("vernier-clear-window".into())
-        .spawn(move || {
-            std::thread::sleep(delay);
-            let _ = tx.send(MainEvent::ClearAndHideWindowExpired { esc_at });
-        })
-        .ok();
-}
-
 #[derive(Debug)]
 enum MainEvent {
     Platform(PlatformEvent),
@@ -4467,13 +4318,6 @@ enum MainEvent {
     /// wasn't reliably scheduling on Hyprland, so we drive our
     /// own timer with a generation counter for cancellation.
     NudgeTick { dir: NudgeDir, generation: u64 },
-    /// Internal: the close-and-clear confirmation window has lapsed
-    /// without a 2nd ESC, so the visually-frozen overlay should now
-    /// commit to a true freeze (drop input capture, mode → Idle).
-    /// `esc_at` is the timestamp of the 1st ESC press: the handler
-    /// only acts on this event when `last_esc_at == Some(esc_at)`,
-    /// which doubles as the cancel-token if a 2nd ESC arrived first.
-    ClearAndHideWindowExpired { esc_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5138,10 +4982,8 @@ fn do_take_normal_screenshot(
     last_selected_guide: &mut Option<usize>,
     pending_guide: &mut Option<GuideAxis>,
     pending_guide_shift_acked: &mut bool,
-    pre_clear_freeze: &mut bool,
     active_toast: &mut Option<HudToast>,
     toast_until: &mut Option<Instant>,
-    last_esc_at: &mut Option<Instant>,
     color_alternate: bool,
     prefs_hotkey_accel: Option<Accelerator>,
     prefs_hotkey: &mut Option<HotkeyId>,
@@ -5156,8 +4998,6 @@ fn do_take_normal_screenshot(
     if let Err(e) = save_session(held_rects, guides, stuck_measurements) {
         log::warn!("save session: {e:#}");
     }
-    *last_esc_at = None;
-    *pre_clear_freeze = false;
     held_rects.clear();
     *nudge_selection = None;
     *last_selected_guide = None;
@@ -5442,7 +5282,6 @@ fn refresh_hud(
     color_alternate: bool,
     align_mode: bool,
     alt_held: bool,
-    pre_clear_freeze: bool,
     stuck_drag_committed: bool,
     screen_w: i32,
     screen_h: i32,
@@ -5451,22 +5290,6 @@ fn refresh_hud(
 ) {
     let fg = hud_foreground(color_alternate);
 
-    // 1st ESC has visually frozen the overlay: content stays but the
-    // live measurement crosshair / pills don't draw. Keyboard input is
-    // still captured (so a 2nd ESC can land); the close-and-clear
-    // window timer drops the input grab on expiry.
-    if pre_clear_freeze {
-        let mut hud = Hud::hover((-1000.0, -1000.0));
-        hud.kind = HudKind::None;
-        hud.foreground = fg;
-        populate_hud_appearance(&mut hud, alt_held);
-        hud.toast = toast.cloned();
-        hud.guides = guides.to_vec();
-        hud.stuck_measurements = stuck_measurements.to_vec();
-        hud.held_rects = held_rects.to_vec();
-        overlay.set_hud(Some(hud));
-        return;
-    }
     // While the context menu is open, freeze the live measurement at
     // the cursor's position when the menu opened — the crosshair, edge
     // ticks, and any cursor-driven hover state stop tracking the mouse
@@ -6016,6 +5839,10 @@ fn apply_held_rects_to_edges(
     x: f64,
     y: f64,
 ) {
+    // No-op when the user has turned object snapping off in prefs.
+    if !current_settings().general.snap_to_objects {
+        return;
+    }
     for rect in held_rects {
         let min_x = rect.rect_start.0.min(rect.rect_end.0);
         let max_x = rect.rect_start.0.max(rect.rect_end.0);

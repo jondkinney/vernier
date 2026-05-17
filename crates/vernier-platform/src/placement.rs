@@ -260,22 +260,7 @@ fn stuck_default_bbox(
 fn rect_pill_text(r: &HeldRect, fmt: &HudMeasurementFormat) -> String {
     let rw = (r.rect_end.0 - r.rect_start.0).abs();
     let rh = (r.rect_end.1 - r.rect_start.1).abs();
-    if fmt.wh_indicators {
-        format!(
-            "W: {}{} \u{00D7} H: {}{}",
-            fmt.format_number(rw),
-            fmt.unit_suffix,
-            fmt.format_number(rh),
-            fmt.unit_suffix,
-        )
-    } else {
-        format!(
-            "{} \u{00D7} {}{}",
-            fmt.format_number(rw),
-            fmt.format_number(rh),
-            fmt.unit_suffix,
-        )
-    }
+    fmt.format_wh(rw, rh)
 }
 
 fn rect_dim_default_bbox(

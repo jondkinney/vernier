@@ -27,9 +27,9 @@ pub use measurement::{
     axis_biased_snap, best_snap, Axis, Measurement, Mode as InteractionMode, SnapPoint,
 };
 pub use settings::{
-    AppearanceSettings, ColorRgba, CopyFormat, GeneralSettings, IntegrationSettings,
+    AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, GeneralSettings, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
-    ToleranceSettings, Units, settings_path,
+    ToleranceSettings, settings_path,
 };
 
 /// Stable per-process build identifier — the mtime (in seconds since

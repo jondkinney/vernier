@@ -197,6 +197,9 @@ pub struct HudMeasurementFormat {
     /// Show the aspect-ratio pill on area rectangles. When false,
     /// the rect renders without an aspect pill regardless of mode.
     pub aspect_in_area: bool,
+    /// Show the aspect-ratio pill on the live distance-tool readout
+    /// — the crosshair W×H that updates as the cursor moves.
+    pub aspect_in_distance: bool,
     /// Reporting style for the aspect-ratio pill: Automatic picks
     /// a curated common ratio when within tolerance, otherwise the
     /// reduced fraction; CommonOnly hides the pill if no curated
@@ -218,6 +221,7 @@ impl Default for HudMeasurementFormat {
             scale_factor: 1.0,
             wh_indicators: false,
             aspect_in_area: true,
+            aspect_in_distance: false,
             aspect_mode: vernier_core::AspectMode::Automatic,
             dimension_divisor: 1.0,
         }
@@ -253,6 +257,30 @@ impl HudMeasurementFormat {
     /// `format_number` with the configured unit suffix appended.
     pub fn format_value(&self, value_logical: f64) -> String {
         format!("{}{}", self.format_number(value_logical), self.unit_suffix)
+    }
+
+    /// Render a `W × H` measurement label, applying the unit suffix
+    /// and rounding mode to each value. Shared by the live crosshair
+    /// readout, committed held rects, and the pill-layout sizer so
+    /// the measured and rendered strings can't drift apart.
+    pub fn format_wh(&self, w_logical: f64, h_logical: f64) -> String {
+        if self.wh_indicators {
+            format!(
+                "W: {}{} \u{00D7} H: {}{}",
+                self.format_number(w_logical),
+                self.unit_suffix,
+                self.format_number(h_logical),
+                self.unit_suffix,
+            )
+        } else {
+            format!(
+                "{}{} \u{00D7} {}{}",
+                self.format_number(w_logical),
+                self.unit_suffix,
+                self.format_number(h_logical),
+                self.unit_suffix,
+            )
+        }
     }
 }
 
