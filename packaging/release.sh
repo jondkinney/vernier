@@ -27,6 +27,11 @@
 # built locally would just be replaced — leaving the PKGBUILD
 # checksum describing a file nobody downloads.
 #
+# The crates.io token is read from 1Password at the start of the run
+# (`op read op://Private/crates.io/vernier-release`) and passed to
+# `cargo publish` via CARGO_REGISTRY_TOKEN — it never touches disk or
+# `~/.cargo/credentials.toml`. Needs the `op` (1Password) CLI signed in.
+#
 # Usage:
 #   packaging/release.sh 0.2.0
 #   packaging/release.sh 0.2.0 --dry-run
@@ -44,6 +49,7 @@ set -euo pipefail
 DRY_RUN=0
 SKIP_PUSH=0
 NEW_VER=""
+CRATESIO_TOKEN=""
 
 while (($#)); do
     case "$1" in
@@ -152,12 +158,17 @@ say "checking preconditions"
 command -v gh    >/dev/null || die "gh CLI not installed"
 command -v curl  >/dev/null || die "curl not installed"
 command -v cargo >/dev/null || die "cargo not installed"
+command -v op    >/dev/null || die "op (1Password CLI) not installed"
 if (( ! SKIP_PUSH )) && (( ! DRY_RUN )); then
     gh auth status >/dev/null 2>&1 || die "gh not authenticated; run 'gh auth login'"
-    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-    [[ -f "$cargo_home/credentials.toml" || -f "$cargo_home/credentials" \
-       || -n "${CARGO_REGISTRY_TOKEN:-}" ]] \
-        || die "no crates.io token; run 'cargo login' or set CARGO_REGISTRY_TOKEN"
+    # crates.io token, read from 1Password up front so an `op` auth
+    # failure aborts before the GitHub Release / AUR push rather than
+    # mid-publish. Kept in a plain (un-exported) variable — only the
+    # per-command CARGO_REGISTRY_TOKEN assignments at publish time see
+    # it, so it never enters the environment or `~/.cargo/`.
+    CRATESIO_TOKEN="$(op read 'op://Private/crates.io/vernier-release')" \
+        || die "couldn't read the crates.io token from 1Password (op read op://Private/crates.io/vernier-release)"
+    [[ -n "$CRATESIO_TOKEN" ]] || die "the crates.io token from 1Password is empty"
 fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
@@ -318,7 +329,13 @@ push_aur "$PKGNAME-git"  "$PKGBUILD_GIT"
 # the index, so the next one in the list can build against it.
 say "publishing crates to crates.io"
 for crate in "${CRATES[@]}"; do
-    run cargo publish -p "$crate"
+    # Not via run(): the 1Password-sourced token is passed per-command
+    # so it reaches only this `cargo publish`, and the echoed line
+    # redacts it rather than printing the secret.
+    printf '   \033[2m$\033[0m %s\n' "CARGO_REGISTRY_TOKEN=*** cargo publish -p $crate"
+    if (( ! DRY_RUN )); then
+        CARGO_REGISTRY_TOKEN="$CRATESIO_TOKEN" cargo publish -p "$crate"
+    fi
 done
 
 #--- confirm every release workflow finished ----------------------------------

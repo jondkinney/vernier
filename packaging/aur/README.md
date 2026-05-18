@@ -30,8 +30,10 @@ Flags:
 - `--dry-run` — print every step, change nothing.
 - `--skip-push` — bump + commit + tag locally, then stop.
 
-The script requires `gh` to be authenticated (`gh auth login`) and your
-SSH key to be the one registered with `aur@aur.archlinux.org`.
+The script requires `gh` authenticated (`gh auth login`), the `op`
+(1Password) CLI signed in — it reads the crates.io token from
+`op://Private/crates.io/vernier-release` — and your SSH key registered
+with `aur@aur.archlinux.org`.
 
 If you'd rather do it by hand: bump `Cargo.toml`, `cargo build --release`,
 commit + tag + push, then for each PKGBUILD update `pkgver`/`pkgrel`/`sha256sums`,
