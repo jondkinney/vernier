@@ -446,9 +446,7 @@ fn parse_desktop(path: &Path, expected_basename: &str, resolved_bin: &Path) -> O
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| first.to_string());
-    let matches = first_base == expected_basename
-        || first_path == resolved_bin
-        || (first_path.is_absolute() && first_path == resolved_bin);
+    let matches = first_base == expected_basename || first_path == resolved_bin;
     if !matches {
         return None;
     }
