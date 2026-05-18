@@ -1,9 +1,15 @@
-//! Platform-neutral app icon rasterization. The SVGs live in
-//! `assets/icons/svg/`; consumers ask for an RGBA8 buffer at the
-//! size they need (tray, launcher PNG, prefs About card).
+//! Platform-neutral app icon rasterization. Consumers ask for an
+//! RGBA8 buffer at the size they need (tray, launcher PNG, prefs
+//! About card).
+//!
+//! The SVGs are kept crate-local under `assets/icons/svg/` so the
+//! crate is self-contained when published to crates.io (a published
+//! tarball can't reach the repo-root `assets/`). The repo-root copy
+//! remains the canonical brand source used by the packaging
+//! scripts; these two files mirror it.
 
-const APP_ICON_SVG: &[u8] = include_bytes!("../../../assets/icons/svg/vernier.svg");
-const TRAY_ICON_SVG: &[u8] = include_bytes!("../../../assets/icons/svg/vernier-symbolic.svg");
+const APP_ICON_SVG: &[u8] = include_bytes!("../assets/icons/svg/vernier.svg");
+const TRAY_ICON_SVG: &[u8] = include_bytes!("../assets/icons/svg/vernier-symbolic.svg");
 
 /// Render the colored Vernier app icon at `size × size`. Used by
 /// the daemon to drop a PNG on disk for desktop / launcher entries

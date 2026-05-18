@@ -1,9 +1,12 @@
 [package]
-name = "vernier-core"
+name = "vernier-rs-core"
+description = "Core algorithms, geometry, and settings for Vernier, the native pixel-measurement screen overlay."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]

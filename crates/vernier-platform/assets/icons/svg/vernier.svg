@@ -1,0 +1,134 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#313244"/>
+      <stop offset="1" stop-color="#1e1e2e"/>
+    </linearGradient>
+    <linearGradient id="vSurface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4e5066"/>
+      <stop offset="1" stop-color="#3d3f52"/>
+    </linearGradient>
+    <clipPath id="rounded">
+      <rect width="256" height="256" rx="56"/>
+    </clipPath>
+    <filter id="iconShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <filter id="vShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <g transform="translate(16 16) scale(0.875)">
+
+    <!-- Background with macOS-style outer drop shadow -->
+    <rect width="256" height="256" rx="56" fill="url(#bg)" filter="url(#iconShadow)"/>
+
+    <!--
+      All icon content clipped to the rounded rect so nothing bleeds past the icon edge.
+      That includes the V silhouette + its drop shadow AND the tick marks on the outer
+      edge (which can get close to the icon's left side).
+    -->
+    <g clip-path="url(#rounded)">
+
+      <!-- V silhouette with subtle top-to-bottom gradient for brushed-metal texture -->
+      <polygon points="0,0 128,256 256,0 196,0 128,136 60,0"
+               fill="url(#vSurface)" filter="url(#vShadow)"/>
+
+      <!--
+        Inner edge highlight: thin V-shaped path inside the V body, hugging the
+        inner cut-out edges. Inset 1.5 perpendicular into V body so the stroke
+        sits cleanly inside the silhouette. Suggests a beveled lip catching light.
+      -->
+      <path d="M 58.66,0.67 L 128,139.35 L 197.34,0.67"
+            fill="none"
+            stroke="#6c7086"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            opacity="0.55"/>
+
+      <!--
+        Outer edge highlight: same treatment along the V's OUTER perimeter,
+        inset 1.5 perp into V body. Starts where the outer edge clears the
+        rounded corners (at y≈22.4), curves around the outer apex at (128, 256).
+      -->
+      <path d="M 12.54,21.73 L 128,252.65 L 243.46,21.73"
+            fill="none"
+            stroke="#6c7086"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            opacity="0.55"/>
+
+      <!--
+        MAIN scale on INNER edge. All ticks share the same color (surface2 #585b70).
+        Major ticks (t=0.10, 0.50, 0.90) are longer (19 perp) than regular (15 perp).
+        The aligned tick at t=0.34 is drawn separately below in overlay0 (lighter gray).
+      -->
+      <g stroke="#585b70" stroke-width="3.5" stroke-linecap="round">
+        <!-- Major ticks: length 19 -->
+        <line x1="65.23"  y1="14.38"  x2="48.24"  y2="22.88"/>
+        <line x1="92.43"  y1="68.78"  x2="75.44"  y2="77.28"/>
+        <line x1="119.63" y1="123.18" x2="102.64" y2="131.68"/>
+        <!-- Regular ticks: length 13 (skipping t=0.34, the aligned one) -->
+        <line x1="70.67"  y1="25.26"  x2="59.05"  y2="31.08"/>
+        <line x1="76.11"  y1="36.14"  x2="64.49"  y2="41.96"/>
+        <line x1="86.99"  y1="57.90"  x2="75.37"  y2="63.72"/>
+        <line x1="97.87"  y1="79.66"  x2="86.25"  y2="85.48"/>
+        <line x1="103.31" y1="90.54"  x2="91.69"  y2="96.36"/>
+        <line x1="108.75" y1="101.42" x2="97.13"  y2="107.24"/>
+        <line x1="114.19" y1="112.30" x2="102.57" y2="118.12"/>
+      </g>
+
+      <!--
+        VERNIER scale on OUTER edge. Majors at endpoints (y=30.24, y=130.24)
+        anchor the scale at its top and bottom. Aligned tick (y=70.24) stays
+        regular — matches the aligned main tick which is also at a regular position.
+      -->
+      <g stroke="#585b70" stroke-width="3.5" stroke-linecap="round">
+        <!-- Major ticks: length 19 at endpoints -->
+        <line x1="16.69" y1="29.46"  x2="33.68" y2="20.96"/>
+        <line x1="66.69" y1="129.46" x2="83.68" y2="120.96"/>
+        <!-- Regular ticks: length 13 (skipping y=70.24, the aligned one) -->
+        <line x1="26.69" y1="49.46"  x2="38.31" y2="43.64"/>
+        <line x1="46.69" y1="89.46"  x2="58.31" y2="83.64"/>
+        <line x1="56.69" y1="109.46" x2="68.31" y2="103.64"/>
+      </g>
+
+      <!--
+        Sliding interface line — thin reference line running parallel to both V edges,
+        sitting at the midpoint of the arm body between the main and vernier scales.
+        This is the imaginary seam where the two scales would slide against each other
+        on a real vernier caliper.
+        Geometry: from (35, 10) to (95, 130), slope 2.0 (same as V edges).
+        Both endpoints are at perpendicular distance 26.83 from each V arm edge.
+      -->
+      <line x1="34" y1="8" x2="97.5" y2="135"
+            stroke="#585b70" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+      <!--
+        ALIGNED pair: same regular length as other ticks (15), just lighter gray (overlay0)
+        to mark where the two scales line up on the same perpendicular line.
+        Drawn after the interface line so they sit on top of any visual conflict.
+      -->
+      <g stroke="#6c7086" stroke-width="3.5" stroke-linecap="round">
+        <line x1="81.55" y1="47.02" x2="69.93" y2="52.84"/>  <!-- Main t=0.34 -->
+        <line x1="36.69" y1="69.46" x2="48.31" y2="63.64"/>  <!-- Vernier y=70.24 -->
+      </g>
+
+    </g>
+
+    <!-- Inner rim -->
+    <rect x="1" y="1" width="254" height="254" rx="55"
+          fill="none" stroke="#585b70" stroke-width="1.5"
+          vector-effect="non-scaling-stroke"/>
+
+    <!-- Cyan crosshair -->
+    <line x1="128" y1="68" x2="128" y2="188" stroke="#89dceb" stroke-width="9" stroke-linecap="round"/>
+    <line x1="68" y1="128" x2="188" y2="128" stroke="#89dceb" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="128" cy="128" r="11" fill="#89dceb"/>
+    <circle cx="128" cy="128" r="4.5" fill="#11111b"/>
+
+  </g>
+</svg>

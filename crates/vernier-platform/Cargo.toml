@@ -1,9 +1,12 @@
 [package]
-name = "vernier-platform"
+name = "vernier-rs-platform"
+description = "Platform abstraction and native overlay backends (macOS, Linux/Wayland) for Vernier."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]

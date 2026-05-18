@@ -3674,7 +3674,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vernier-app"
+name = "vernier-rs"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -3683,13 +3683,13 @@ dependencies = [
  "image",
  "libc",
  "log",
- "vernier-core",
- "vernier-platform",
- "vernier-ui",
+ "vernier-rs-core",
+ "vernier-rs-platform",
+ "vernier-rs-ui",
 ]
 
 [[package]]
-name = "vernier-core"
+name = "vernier-rs-core"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -3700,7 +3700,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vernier-platform"
+name = "vernier-rs-platform"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -3729,12 +3729,12 @@ dependencies = [
  "tokio",
  "tungstenite",
  "usvg",
- "vernier-core",
+ "vernier-rs-core",
  "wayland-client",
 ]
 
 [[package]]
-name = "vernier-ui"
+name = "vernier-rs-ui"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -3742,8 +3742,8 @@ dependencies = [
  "egui",
  "log",
  "rfd",
- "vernier-core",
- "vernier-platform",
+ "vernier-rs-core",
+ "vernier-rs-platform",
 ]
 
 [[package]]

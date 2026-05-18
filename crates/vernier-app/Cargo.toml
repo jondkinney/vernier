@@ -1,10 +1,15 @@
 [package]
-name = "vernier-app"
+name = "vernier-rs"
+description = "Native pixel-measurement screen overlay for macOS and Linux/Wayland. Fast, built in Rust. Installs the `vernier` binary."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
+keywords = ["measurement", "overlay", "ruler", "wayland", "screenshot"]
+categories = ["gui"]
 
 [[bin]]
 name = "vernier"

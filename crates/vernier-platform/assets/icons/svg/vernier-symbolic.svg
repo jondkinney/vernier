@@ -1,0 +1,30 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Upper-left arm of V — dashed pattern creates negative-space "tick" gaps
+    in the outline itself. Three 1-unit gaps split the line into four short
+    visible segments, suggesting scale graduations on the left side.
+
+    Butt linecap keeps the gap edges crisp (round caps would extend into
+    and visually fill the gaps).
+
+    Pattern math: arm length ≈ 12 units along the line.
+      4 visible segments × 2.25 + 3 gaps × 1.0 = 9 + 3 = 12 ✓
+  -->
+  <path d="M 1.25,1.25 L 6.625,12"
+        stroke="currentColor" stroke-width="2.5"
+        stroke-linecap="butt"
+        stroke-dasharray="2.25 1"/>
+
+  <!-- Lower-left arm + apex + right arm (solid, round caps as before) -->
+  <path d="M 6.625,12 L 12,22.75 L 22.75,1.25"
+        stroke="currentColor" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Full-extent vertical crosshair -->
+  <line x1="12" y1="1.5" x2="12" y2="22.5"
+        stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+
+  <!-- Full-extent horizontal crosshair -->
+  <line x1="1.5" y1="12" x2="22.5" y2="12"
+        stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+</svg>
