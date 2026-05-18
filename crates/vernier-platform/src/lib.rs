@@ -21,6 +21,14 @@ pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
     icon::render_app_icon_rgba(size)
 }
 
+/// The raw colored app-icon SVG, for writing into the `scalable/`
+/// branch of an XDG hicolor icon theme. The bytes are embedded in
+/// this crate (`include_bytes!`), so this works from a crates.io
+/// install with no repo checkout present.
+pub fn app_icon_svg() -> &'static [u8] {
+    icon::app_icon_svg()
+}
+
 /// Rasterize an SVG (`svg_bytes`) into a `size × size` RGBA8
 /// non-premultiplied buffer, fitting the SVG into the square with
 /// uniform scaling. Returns `None` if the SVG can't be parsed or

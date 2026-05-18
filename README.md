@@ -40,6 +40,31 @@ Three flavors:
 paru -S vernier-bin    # or `yay -S vernier-bin`
 ```
 
+### Cargo (any Linux distro)
+
+For distros without a native package, install from crates.io:
+
+```bash
+cargo install vernier-rs    # compiles from source, installs the `vernier` binary
+```
+
+The crate is `vernier-rs` because the bare `vernier` name was already
+taken; the installed binary is still `vernier`. You need Rust 1.85+ and
+the system build/runtime libraries — `pkgconf` plus the `wayland`,
+`libxkbcommon`, `pipewire`, `fontconfig`, `freetype2` and `libglvnd`
+(OpenGL) dev packages (see *Build from source* for the exact Arch
+names; other distros name them similarly).
+
+The first time you run `vernier`, the daemon registers itself with
+your application launcher — it writes `vernier.desktop` and the icon
+theme under `~/.local/share`, no extra step needed. To register it
+*before* the first launch, run `vernier install-desktop`.
+
+`cargo install` can't pull in the optional capture/clipboard tools
+(`grim`, `slurp`, `wl-clipboard`, `libnotify`). Run `vernier doctor`
+to see which are missing — the related features degrade gracefully
+until you install them.
+
 ### Build from source
 
 Rust 1.85+ (stable). System packages on Arch:

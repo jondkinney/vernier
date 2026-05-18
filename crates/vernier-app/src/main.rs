@@ -73,6 +73,16 @@ enum Cmd {
     /// Tell the running daemon to re-read its settings file. Sent
     /// automatically by the prefs window after each save.
     ReloadSettings,
+    /// Install the desktop entry and app icons into the XDG data
+    /// directory, then exit — without starting the daemon. The
+    /// daemon does this on every start anyway, so this is only
+    /// needed to register a freshly `cargo install`ed binary with
+    /// app launchers before its first run.
+    InstallDesktop,
+    /// Report which optional external tools Vernier relies on
+    /// (grim, slurp, wl-clipboard, libnotify) and whether a
+    /// `GlobalShortcuts` portal backend is installed.
+    Doctor,
 }
 
 fn main() -> Result<()> {
@@ -95,6 +105,8 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
+        Some(Cmd::InstallDesktop) => run_install_desktop(),
+        Some(Cmd::Doctor) => run_doctor(),
         None => {
             // If a daemon is already running, treat the bare invocation
             // as "open prefs" — matches the launcher / desktop-entry
@@ -268,7 +280,7 @@ fn run_daemon() -> Result<()> {
             Settings::default()
         }
     };
-    let icon_path = match ensure_app_icon_png() {
+    let icon_path = match ensure_app_icons() {
         Ok(p) => Some(p),
         Err(e) => {
             log::warn!("app icon: {e:#}");
@@ -281,6 +293,8 @@ fn run_daemon() -> Result<()> {
     ensure_application_desktop_file(icon_path.as_deref()).unwrap_or_else(|e| {
         log::warn!("desktop entry: {e:#}");
     });
+    #[cfg(target_os = "linux")]
+    warn_missing_optional_tools();
     replace_settings(initial_settings.clone());
 
     let (platform, platform_events) = vernier_platform::init()?;
@@ -3368,21 +3382,35 @@ fn xdg_data_dir() -> Result<PathBuf> {
         .context("no XDG_DATA_HOME or HOME")
 }
 
-/// Drop the procedural app icon onto disk under the XDG hicolor
-/// theme (256×256 PNG). Both desktop entries reference it as
-/// `Icon=vernier`, so launchers (walker, rofi, GNOME activities)
-/// resolve it via the standard icon-theme lookup. Returns the
-/// installed path so callers can also use it as an absolute Icon=
-/// fallback.
-fn ensure_app_icon_png() -> Result<PathBuf> {
-    let dir = xdg_data_dir()?.join("icons/hicolor/256x256/apps");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join("vernier.png");
-    let rgba = vernier_platform::render_app_icon_rgba(256);
-    let img = image::RgbaImage::from_raw(256, 256, rgba)
-        .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw"))?;
-    img.save(&path).with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+/// PNG sizes dropped into the XDG hicolor theme. Mirrors the set
+/// the AUR package installs from the repo-root `assets/icons/hicolor`
+/// tree, so a `cargo install`ed binary integrates identically.
+const APP_ICON_SIZES: &[u32] = &[16, 22, 24, 32, 48, 64, 128, 256, 512];
+
+/// Drop the procedural app icon into the XDG hicolor theme: a PNG at
+/// each size in [`APP_ICON_SIZES`] under `<size>x<size>/apps/`, plus
+/// the scalable SVG under `scalable/apps/`. Both desktop entries
+/// reference `Icon=` by the absolute 256×256 path (returned here),
+/// so launchers resolve it even on systems without an `index.theme`;
+/// the rest of the tree lets theme-aware launchers pick a crisper
+/// size. Idempotent — overwritten on every daemon start.
+fn ensure_app_icons() -> Result<PathBuf> {
+    let hicolor = xdg_data_dir()?.join("icons/hicolor");
+    for &size in APP_ICON_SIZES {
+        let dir = hicolor.join(format!("{size}x{size}/apps"));
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join("vernier.png");
+        let rgba = vernier_platform::render_app_icon_rgba(size);
+        let img = image::RgbaImage::from_raw(size, size, rgba)
+            .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw ({size}px)"))?;
+        img.save(&path).with_context(|| format!("write {}", path.display()))?;
+    }
+    let svg_dir = hicolor.join("scalable/apps");
+    std::fs::create_dir_all(&svg_dir).with_context(|| format!("create {}", svg_dir.display()))?;
+    let svg_path = svg_dir.join("vernier.svg");
+    std::fs::write(&svg_path, vernier_platform::app_icon_svg())
+        .with_context(|| format!("write {}", svg_path.display()))?;
+    Ok(hicolor.join("256x256/apps/vernier.png"))
 }
 
 /// Write the application desktop entry (`vernier.desktop`) to
@@ -3428,6 +3456,168 @@ fn ensure_application_desktop_file(icon_path: Option<&Path>) -> Result<()> {
 fn icon_path_for_desktop_entries() -> Option<PathBuf> {
     let p = xdg_data_dir().ok()?.join("icons/hicolor/256x256/apps/vernier.png");
     if p.exists() { Some(p) } else { None }
+}
+
+/// `install-desktop` subcommand: drop the app icons + desktop entry
+/// into `$XDG_DATA_HOME` and exit, without starting the daemon. The
+/// daemon does this on every start, so this only matters for a
+/// freshly `cargo install`ed binary the user hasn't run yet — it
+/// makes Vernier show up in app launchers before its first launch.
+fn run_install_desktop() -> Result<()> {
+    let icon = ensure_app_icons().context("install app icons")?;
+    ensure_application_desktop_file(Some(&icon)).context("install desktop entry")?;
+    let data = xdg_data_dir()?;
+    println!("Installed Vernier desktop integration:");
+    println!(
+        "  desktop entry  {}",
+        data.join("applications/vernier.desktop").display()
+    );
+    println!("  icons          {}/", data.join("icons/hicolor").display());
+    println!();
+    println!("Vernier should now appear in your application launcher.");
+    Ok(())
+}
+
+/// An external CLI tool Vernier shells out to for an optional
+/// feature. Absence degrades that feature gracefully rather than
+/// breaking the daemon, so these are reported, never required.
+#[cfg(target_os = "linux")]
+struct OptionalTool {
+    /// Executable name looked up on `$PATH`.
+    binary: &'static str,
+    /// Arch package that provides it (names vary on other distros).
+    arch_pkg: &'static str,
+    /// What stops working when it's missing.
+    enables: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+const OPTIONAL_TOOLS: &[OptionalTool] = &[
+    OptionalTool {
+        binary: "grim",
+        arch_pkg: "grim",
+        enables: "screenshot capture of held-rect regions",
+    },
+    OptionalTool {
+        binary: "slurp",
+        arch_pkg: "slurp",
+        enables: "region selection for the external-screenshot shortcut",
+    },
+    OptionalTool {
+        binary: "wl-copy",
+        arch_pkg: "wl-clipboard",
+        enables: "copying screenshots / measurements to the clipboard",
+    },
+    OptionalTool {
+        binary: "notify-send",
+        arch_pkg: "libnotify",
+        enables: "post-capture notifications",
+    },
+];
+
+/// True if `name` resolves to an executable file on `$PATH`.
+#[cfg(target_os = "linux")]
+fn binary_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        std::fs::metadata(dir.join(name))
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Whether any installed `*.portal` file advertises the
+/// `GlobalShortcuts` interface. A filesystem probe of the XDG data
+/// dirs — cheaper than a D-Bus round-trip, and enough to tell the
+/// user whether a capable portal backend is installed.
+#[cfg(target_os = "linux")]
+fn global_shortcuts_portal_present() -> bool {
+    let dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    dirs.split(':')
+        .map(|d| PathBuf::from(d).join("xdg-desktop-portal/portals"))
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "portal").unwrap_or(false))
+        .any(|e| {
+            std::fs::read_to_string(e.path())
+                .map(|c| c.contains("GlobalShortcuts"))
+                .unwrap_or(false)
+        })
+}
+
+/// Log a single warning naming any optional tools missing from
+/// `$PATH`, so a `cargo install`ed binary on a bare system surfaces
+/// the gap instead of silently dropping features. Called once on
+/// daemon start.
+#[cfg(target_os = "linux")]
+fn warn_missing_optional_tools() {
+    let missing: Vec<&str> = OPTIONAL_TOOLS
+        .iter()
+        .filter(|t| !binary_on_path(t.binary))
+        .map(|t| t.binary)
+        .collect();
+    if !missing.is_empty() {
+        log::warn!(
+            "optional tools not on PATH: {} — related capture/clipboard/\
+             notification features are disabled; run `vernier doctor` for details",
+            missing.join(", ")
+        );
+    }
+}
+
+/// `doctor` subcommand: probe for the optional external tools and
+/// the `GlobalShortcuts` portal, then print a report. Everything it
+/// checks degrades gracefully, so it always exits 0 — it's a hint,
+/// not a gate.
+#[cfg(target_os = "linux")]
+fn run_doctor() -> Result<()> {
+    println!("Vernier optional-dependency check\n");
+    let mut missing = 0;
+    for t in OPTIONAL_TOOLS {
+        if binary_on_path(t.binary) {
+            println!("  ok       {:<12} {}", t.binary, t.enables);
+        } else {
+            missing += 1;
+            println!("  MISSING  {:<12} {}", t.binary, t.enables);
+            println!(
+                "           → install `{}` (Arch; package name varies by distro)",
+                t.arch_pkg
+            );
+        }
+    }
+    if global_shortcuts_portal_present() {
+        println!("  ok       {:<12} GlobalShortcuts portal (compositor-agnostic hotkey)", "portal");
+    } else {
+        missing += 1;
+        println!("  MISSING  {:<12} no GlobalShortcuts portal backend detected", "portal");
+        println!("           → install an xdg-desktop-portal backend implementing");
+        println!("             GlobalShortcuts, e.g. xdg-desktop-portal-hyprland");
+        println!("             (not needed on Hyprland — Vernier binds the key directly)");
+    }
+    println!();
+    if missing == 0 {
+        println!("All optional tools present.");
+    } else {
+        println!(
+            "{missing} item(s) missing — the related features stay disabled until installed."
+        );
+    }
+    Ok(())
+}
+
+/// macOS / other: capture, clipboard and hotkeys all go through
+/// native APIs, so there are no optional CLI tools to check.
+#[cfg(not(target_os = "linux"))]
+fn run_doctor() -> Result<()> {
+    println!(
+        "On this platform Vernier uses native capture APIs — no optional CLI tools to check."
+    );
+    Ok(())
 }
 
 /// Write or remove `~/.config/autostart/vernier.desktop` depending

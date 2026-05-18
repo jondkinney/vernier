@@ -18,6 +18,13 @@ pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
     rasterize_or_transparent(APP_ICON_SVG, size)
 }
 
+/// The raw colored app-icon SVG. Consumers that install icons into
+/// an XDG hicolor theme write this verbatim to `scalable/apps/` so
+/// theme-aware launchers get a resolution-independent icon.
+pub fn app_icon_svg() -> &'static [u8] {
+    APP_ICON_SVG
+}
+
 /// Render the monochrome tray/menubar icon at `size × size`. The
 /// source SVG uses `currentColor`; substitute white so it reads
 /// against the dark waybar background most distros ship.
