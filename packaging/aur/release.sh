@@ -147,7 +147,14 @@ say "Cargo.toml currently at $CUR_VER → bumping to $NEW_VER"
 #--- bump Cargo.toml + refresh Cargo.lock --------------------------------------
 
 if (( ! DRY_RUN )); then
+    # [workspace.package] version — the first `version = "..."` line.
     sed -i -E "0,/^version = \"[0-9.]+\"$/{s//version = \"$NEW_VER\"/}" Cargo.toml
+    # [workspace.dependencies] version pins on the in-workspace path
+    # deps (the `vernier-rs-*` lines). A crate published at $NEW_VER
+    # must require its siblings at $NEW_VER too — a stale pin lets the
+    # published manifest resolve an older sibling that may lack APIs
+    # this version depends on.
+    sed -i -E "/package = \"vernier-rs-/ s/version = \"[^\"]+\"/version = \"$NEW_VER\"/" Cargo.toml
 fi
 # Build so Cargo.lock picks up the bumped workspace version and a
 # broken release-profile compile is caught before we tag. The shipped
