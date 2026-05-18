@@ -24,9 +24,9 @@
 # checksum describing a file nobody downloads.
 #
 # Usage:
-#   packaging/aur/release.sh 0.2.0
-#   packaging/aur/release.sh 0.2.0 --dry-run
-#   packaging/aur/release.sh 0.2.0 --skip-push
+#   packaging/release.sh 0.2.0
+#   packaging/release.sh 0.2.0 --dry-run
+#   packaging/release.sh 0.2.0 --skip-push
 #
 # Flags:
 #   --dry-run     print every step but don't touch anything

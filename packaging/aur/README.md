@@ -17,11 +17,12 @@ so changes can land here first, be tested, and only then be pushed.
 
 ## Releasing a new version
 
-One command does all of it — bump, build, tag, push, GitHub Release with
-the prebuilt asset, AUR sync for all three variants:
+`packaging/release.sh` does all of it in one command: bump, build,
+tag, push, GitHub Release (CI builds + uploads the binaries), AUR
+sync for all three variants, and the crates.io publish:
 
 ```sh
-packaging/aur/release.sh 0.2.0
+packaging/release.sh 0.2.0
 ```
 
 Flags:
