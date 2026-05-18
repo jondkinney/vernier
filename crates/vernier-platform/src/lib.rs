@@ -255,6 +255,67 @@ pub fn focus_macos_app_by_pid(pid: i32) {
     }
 }
 
+/// Start an asynchronous probe of whether *this* process is authorized
+/// to capture the screen — the macOS Screen Recording ("Screen &
+/// System Audio Recording") grant.
+///
+/// Returns immediately with a `Receiver` that yields exactly one
+/// `bool`. On macOS the probe goes through ScreenCaptureKit's
+/// `SCShareableContent` (see `macos::screen_recording`) — the only API
+/// that reports the grant truthfully. `CGPreflightScreenCaptureAccess`
+/// and the CoreGraphics capture calls all return false positives when
+/// the grant is missing (verified on macOS 15 against a real `tccutil
+/// reset ScreenCapture`). Because `SCShareableContent` is asynchronous,
+/// the result lands on the channel a short time after this call.
+///
+/// On every other platform there is no equivalent permission — capture
+/// works unconditionally — so the channel immediately yields `true`,
+/// and callers treat that as "nothing to warn about".
+///
+/// Without the grant `CGDisplayCreateImage` / `CGWindowListCreateImage`
+/// hand back degraded frames and edge detection, the freeze-screen
+/// background, and screenshots all stop working — hence the prefs
+/// banner this drives. The grant is keyed on the app's code signature,
+/// so an ad-hoc rebuild changes the cdhash and can silently invalidate
+/// a previously-granted permission — exactly when the banner earns its
+/// keep.
+pub fn probe_screen_recording() -> std::sync::mpsc::Receiver<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::probe_screen_recording()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send(true);
+        rx
+    }
+}
+
+/// Open System Settings at Privacy & Security → Screen & System Audio
+/// Recording, so the user can grant Vernier the capture permission.
+/// macOS-only; a no-op elsewhere (the banner that calls this never
+/// shows on other platforms because [`screen_recording_authorized`]
+/// is always `true` there).
+pub fn open_screen_recording_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        // `open` resolves the `x-apple.systempreferences:` scheme to
+        // System Settings and deep-links to the named privacy anchor.
+        // `Privacy_ScreenCapture` is the Screen & System Audio
+        // Recording pane.
+        if let Err(e) = std::process::Command::new("open")
+            .arg(
+                "x-apple.systempreferences:com.apple.preference.security\
+                 ?Privacy_ScreenCapture",
+            )
+            .spawn()
+        {
+            log::warn!("open_screen_recording_settings: spawn `open` failed: {e}");
+        }
+    }
+}
+
 /// OS abstraction. Returned by [`init`] and shared between threads.
 pub trait Platform: Send + Sync {
     /// All connected monitors.

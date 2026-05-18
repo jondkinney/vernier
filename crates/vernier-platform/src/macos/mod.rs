@@ -35,11 +35,13 @@ mod hotkey;
 mod keymap;
 mod monitor;
 mod overlay;
+mod screen_recording;
 mod tray;
 
 pub use app::bootstrap_main;
 pub use handoff_icon::extract_macos_app_icon_rgba;
 pub use monitor::primary_screen_visible_height;
+pub(crate) use screen_recording::probe_screen_recording;
 
 /// Main-thread-only registry. Owns every retained AppKit object
 /// the backend creates. Accessed via [`with_main_state`] from
