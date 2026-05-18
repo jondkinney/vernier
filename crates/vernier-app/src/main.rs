@@ -3840,18 +3840,26 @@ fn current_toggle_accel() -> Option<Accelerator> {
     Accelerator::parse(&s.shortcuts.toggle)
 }
 
+/// Whether a Hyprland socket is live. A unix socket *file* lingers
+/// on disk after its listener process exits, so presence is not
+/// liveness — only a successful connect proves the instance is up.
+fn hypr_socket_live(sock: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
 /// Locate the live Hyprland instance: prefer `HYPRLAND_INSTANCE_SIGNATURE`
-/// from our process env when its `.socket2.sock` still exists; otherwise
-/// fall back to the most recently-modified instance directory under
-/// `$XDG_RUNTIME_DIR/hypr/`. The fallback handles the case where Hyprland
-/// restarted while our daemon kept running, leaving a stale env var.
-/// Returns `(signature, path/to/.socket2.sock)`.
+/// from our process env when its `.socket2.sock` still accepts a
+/// connection; otherwise fall back to the most recently-modified
+/// instance directory under `$XDG_RUNTIME_DIR/hypr/` whose socket is
+/// live. The fallback handles the case where Hyprland restarted while
+/// our daemon kept running, leaving a stale env var (and a stale
+/// socket file on disk). Returns `(signature, path/to/.socket2.sock)`.
 fn current_hyprland_instance() -> Option<(String, PathBuf)> {
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
     let hypr_dir = xdg.join("hypr");
     if let Some(sig_os) = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE") {
         let sock = hypr_dir.join(&sig_os).join(".socket2.sock");
-        if sock.exists() {
+        if hypr_socket_live(&sock) {
             return Some((sig_os.to_string_lossy().into_owned(), sock));
         }
     }
@@ -3859,7 +3867,7 @@ fn current_hyprland_instance() -> Option<(String, PathBuf)> {
     for entry in std::fs::read_dir(&hypr_dir).ok()?.flatten() {
         let dir = entry.path();
         let sock = dir.join(".socket2.sock");
-        if !sock.exists() {
+        if !hypr_socket_live(&sock) {
             continue;
         }
         let mtime = match entry.metadata().and_then(|m| m.modified()) {
