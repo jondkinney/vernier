@@ -17,6 +17,10 @@
 #   5. Syncs PKGBUILD + .SRCINFO to each of three AUR repos
 #      (ssh://aur@aur.archlinux.org/{vernier,vernier-bin,vernier-git}.git).
 #   6. Publishes the four crates to crates.io.
+#   7. Watches all four release workflows to completion and prints
+#      the all-platform status (plus a desktop notification when
+#      notify-send is available). A failed or missing workflow flips
+#      the exit code; it does not roll back the AUR / crates publish.
 #
 # The Linux tarballs are built by CI, never here: the release-x86_64
 # workflow re-uploads the x86_64 tarball with --clobber, so a tarball
@@ -107,6 +111,33 @@ wait_for_asset_sha() {
         sleep 30
     done
     return 1
+}
+
+# Watch the workflow run $TAG's release triggered for workflow file
+# $1 ('release-macos.yml' etc.); echo "success", a failing
+# conclusion, or "notfound". `gh run watch` blocks until the run
+# ends, so a run still in flight (the macOS build, a slow rerun) is
+# waited out here too.
+watch_release_run() {
+    local wf="$1" run_id="" attempt
+    # The release-event runs take a few seconds to register after
+    # `gh release create` — retry the lookup until one shows up.
+    for attempt in $(seq 1 24); do
+        run_id="$(gh run list --repo "$GH_REPO" --workflow "$wf" \
+                    --event release --limit 20 \
+                    --json databaseId,headBranch \
+                    --jq "map(select(.headBranch == \"$TAG\")) | .[0].databaseId" \
+                    2>/dev/null || true)"
+        [[ -n "$run_id" && "$run_id" != "null" ]] && break
+        run_id=""
+        sleep 5
+    done
+    [[ -n "$run_id" ]] || { echo "notfound"; return; }
+    if gh run watch "$run_id" --repo "$GH_REPO" --exit-status >/dev/null 2>&1; then
+        echo "success"
+    else
+        echo "failure"
+    fi
 }
 
 cd "$REPO_ROOT"
@@ -290,8 +321,53 @@ for crate in "${CRATES[@]}"; do
     run cargo publish -p "$crate"
 done
 
-say "done."
+#--- confirm every release workflow finished ----------------------------------
+
+# AUR + crates are done — the script's core job, and nothing below
+# rolls it back. But the release also fanned out four GitHub
+# workflows; only the x86_64 / aarch64 tarballs were waited on (to
+# pin their shas). Watch every run to its conclusion so the operator
+# sees the true all-platform status — including release-macos (whose
+# .dmg the script never needed) and release-update-site — without
+# leaving the terminal or opening the Actions tab.
+release_failed=""
+if (( DRY_RUN )); then
+    say "dry-run: skipping release-workflow confirmation"
+else
+    say "confirming release workflows — blocks until each ends (macOS is the long pole)"
+    echo
+    for wf in release-x86_64 release-aarch64 release-macos release-update-site; do
+        status="$(watch_release_run "$wf.yml")"
+        case "$status" in
+            success)
+                printf '   \033[1;32m✓\033[0m %s\n' "$wf" ;;
+            notfound)
+                printf '   \033[1;33m?\033[0m %s — no run found for %s\n' "$wf" "$TAG"
+                release_failed="$release_failed $wf(not-found)" ;;
+            *)
+                printf '   \033[1;31m✗\033[0m %s — concluded: %s\n' "$wf" "$status"
+                release_failed="$release_failed $wf" ;;
+        esac
+    done
+    echo
+    if command -v notify-send >/dev/null 2>&1; then
+        if [[ -z "$release_failed" ]]; then
+            notify-send "vernier $TAG released" \
+                "All four release workflows finished green." || true
+        else
+            notify-send -u critical "vernier $TAG — workflow failure" \
+                "Failed:$release_failed — see 'gh run list --repo $GH_REPO'." || true
+        fi
+    fi
+fi
+
 say "  https://aur.archlinux.org/packages/$PKGNAME"
 say "  https://aur.archlinux.org/packages/$PKGNAME-bin"
 say "  https://aur.archlinux.org/packages/$PKGNAME-git"
 say "  https://crates.io/crates/vernier-rs"
+
+if [[ -n "$release_failed" ]]; then
+    die "release incomplete — workflow(s) failed or missing:$release_failed
+   rerun a failed build with:  gh run rerun <run-id> --repo $GH_REPO"
+fi
+say "done — $TAG fully released on all platforms."
