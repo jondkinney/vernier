@@ -134,6 +134,21 @@ struct PrefsApp {
     /// IPC. `None` if the probe failed or the daemon is older than
     /// the `version` command. Refreshed alongside `daemon_alive`.
     daemon_build_id: Option<String>,
+    /// Cached macOS Screen Recording authorization — `false` drives
+    /// the permission banner shown above every pane. Starts optimistic
+    /// (`true`) and is corrected by the first async probe result a few
+    /// hundred ms after launch, so the common authorized case never
+    /// flashes a banner. Always ends up `true` on non-macOS platforms
+    /// (no such permission), so the banner is macOS-only in practice.
+    screen_recording_ok: bool,
+    /// In-flight ScreenCaptureKit authorization probe. `Some` while
+    /// awaiting a result — the probe is asynchronous (see
+    /// [`vernier_platform::probe_screen_recording`]). Re-armed every
+    /// few seconds so the banner tracks the grant in both directions.
+    screen_recording_probe: Option<Receiver<bool>>,
+    /// When the most recent authorization probe was started — gates
+    /// the re-probe cadence.
+    last_recording_probe: Instant,
 }
 
 impl PrefsApp {
@@ -204,6 +219,12 @@ impl PrefsApp {
             prefs_started_at: now,
             my_build_id: vernier_core::build_id(),
             daemon_build_id: None,
+            // Optimistic until the first async probe lands — avoids a
+            // banner flash on the common authorized path. `update`
+            // resolves the probe and re-arms it while unauthorized.
+            screen_recording_ok: true,
+            screen_recording_probe: Some(vernier_platform::probe_screen_recording()),
+            last_recording_probe: now,
         }
     }
 
@@ -273,6 +294,39 @@ impl App for PrefsApp {
             self.last_daemon_probe = Instant::now();
         }
         ctx.request_repaint_after(probe_interval);
+
+        // Resolve any in-flight Screen Recording authorization probe.
+        // ScreenCaptureKit answers asynchronously, so the result is
+        // picked up here rather than inline.
+        if let Some(rx) = &self.screen_recording_probe {
+            match rx.try_recv() {
+                Ok(authorized) => {
+                    if authorized != self.screen_recording_ok {
+                        log::info!(
+                            "prefs: screen-recording authorized -> {authorized}"
+                        );
+                    }
+                    self.screen_recording_ok = authorized;
+                    self.screen_recording_probe = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Probe dropped without a result — keep the last
+                    // known state; the re-arm below retries.
+                    self.screen_recording_probe = None;
+                }
+            }
+        }
+        // Re-arm the probe every few seconds so the banner tracks the
+        // grant both ways while prefs is open — appearing if the user
+        // revokes the permission, clearing once they grant it.
+        if self.screen_recording_probe.is_none()
+            && self.last_recording_probe.elapsed() > Duration::from_secs(3)
+        {
+            self.screen_recording_probe =
+                Some(vernier_platform::probe_screen_recording());
+            self.last_recording_probe = Instant::now();
+        }
 
         // While in shortcut-capture mode, drain key events from
         // egui's input queue (so other widgets don't act on them)
@@ -536,6 +590,66 @@ impl App for PrefsApp {
         if quit_requested {
             (self.on_quit)();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Screen Recording permission banner. Rendered as a top panel
+        // — independent of `self.section` — so it sits above every
+        // pane until the permission is granted. Without the grant
+        // `CGDisplayCreateImage` returns null and edge detection, the
+        // freeze-screen background, and screenshots all silently stop
+        // working. `screen_recording_ok` is always `true` on non-macOS
+        // (no such permission), so this panel never appears there.
+        if !self.screen_recording_ok {
+            egui::TopBottomPanel::top("screen_recording_banner")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(60, 32, 32))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(170, 80, 70),
+                        ))
+                        .inner_margin(egui::Margin::symmetric(20, 12)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ Screen Recording is off")
+                            .color(egui::Color32::from_rgb(255, 140, 120))
+                            .size(13.5)
+                            .strong(),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Vernier needs the Screen Recording permission to detect \
+                             edges, freeze the screen, and take screenshots. Until it's \
+                             granted, measure mode tracks the cursor but can't snap to \
+                             pixels.",
+                        )
+                        .color(egui::Color32::from_gray(210))
+                        .size(12.0),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Open System Settings").size(12.5),
+                        ))
+                        .clicked()
+                    {
+                        vernier_platform::open_screen_recording_settings();
+                    }
+                    ui.add_space(6.0);
+                    // A plain label (not nested in `ui.horizontal`, which
+                    // hands out unbounded width) so this wraps at the
+                    // panel edge instead of being clipped by the window.
+                    ui.label(
+                        egui::RichText::new(
+                            "Enable Vernier under Screen & System Audio Recording, \
+                             then quit and reopen Vernier.",
+                        )
+                        .color(egui::Color32::from_gray(150))
+                        .size(11.5),
+                    );
+                });
         }
 
         egui::CentralPanel::default()
