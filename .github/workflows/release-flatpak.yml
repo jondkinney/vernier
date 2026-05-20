@@ -1,10 +1,10 @@
 name: release-flatpak
 
 # Build the Flatpak bundle for vernier on every published Release.
-# Mirrors release-x86_64 / release-aarch64 — fires on the same
-# `release: published` event so the resulting bundle lands on the
-# same GitHub Release as the other platform artifacts. Also
-# exposed via workflow_dispatch for backfills and reruns.
+# Mirrors release.yml — fires on the same `release: published` event
+# so the resulting bundle lands on the same GitHub Release as the
+# other platform artifacts. Also exposed via workflow_dispatch for
+# backfills and reruns.
 #
 # Manifest lives at build-aux/com.usevernier.Vernier.yml.
 

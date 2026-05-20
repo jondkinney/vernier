@@ -15,9 +15,11 @@ is no release script to run.
      `vernier-rs-ui` to crates.io in dependency order;
    - creates the `vX.Y.Z` tag and the GitHub Release.
 4. The GitHub Release fires the packaging workflows automatically:
-   - `release-x86_64.yml` — Linux x86_64 tarball.
-   - `release-aarch64.yml` — Linux aarch64 tarball.
-   - `release-macos.yml` — signed/notarized aarch64 macOS DMG.
+   - `release.yml` — builds the Linux x86_64 tarball, the Linux
+     aarch64 tarball, and the signed/notarized aarch64 macOS DMG.
+     Each platform is a separate job; one failure doesn't block the
+     others.
+   - `release-flatpak.yml` — builds the Flatpak bundle.
    - `release-update-site.yml` — bumps the version on `usevernier.com`
      (the `vernier-site` repo).
    - `aur-publish.yml` — pushes all three AUR variants
@@ -56,7 +58,6 @@ existing release tag:
 
 ```sh
 gh workflow run aur-publish.yml -f tag=vX.Y.Z
-gh workflow run release-x86_64.yml -f tag=vX.Y.Z
-gh workflow run release-aarch64.yml -f tag=vX.Y.Z
-gh workflow run release-macos.yml -f tag=vX.Y.Z
+gh workflow run release.yml -f tag=vX.Y.Z
+gh workflow run release-flatpak.yml -f tag=vX.Y.Z
 ```

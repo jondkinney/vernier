@@ -1,0 +1,267 @@
+name: release
+run-name: "Release - ${{ github.event.release.tag_name || inputs.tag }}"
+
+# Fires when release-plz publishes a new GitHub Release. Builds every
+# platform artifact (Linux x86_64, Linux aarch64, macOS aarch64 DMG)
+# and uploads it to the same Release. Each job uploads its own
+# artifact via `gh release upload` so a failure in one platform
+# doesn't block the others — the AUR-bin / Flatpak workflows
+# poll for the assets they need.
+#
+# Flatpak builds live in release-flatpak.yml (same trigger).
+#
+# Exposed via workflow_dispatch so we can backfill an old tag if a
+# job was added later, or rerun a failed build without cutting a
+# new version.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.3.0)'
+        required: true
+        type: string
+
+jobs:
+  linux-x86_64:
+    name: Build x86_64 binary + upload to Release
+    runs-on: ubuntu-24.04
+    permissions:
+      # gh release upload writes to the release assets.
+      contents: write
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building for tag=$TAG version=$VERSION"
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libpipewire-0.3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        env:
+          # Mirror release.sh: strip workspace + cargo paths out of the
+          # binary so backtraces don't carry the runner's directory
+          # layout into the shipped artifact.
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=/home/runner/.cargo=/cargo
+        run: cargo build --release --bin vernier
+
+      - name: Stage prebuilt tarball
+        id: stage
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="vernier-${VERSION}-x86_64"
+          STAGE="$RUNNER_TEMP/$NAME"
+          install -d "$STAGE/icons"
+          install -m755 target/release/vernier      "$STAGE/vernier"
+          install -m644 packaging/vernier.desktop   "$STAGE/vernier.desktop"
+          install -m644 README.md                   "$STAGE/README.md"
+          install -m644 LICENSE-MIT                 "$STAGE/LICENSE-MIT"
+          install -m644 LICENSE-APACHE              "$STAGE/LICENSE-APACHE"
+          cp -r assets/icons/hicolor/.              "$STAGE/icons/"
+          # status/ icons stay out for the same reason as release.sh —
+          # SNI clients should fall through to icon_pixmap.
+          rm -rf "$STAGE"/icons/*/status
+          TARBALL="$RUNNER_TEMP/$NAME.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$TARBALL" "$NAME"
+          sha256sum "$TARBALL"
+          echo "path=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.stage.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  linux-aarch64:
+    name: Build aarch64 binary + upload to Release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building for tag=$TAG version=$VERSION"
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libpipewire-0.3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=/home/runner/.cargo=/cargo
+        run: cargo build --release --bin vernier
+
+      - name: Stage prebuilt tarball
+        id: stage
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="vernier-${VERSION}-aarch64"
+          STAGE="$RUNNER_TEMP/$NAME"
+          install -d "$STAGE/icons"
+          install -m755 target/release/vernier      "$STAGE/vernier"
+          install -m644 packaging/vernier.desktop   "$STAGE/vernier.desktop"
+          install -m644 README.md                   "$STAGE/README.md"
+          install -m644 LICENSE-MIT                 "$STAGE/LICENSE-MIT"
+          install -m644 LICENSE-APACHE              "$STAGE/LICENSE-APACHE"
+          cp -r assets/icons/hicolor/.              "$STAGE/icons/"
+          rm -rf "$STAGE"/icons/*/status
+          TARBALL="$RUNNER_TEMP/$NAME.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$TARBALL" "$NAME"
+          sha256sum "$TARBALL"
+          echo "path=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.stage.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  macos-aarch64:
+    name: Build aarch64 .app + DMG
+    # macos-latest is Apple Silicon (M-series) as of GitHub Actions
+    # 2024+. Pinning to the meta-tag avoids drift when Apple ships a
+    # new macOS major; the build is OS-version-agnostic.
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building for tag=$TAG version=$VERSION"
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install packaging tools
+        run: |
+          # create-dmg drives hdiutil + AppleScript to lay out the
+          # drag-to-Applications window. librsvg gives us a clean
+          # 1024px icon render from the source SVG (otherwise the
+          # 1024 slot would be a sips upscale of the 512 PNG).
+          brew install create-dmg librsvg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build --remap-path-prefix=/Users/runner/.cargo=/cargo
+        run: cargo build --release --bin vernier --target aarch64-apple-darwin
+
+      - name: Stage binary at target/release for packager
+        # package.sh reads target/release/vernier. With an explicit
+        # --target the binary lands under target/aarch64-apple-darwin/
+        # — symlink rather than copy so we keep one source of truth.
+        run: |
+          mkdir -p target/release
+          ln -sf "$PWD/target/aarch64-apple-darwin/release/vernier" target/release/vernier
+
+      - name: Build .app bundle + DMG
+        env:
+          # Signing/notarization secrets, consumed by
+          # packaging/macos/sign-and-notarize.sh. If any are unset
+          # the script no-ops and the build falls back to ad-hoc
+          # signing — useful for forks that haven't configured
+          # secrets yet.
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          VERNIER_SIGNING_PASSWORD: ${{ secrets.VERNIER_SIGNING_PASSWORD }}
+        run: ./packaging/macos/package.sh
+
+      - name: Verify bundle signature
+        run: codesign --verify --verbose=2 target/macos/Vernier.app
+
+      - name: Locate DMG
+        id: dmg
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          DMG="target/macos/Vernier-${VERSION}-aarch64.dmg"
+          if [ ! -f "$DMG" ]; then
+            echo "error: $DMG not found" >&2
+            ls -la target/macos/ >&2
+            exit 1
+          fi
+          shasum -a 256 "$DMG"
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.dmg.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
