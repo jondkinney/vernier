@@ -749,13 +749,15 @@ fn install_tracking_area(view: &OverlayView, size: objc2_foundation::NSSize) {
     // owner: &AnyObject; pass the view itself (it has the
     // mouseMoved/Entered/Exited methods we defined).
     let owner: &AnyObject = unsafe { &*((&**view) as *const NSView as *const AnyObject) };
-    let area: Retained<NSTrackingArea> = NSTrackingArea::initWithRect_options_owner_userInfo(
-        NSTrackingArea::alloc(),
-        rect,
-        options,
-        Some(owner),
-        None,
-    );
+    let area: Retained<NSTrackingArea> = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            rect,
+            options,
+            Some(owner),
+            None,
+        )
+    };
     view.addTrackingArea(&area);
 }
 

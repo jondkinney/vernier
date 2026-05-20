@@ -81,8 +81,10 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
         // The status-item button itself triggers `on_status_click`
         // when the user left-clicks. Menu items run through their
         // own per-item target/action.
-        button.setTarget(Some(&*target));
-        button.setAction(Some(sel!(onStatusClick:)));
+        unsafe {
+            button.setTarget(Some(&*target));
+            button.setAction(Some(sel!(onStatusClick:)));
+        }
 
         let ns_menu = build_menu(&menu, &target, mtm);
         status_item.setMenu(Some(&ns_menu));
@@ -124,16 +126,22 @@ fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: M
         TrayMenuItem::Action {
             id, label, enabled, ..
         } => {
-            let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(label),
-                Some(sel!(onMenuItem:)),
-                &NSString::from_str(""),
-            );
-            mi.setTarget(Some(target));
-            mi.setEnabled(*enabled);
-            mi.setRepresentedObject(Some(&NSString::from_str(id)));
-            parent.addItem(&mi);
+            // NSMenuItem's init / setTarget / setRepresentedObject are
+            // marked unsafe in objc2-app-kit; the safety contract is
+            // standard Cocoa "main thread + retain rules", which the
+            // surrounding tray-update path already upholds.
+            unsafe {
+                let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    Some(sel!(onMenuItem:)),
+                    &NSString::from_str(""),
+                );
+                mi.setTarget(Some(target));
+                mi.setEnabled(*enabled);
+                mi.setRepresentedObject(Some(&NSString::from_str(id)));
+                parent.addItem(&mi);
+            }
         }
         TrayMenuItem::Toggle {
             id,
@@ -141,33 +149,37 @@ fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: M
             enabled,
             checked,
         } => {
-            let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(label),
-                Some(sel!(onMenuItem:)),
-                &NSString::from_str(""),
-            );
-            mi.setTarget(Some(target));
-            mi.setEnabled(*enabled);
-            mi.setState(if *checked {
-                objc2_app_kit::NSControlStateValueOn
-            } else {
-                objc2_app_kit::NSControlStateValueOff
-            });
-            mi.setRepresentedObject(Some(&NSString::from_str(id)));
-            parent.addItem(&mi);
+            unsafe {
+                let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    Some(sel!(onMenuItem:)),
+                    &NSString::from_str(""),
+                );
+                mi.setTarget(Some(target));
+                mi.setEnabled(*enabled);
+                mi.setState(if *checked {
+                    objc2_app_kit::NSControlStateValueOn
+                } else {
+                    objc2_app_kit::NSControlStateValueOff
+                });
+                mi.setRepresentedObject(Some(&NSString::from_str(id)));
+                parent.addItem(&mi);
+            }
         }
         TrayMenuItem::Submenu {
             id: _,
             label,
             items,
         } => {
-            let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(label),
-                None,
-                &NSString::from_str(""),
-            );
+            let mi = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(label),
+                    None,
+                    &NSString::from_str(""),
+                )
+            };
             let submenu = NSMenu::new(mtm);
             for sub in items {
                 append_item(&submenu, sub, target, mtm);

@@ -108,22 +108,21 @@ pub(crate) fn capture_screen_native(monitor: MonitorId) -> Result<NativeFrame> {
         }
     };
 
-    let width = image.width() as u32;
-    let height = image.height() as u32;
-    let stride = image.bytes_per_row() as u32;
-    let bitmap = image.bitmap_info();
-    let alpha = image.alpha_info();
+    // CGImage::width / height / bytes_per_row / etc. are associated
+    // functions (not &self methods) that take `Option<&CGImage>` —
+    // pass `Some(&image)` and let CFRetained deref-coerce.
+    let width = CGImage::width(Some(&image)) as u32;
+    let height = CGImage::height(Some(&image)) as u32;
+    let stride = CGImage::bytes_per_row(Some(&image)) as u32;
+    let bitmap = CGImage::bitmap_info(Some(&image));
+    let alpha = CGImage::alpha_info(Some(&image));
     let format = pixel_format_from_cg(bitmap, alpha);
 
-    let provider_nn = image.data_provider().ok_or(PlatformError::Unsupported {
+    let provider = CGImage::data_provider(Some(&image)).ok_or(PlatformError::Unsupported {
         what: "macos: CGImage::data_provider returned null",
     })?;
-    // Borrow without retaining: provider is owned by the image and lives
-    // as long as `image` does. We only need the byte slice during this
-    // call.
-    let provider: &CGDataProvider = provider_nn.as_ref();
-    let data: CFRetained<objc2_core_foundation::CFData> =
-        provider.data().ok_or(PlatformError::Unsupported {
+    let data: CFRetained<objc2_core_foundation::CFData> = CGDataProvider::data(Some(&provider))
+        .ok_or(PlatformError::Unsupported {
             what: "macos: CGDataProvider::data returned null",
         })?;
     let len = data.length() as usize;
