@@ -1,0 +1,132 @@
+name: AUR publish
+
+# Publishes all three AUR variants after release-plz cuts a Release:
+#   - vernier      (source build from the GitHub source tarball)
+#   - vernier-bin  (prebuilt binaries from the Release assets)
+#   - vernier-git  (tracks main; pkgver() generated at build time)
+#
+# packaging/{aur,aur-bin,aur-git}/PKGBUILD are the source of truth.
+# This workflow pins per-release fields (pkgver, pkgrel, sha256sums),
+# regenerates .SRCINFO, and pushes to the matching AUR repo.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to the AUR (e.g. v0.3.0)'
+        required: true
+
+jobs:
+  aur:
+    name: Publish ${{ matrix.aur_pkg }} to the AUR
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - aur_pkg: vernier
+            pkgbuild_dir: aur
+            kind: source
+          - aur_pkg: vernier-bin
+            pkgbuild_dir: aur-bin
+            kind: bin
+          - aur_pkg: vernier-git
+            pkgbuild_dir: aur-git
+            kind: git
+    env:
+      AUR_PKG: ${{ matrix.aur_pkg }}
+      PKGBUILD_DIR: ${{ matrix.pkgbuild_dir }}
+      VARIANT_KIND: ${{ matrix.kind }}
+      GH_REPO: jondkinney/vernier
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Install tooling
+        run: pacman -Syu --noconfirm --needed git openssh pacman-contrib curl
+
+      - name: Publish to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+
+          # SSH access to the AUR. Inline `-o` flags via
+          # GIT_SSH_COMMAND so we don't depend on ~/.ssh/config being
+          # honored — accept-new TOFUs the AUR's host key on first
+          # connect.
+          install -dm700 /root/.ssh
+          echo "$AUR_SSH_KEY" > /root/.ssh/id_aur
+          chmod 600 /root/.ssh/id_aur
+          touch /root/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i /root/.ssh/id_aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/root/.ssh/known_hosts'
+
+          # Grab the PKGBUILD at the released tag.
+          git clone --depth 1 --branch "$TAG" "https://github.com/$GH_REPO.git" app
+
+          # Clone the AUR repo; init a fresh one if the package is new.
+          if ! git clone "ssh://aur@aur.archlinux.org/${AUR_PKG}.git" aur; then
+            mkdir -p aur
+            git -C aur init -q -b master
+            git -C aur remote add origin "ssh://aur@aur.archlinux.org/${AUR_PKG}.git"
+          fi
+
+          # Drop in the variant's PKGBUILD.
+          cp "app/packaging/${PKGBUILD_DIR}/PKGBUILD" aur/PKGBUILD
+
+          # Variant-specific version pin + tarball wait.
+          case "$VARIANT_KIND" in
+            source)
+              # Single tarball, sha refreshed below by updpkgsums.
+              sed -i "s/^pkgver=.*/pkgver=$ver/;s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+              ;;
+            bin)
+              # Multi-arch tarballs built in parallel by
+              # release-{x86_64,aarch64}.yml. Wait up to ~30 min for
+              # both to land on the GitHub Release before updpkgsums
+              # tries to fetch them.
+              sed -i "s/^pkgver=.*/pkgver=$ver/;s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+              x86_url="https://github.com/${GH_REPO}/releases/download/${TAG}/vernier-${ver}-x86_64.tar.gz"
+              arm_url="https://github.com/${GH_REPO}/releases/download/${TAG}/vernier-${ver}-aarch64.tar.gz"
+              for i in $(seq 1 90); do
+                if curl -sfIL -o /dev/null "$x86_url" && curl -sfIL -o /dev/null "$arm_url"; then
+                  echo "both binary tarballs present"
+                  break
+                fi
+                echo "waiting for binary tarballs (attempt $i/90)..."
+                sleep 20
+              done
+              ;;
+            git)
+              # Static pkgver= line is metadata only — the pkgver()
+              # function regenerates it at build time. Bump it to the
+              # new tag so the AUR page shows the current version.
+              # sha256sums=('SKIP'), so no updpkgsums needed.
+              sed -i "s/^pkgver=.*/pkgver=$ver/" aur/PKGBUILD
+              ;;
+          esac
+
+          # makepkg / updpkgsums refuse to run as root.
+          useradd -m builder
+          chown -R builder:builder aur
+
+          case "$VARIANT_KIND" in
+            source|bin)
+              sudo -H -u builder bash -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+              ;;
+            git)
+              sudo -H -u builder bash -c 'cd aur && makepkg --printsrcinfo > .SRCINFO'
+              ;;
+          esac
+
+          # Commit + push (no-op if nothing changed — vernier-git's
+          # static pkgver may already be current, etc.).
+          git config --global --add safe.directory "$PWD/aur"
+          cd aur
+          git config user.name 'vernier release'
+          git config user.email 'release@users.noreply.github.com'
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git commit -m "Update to $ver"
+          git push --quiet -u origin master
