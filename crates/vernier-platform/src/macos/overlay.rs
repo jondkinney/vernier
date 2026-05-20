@@ -71,7 +71,7 @@ pub(crate) fn create(monitor: MonitorId) -> Result<OverlayHandle> {
         };
 
         window.setOpaque(false);
-        let clear = unsafe { NSColor::clearColor() };
+        let clear = NSColor::clearColor();
         window.setBackgroundColor(Some(&clear));
         // Above normal/floating app windows, below pop-up menus
         // (101) and the menu bar (24-25) so the user can still
@@ -219,7 +219,11 @@ impl OverlayOps for MacOverlay {
                         let mtm =
                             MainThreadMarker::new().expect("set_input_capturing on main thread");
                         let app = NSApplication::sharedApplication(mtm);
-                        app.activateIgnoringOtherApps(true);
+                        // `activate()` supersedes `activateIgnoringOtherApps(true)`
+                        // as of macOS 14 — the new method always activates
+                        // unconditionally (the old `false` variant was the
+                        // odd one out and is gone).
+                        app.activate();
                         o.window.makeKeyAndOrderFront(None);
                         o.window.makeFirstResponder(Some(&o.view));
                         let was_hidden = *o.view.ivars().cursor_hidden.borrow();
@@ -237,7 +241,7 @@ impl OverlayOps for MacOverlay {
                             // those briefly block the main thread,
                             // and without a sticky hide the cursor
                             // would pop visible during the block.
-                            unsafe { NSCursor::hide() };
+                            NSCursor::hide();
                         }
                     } else {
                         let was_hidden = *o.view.ivars().cursor_hidden.borrow();
@@ -250,7 +254,7 @@ impl OverlayOps for MacOverlay {
                             // permanently hidden — guarded by the
                             // `was_hidden` check so we only call this
                             // when there's a hide to balance.
-                            unsafe { NSCursor::unhide() };
+                            NSCursor::unhide();
                         }
                     }
                 }
@@ -351,7 +355,7 @@ impl OverlayOps for MacOverlay {
                         // stays invisible. show_cursor_on then sets
                         // the shape (arrow or pointing-hand) that the
                         // newly-visible cursor takes.
-                        unsafe { NSCursor::unhide() };
+                        NSCursor::unhide();
                         show_cursor_on(&o.view);
                     } else if !visible && !was_hidden {
                         *o.view.ivars().cursor_hidden.borrow_mut() = true;
@@ -360,7 +364,7 @@ impl OverlayOps for MacOverlay {
                         // even on monitors / windows where AppKit's
                         // cursor-rect arbitration has lost track of
                         // our transparent cursor.
-                        unsafe { NSCursor::hide() };
+                        NSCursor::hide();
                         hide_cursor_on(&o.view);
                     }
                 }
@@ -477,16 +481,14 @@ define_class!(
         fn draw_rect(&self, _dirty: NSRect) {
             let bounds = self.bounds();
             let tint = *self.ivars().tint.borrow();
-            unsafe {
-                let color = NSColor::colorWithCalibratedRed_green_blue_alpha(
-                    tint.r as f64 / 255.0,
-                    tint.g as f64 / 255.0,
-                    tint.b as f64 / 255.0,
-                    tint.a as f64 / 255.0,
-                );
-                color.setFill();
-                objc2_app_kit::NSRectFill(bounds);
-            }
+            let color = NSColor::colorWithCalibratedRed_green_blue_alpha(
+                tint.r as f64 / 255.0,
+                tint.g as f64 / 255.0,
+                tint.b as f64 / 255.0,
+                tint.a as f64 / 255.0,
+            );
+            color.setFill();
+            objc2_app_kit::NSRectFill(bounds);
             // Paint, bottom to top:
             //   1. tint (filled above)
             //   2. freeze-screen background (if any)
@@ -546,7 +548,7 @@ define_class!(
         fn cursor_update(&self, _event: &NSEvent) {
             if *self.ivars().cursor_hidden.borrow() {
                 let cursor = transparent_cursor(self);
-                unsafe { cursor.set() };
+                cursor.set();
             }
         }
         // AppKit polls this whenever the cursor rects need to be
@@ -561,7 +563,7 @@ define_class!(
             if *self.ivars().cursor_hidden.borrow() {
                 let bounds = self.bounds();
                 let cursor = transparent_cursor(self);
-                unsafe { self.addCursorRect_cursor(bounds, &cursor) };
+                self.addCursorRect_cursor(bounds, &cursor);
             }
         }
     }
@@ -651,7 +653,7 @@ const NS_FLAG_OPTION: u64 = 1 << 19;
 const NS_FLAG_COMMAND: u64 = 1 << 20;
 
 fn forward_flags_changed(view: &OverlayView, event: &NSEvent) {
-    let flags: u64 = unsafe { event.modifierFlags() }.0 as u64;
+    let flags: u64 = event.modifierFlags().0 as u64;
     let prev = *view.ivars().last_flags.borrow();
     *view.ivars().last_flags.borrow_mut() = flags;
     let monitor = view.ivars().monitor;
@@ -686,9 +688,9 @@ fn forward_flags_changed(view: &OverlayView, event: &NSEvent) {
 
 fn forward_key(view: &OverlayView, event: &NSEvent, pressed: bool) {
     let monitor = view.ivars().monitor;
-    let vkey = unsafe { event.keyCode() };
-    let is_repeat = pressed && unsafe { event.isARepeat() };
-    let keysym = vkey_to_xkb_keysym(vkey as u16);
+    let vkey = event.keyCode();
+    let is_repeat = pressed && event.isARepeat();
+    let keysym = vkey_to_xkb_keysym(vkey);
     if keysym == 0 {
         return;
     }
@@ -706,7 +708,7 @@ fn forward_key(view: &OverlayView, event: &NSEvent, pressed: bool) {
 /// coordinates (origin bottom-left, points). Returns None only if
 /// the call isn't safe to make (e.g. early shutdown).
 fn current_cursor_xy() -> Option<(f64, f64)> {
-    let p = unsafe { objc2_app_kit::NSEvent::mouseLocation() };
+    let p = objc2_app_kit::NSEvent::mouseLocation();
     Some((p.x, p.y))
 }
 
@@ -747,20 +749,18 @@ fn install_tracking_area(view: &OverlayView, size: objc2_foundation::NSSize) {
     // owner: &AnyObject; pass the view itself (it has the
     // mouseMoved/Entered/Exited methods we defined).
     let owner: &AnyObject = unsafe { &*((&**view) as *const NSView as *const AnyObject) };
-    let area: Retained<NSTrackingArea> = unsafe {
-        NSTrackingArea::initWithRect_options_owner_userInfo(
-            NSTrackingArea::alloc(),
-            rect,
-            options,
-            Some(owner),
-            None,
-        )
-    };
+    let area: Retained<NSTrackingArea> = NSTrackingArea::initWithRect_options_owner_userInfo(
+        NSTrackingArea::alloc(),
+        rect,
+        options,
+        Some(owner),
+        None,
+    );
     view.addTrackingArea(&area);
 }
 
 fn surface_local_point(view: &OverlayView, event: &NSEvent) -> (f64, f64) {
-    let p_window = unsafe { event.locationInWindow() };
+    let p_window = event.locationInWindow();
     let p_view = view.convertPoint_fromView(p_window, None);
     let height = view.bounds().size.height;
     (p_view.x, height - p_view.y)
@@ -784,26 +784,26 @@ fn surface_local_point(view: &OverlayView, event: &NSEvent) -> (f64, f64) {
 /// `cursor_hidden`. Does NOT re-enter the main-thread state.
 fn hide_cursor_on(view: &OverlayView) {
     if let Some(window) = view.window() {
-        unsafe { window.invalidateCursorRectsForView(view) };
+        window.invalidateCursorRectsForView(view);
     }
     // Also nudge the current cursor immediately so the user
     // doesn't wait for the next mouse-move to see the change.
     let cursor = transparent_cursor(view);
-    unsafe { cursor.set() };
+    cursor.set();
 }
 
 fn show_cursor_on(view: &OverlayView) {
     use objc2_app_kit::NSCursor;
     if let Some(window) = view.window() {
-        unsafe { window.invalidateCursorRectsForView(view) };
+        window.invalidateCursorRectsForView(view);
     }
     let pointing = *view.ivars().pointing_hand.borrow();
     let cursor = if pointing {
-        unsafe { NSCursor::pointingHandCursor() }
+        NSCursor::pointingHandCursor()
     } else {
-        unsafe { NSCursor::arrowCursor() }
+        NSCursor::arrowCursor()
     };
-    unsafe { cursor.set() };
+    cursor.set();
 }
 
 /// Build (once per view) and `.set()` a 16x16 fully transparent
@@ -820,9 +820,9 @@ fn transparent_cursor(view: &OverlayView) -> Retained<objc2_app_kit::NSCursor> {
         width: 16.0,
         height: 16.0,
     };
-    let image = unsafe { NSImage::initWithSize(NSImage::alloc(), size) };
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
     let hot = NSPoint { x: 0.0, y: 0.0 };
-    let cursor = unsafe { NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, hot) };
+    let cursor = NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, hot);
     *view.ivars().transparent_cursor.borrow_mut() = Some(cursor.clone());
     cursor
 }
@@ -913,10 +913,10 @@ fn cgimage_from_rgba(
 fn draw_hud_image(bounds: NSRect, image: &CFRetained<CGImage>) {
     use objc2_app_kit::NSGraphicsContext;
     use objc2_core_foundation::CGRect as CFRect;
-    let Some(ctx) = (unsafe { NSGraphicsContext::currentContext() }) else {
+    let Some(ctx) = NSGraphicsContext::currentContext() else {
         return;
     };
-    let cg_ctx = unsafe { ctx.CGContext() };
+    let cg_ctx = ctx.CGContext();
     let rect = CFRect {
         origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
         size: objc2_core_foundation::CGSize {
@@ -924,7 +924,5 @@ fn draw_hud_image(bounds: NSRect, image: &CFRetained<CGImage>) {
             height: bounds.size.height,
         },
     };
-    unsafe {
-        objc2_core_graphics::CGContext::draw_image(Some(&cg_ctx), rect, Some(image));
-    }
+    objc2_core_graphics::CGContext::draw_image(Some(&cg_ctx), rect, Some(image));
 }

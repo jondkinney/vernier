@@ -3,7 +3,7 @@
 use crate::{AppIdentity, MonitorId, MonitorInfo, PlatformError, Rect, Result};
 
 pub(crate) fn monitors() -> Result<Vec<MonitorInfo>> {
-    super::app::run_on_main_sync(|| monitors_main_thread())
+    super::app::run_on_main_sync(monitors_main_thread)
 }
 
 fn monitors_main_thread() -> Result<Vec<MonitorInfo>> {
@@ -19,7 +19,7 @@ fn monitors_main_thread() -> Result<Vec<MonitorInfo>> {
     let mut out = Vec::with_capacity(screens.len());
     for (idx, screen) in screens.iter().enumerate() {
         let frame = screen.frame();
-        let scale = screen.backingScaleFactor() as f64;
+        let scale = screen.backingScaleFactor();
         // NSScreen::localizedName landed in macOS 10.15.
         let name = screen.localizedName().to_string();
         let screen_ptr = (&**screen) as *const _ as *const () as usize;
@@ -45,7 +45,7 @@ fn monitors_main_thread() -> Result<Vec<MonitorInfo>> {
 }
 
 pub(crate) fn focused_app() -> Result<Option<AppIdentity>> {
-    super::app::run_on_main_sync(|| focused_app_main_thread())
+    super::app::run_on_main_sync(focused_app_main_thread)
 }
 
 fn focused_app_main_thread() -> Result<Option<AppIdentity>> {
@@ -85,7 +85,7 @@ pub(crate) fn ns_screen_for(
         return None;
     }
     // NSArray indexed access returns a Retained for us.
-    Some(unsafe { screens.objectAtIndex(idx) })
+    Some(screens.objectAtIndex(idx))
 }
 
 /// Find the [`MonitorId`] for the NSScreen at `idx`. Returns an

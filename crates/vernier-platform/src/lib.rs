@@ -220,10 +220,8 @@ pub fn promote_to_foreground_application() {
         .spawn(|| {
             use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
             std::thread::sleep(std::time::Duration::from_millis(400));
-            let running = unsafe { NSRunningApplication::currentApplication() };
-            unsafe {
-                running.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-            }
+            let running = NSRunningApplication::currentApplication();
+            running.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
             log::info!("macos: deferred activate fired (NSRunningApplication.activateWithOptions)");
         })
         .expect("spawn vernier-foreground-activate thread");
@@ -239,14 +237,11 @@ pub fn promote_to_foreground_application() {
 #[cfg(target_os = "macos")]
 pub fn focus_macos_app_by_pid(pid: i32) {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-    let Some(app) = (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
-    else {
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
         log::debug!("focus_macos_app_by_pid: no NSRunningApplication for pid {pid}");
         return;
     };
-    unsafe {
-        app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-    }
+    app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
 }
 
 /// Start an asynchronous probe of whether *this* process is authorized

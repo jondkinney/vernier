@@ -34,12 +34,21 @@
 //! stride along to [`NativeFrame`] consumers verbatim; only the packed
 //! [`Frame`] path strips the padding (and swizzles to RGBA).
 
+// TODO(macos-modernize): migrate CGDisplayCreateImage +
+// CGWindowListCreateImage off CoreGraphics to ScreenCaptureKit. Their
+// "use ScreenCaptureKit instead" deprecation is allowed here because
+// ScreenCaptureKit's async/callback API doesn't fit the synchronous
+// "give me one frame right now" semantics this caller wants. See the
+// Deprecation section in the module-level docstring above.
+// CGBitmapInfo::ByteOrder32Little is in the same boat — replaced by
+// constants that ship with the new API.
+#![allow(deprecated)]
+
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapInfo, CGDataProvider, CGDataProviderCopyData, CGDirectDisplayID, CGDisplayCreateImage,
-    CGImage, CGImageAlphaInfo, CGImageGetAlphaInfo, CGImageGetBitmapInfo, CGImageGetBytesPerRow,
-    CGImageGetDataProvider, CGImageGetHeight, CGImageGetWidth, CGMainDisplayID,
-    CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption,
+    CGBitmapInfo, CGDataProvider, CGDirectDisplayID, CGDisplayCreateImage, CGImage,
+    CGImageAlphaInfo, CGMainDisplayID, CGWindowImageOption, CGWindowListCreateImage,
+    CGWindowListOption,
 };
 
 use crate::{Frame, MonitorId, NativeFrame, PixelFormat, PlatformError, Rect, Result};
@@ -99,24 +108,23 @@ pub(crate) fn capture_screen_native(monitor: MonitorId) -> Result<NativeFrame> {
         }
     };
 
-    let width = unsafe { CGImageGetWidth(Some(&image)) } as u32;
-    let height = unsafe { CGImageGetHeight(Some(&image)) } as u32;
-    let stride = unsafe { CGImageGetBytesPerRow(Some(&image)) } as u32;
-    let bitmap = unsafe { CGImageGetBitmapInfo(Some(&image)) };
-    let alpha = unsafe { CGImageGetAlphaInfo(Some(&image)) };
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let stride = image.bytes_per_row() as u32;
+    let bitmap = image.bitmap_info();
+    let alpha = image.alpha_info();
     let format = pixel_format_from_cg(bitmap, alpha);
 
-    let provider_nn =
-        unsafe { CGImageGetDataProvider(Some(&image)) }.ok_or(PlatformError::Unsupported {
-            what: "macos: CGImageGetDataProvider returned null",
-        })?;
+    let provider_nn = image.data_provider().ok_or(PlatformError::Unsupported {
+        what: "macos: CGImage::data_provider returned null",
+    })?;
     // Borrow without retaining: provider is owned by the image and lives
     // as long as `image` does. We only need the byte slice during this
     // call.
-    let provider: &CGDataProvider = unsafe { provider_nn.as_ref() };
-    let data: CFRetained<objc2_core_foundation::CFData> = CGDataProviderCopyData(Some(provider))
-        .ok_or(PlatformError::Unsupported {
-            what: "macos: CGDataProviderCopyData returned null",
+    let provider: &CGDataProvider = provider_nn.as_ref();
+    let data: CFRetained<objc2_core_foundation::CFData> =
+        provider.data().ok_or(PlatformError::Unsupported {
+            what: "macos: CGDataProvider::data returned null",
         })?;
     let len = data.length() as usize;
     let ptr = data.byte_ptr();
@@ -151,28 +159,24 @@ fn cg_display_id_for(monitor: MonitorId) -> CGDirectDisplayID {
 
     let mtm = match MainThreadMarker::new() {
         Some(m) => m,
-        None => return unsafe { CGMainDisplayID() },
+        None => return CGMainDisplayID(),
     };
     let screens = NSScreen::screens(mtm);
     let idx = monitor.0 as usize;
     let Some(screen) = screens.iter().nth(idx) else {
-        return unsafe { CGMainDisplayID() };
+        return CGMainDisplayID();
     };
-    let desc = unsafe { screen.deviceDescription() };
+    let desc = screen.deviceDescription();
     let key = NSString::from_str("NSScreenNumber");
     let value = desc.objectForKey(&key);
     let Some(value) = value else {
-        return unsafe { CGMainDisplayID() };
+        return CGMainDisplayID();
     };
     // The value is an NSNumber boxing a CGDirectDisplayID (u32).
     // Cast via the `unsignedIntValue` selector. Using msg_send! to
     // avoid pulling in NSNumber bindings just for one accessor.
     let id: u32 = unsafe { objc2::msg_send![&*value, unsignedIntValue] };
-    if id == 0 {
-        unsafe { CGMainDisplayID() }
-    } else {
-        id
-    }
+    if id == 0 { CGMainDisplayID() } else { id }
 }
 
 /// Resolve the overlay window's `CGWindowID` for `monitor`, if one
