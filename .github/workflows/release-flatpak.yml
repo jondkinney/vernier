@@ -1,0 +1,62 @@
+name: release-flatpak
+
+# Build the Flatpak bundle for vernier on every published Release.
+# Mirrors release-x86_64 / release-aarch64 — fires on the same
+# `release: published` event so the resulting bundle lands on the
+# same GitHub Release as the other platform artifacts. Also
+# exposed via workflow_dispatch for backfills and reruns.
+#
+# Manifest lives at build-aux/com.usevernier.Vernier.yml.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.3.0)'
+        required: true
+        type: string
+
+jobs:
+  flatpak-build:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release upload writes to the release assets.
+      contents: write
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building Flatpak for $TAG"
+
+      - name: Checkout source at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Build bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: vernier.flatpak
+          manifest-path: build-aux/com.usevernier.Vernier.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Upload bundle to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            vernier.flatpak \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
