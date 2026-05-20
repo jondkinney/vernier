@@ -148,25 +148,23 @@ fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: M
             label,
             enabled,
             checked,
-        } => {
-            unsafe {
-                let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(label),
-                    Some(sel!(onMenuItem:)),
-                    &NSString::from_str(""),
-                );
-                mi.setTarget(Some(target));
-                mi.setEnabled(*enabled);
-                mi.setState(if *checked {
-                    objc2_app_kit::NSControlStateValueOn
-                } else {
-                    objc2_app_kit::NSControlStateValueOff
-                });
-                mi.setRepresentedObject(Some(&NSString::from_str(id)));
-                parent.addItem(&mi);
-            }
-        }
+        } => unsafe {
+            let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                Some(sel!(onMenuItem:)),
+                &NSString::from_str(""),
+            );
+            mi.setTarget(Some(target));
+            mi.setEnabled(*enabled);
+            mi.setState(if *checked {
+                objc2_app_kit::NSControlStateValueOn
+            } else {
+                objc2_app_kit::NSControlStateValueOff
+            });
+            mi.setRepresentedObject(Some(&NSString::from_str(id)));
+            parent.addItem(&mi);
+        },
         TrayMenuItem::Submenu {
             id: _,
             label,
