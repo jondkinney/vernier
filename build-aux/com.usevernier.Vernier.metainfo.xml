@@ -18,6 +18,12 @@
       Works on macOS, Linux (Wayland), and Windows.
     </p>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Measuring a 320×160 px region with edge-detected snaps locked to the element bounds</caption>
+      <image>https://usevernier.com/assets/screenshot-overlay.png</image>
+    </screenshot>
+  </screenshots>
   <categories>
     <category>Utility</category>
     <category>Graphics</category>
