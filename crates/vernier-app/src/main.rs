@@ -280,18 +280,9 @@ fn run_daemon() -> Result<()> {
             Settings::default()
         }
     };
-    let icon_path = match ensure_app_icons() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            log::warn!("app icon: {e:#}");
-            None
-        }
-    };
+    ensure_first_launch_install();
     apply_autostart(&initial_settings.general).unwrap_or_else(|e| {
         log::warn!("autostart: {e:#}");
-    });
-    ensure_application_desktop_file(icon_path.as_deref()).unwrap_or_else(|e| {
-        log::warn!("desktop entry: {e:#}");
     });
     #[cfg(target_os = "linux")]
     warn_missing_optional_tools();
@@ -3460,12 +3451,18 @@ fn icon_path_for_desktop_entries() -> Option<PathBuf> {
 
 /// `install-desktop` subcommand: drop the app icons + desktop entry
 /// into `$XDG_DATA_HOME` and exit, without starting the daemon. The
-/// daemon does this on every start, so this only matters for a
-/// freshly `cargo install`ed binary the user hasn't run yet — it
-/// makes Vernier show up in app launchers before its first launch.
+/// daemon does this once on first launch (see
+/// `ensure_first_launch_install`), so this is the explicit / forced
+/// path for re-running it or for users who haven't started the
+/// daemon yet.
 fn run_install_desktop() -> Result<()> {
     let icon = ensure_app_icons().context("install app icons")?;
     ensure_application_desktop_file(Some(&icon)).context("install desktop entry")?;
+    // Mark the first-launch step as done so the daemon doesn't re-do
+    // it on the next start.
+    if let Ok(marker) = first_launch_marker_path() {
+        let _ = write_first_launch_marker(&marker);
+    }
     let data = xdg_data_dir()?;
     println!("Installed Vernier desktop integration:");
     println!(
@@ -3476,6 +3473,88 @@ fn run_install_desktop() -> Result<()> {
     println!();
     println!("Vernier should now appear in your application launcher.");
     Ok(())
+}
+
+/// Drop the icons + desktop entry into `$XDG_DATA_HOME` on the first
+/// launch only, recording a marker in `$XDG_STATE_HOME/vernier/` so
+/// it never repeats. Skipped inside Flatpak (the runtime ships the
+/// entry and sandboxed XDG dirs make a user-local copy pointless)
+/// and when a system package already provides the entry (the user-
+/// local copy would only shadow it). Best-effort throughout: any
+/// failure is logged but never breaks startup — `install-desktop`
+/// remains the loud / explicit retry path.
+fn ensure_first_launch_install() {
+    if std::env::var_os("FLATPAK_ID").is_some() {
+        return;
+    }
+
+    let Ok(marker) = first_launch_marker_path() else {
+        return;
+    };
+    if marker.exists() {
+        return;
+    }
+
+    // If the user already ran `install-desktop`, treat the entry as
+    // already-installed and just record the marker.
+    let user_entry_exists = xdg_data_dir()
+        .ok()
+        .map(|d| d.join("applications/vernier.desktop").exists())
+        .unwrap_or(false);
+    if user_entry_exists {
+        let _ = write_first_launch_marker(&marker);
+        return;
+    }
+
+    // A system package (AUR / distro) authoritatively provides the
+    // entry — installing a user-local copy would only shadow it.
+    if packaged_entry_exists() {
+        let _ = write_first_launch_marker(&marker);
+        return;
+    }
+
+    let icon_path = match ensure_app_icons() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("app icon: {e:#}");
+            None
+        }
+    };
+    if let Err(e) = ensure_application_desktop_file(icon_path.as_deref()) {
+        log::warn!("desktop entry: {e:#}");
+        return;
+    }
+
+    let _ = write_first_launch_marker(&marker);
+}
+
+fn first_launch_marker_path() -> Result<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .context("neither XDG_STATE_HOME nor HOME is set")?;
+    Ok(state.join("vernier").join("desktop-install-done"))
+}
+
+fn write_first_launch_marker(marker: &Path) -> Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(marker, "Vernier ran its one-time first-launch desktop integration.\n")
+        .with_context(|| format!("write {}", marker.display()))?;
+    Ok(())
+}
+
+/// True if some system XDG data dir already provides our desktop
+/// entry — typically an AUR / distro package's `/usr/share/applications`.
+fn packaged_entry_exists() -> bool {
+    let dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    std::env::split_paths(&dirs).any(|d| d.join("applications/vernier.desktop").is_file())
 }
 
 /// An external CLI tool Vernier shells out to for an optional
