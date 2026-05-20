@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.usevernier.Vernier</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Vernier</name>
+  <summary>Native pixel-measurement screen overlay</summary>
+  <icon type="stock">com.usevernier.Vernier</icon>
+  <launchable type="desktop-id">com.usevernier.Vernier.desktop</launchable>
+  <description>
+    <p>
+      Vernier is a native pixel-measurement overlay for designers and developers.
+      Edge-detected snaps lock to real element bounds, with sticky guides, pinned
+      measurements, and region capture for one-click hand-off to your annotation tool.
+    </p>
+    <p>
+      Press Enter on a measurement to copy the value to the system clipboard.
+      Works on macOS, Linux (Wayland), and Windows.
+    </p>
+  </description>
+  <url type="homepage">https://usevernier.com</url>
+  <url type="bugtracker">https://github.com/jondkinney/vernier/issues</url>
+  <developer_name>Jon Kinney</developer_name>
+</component>

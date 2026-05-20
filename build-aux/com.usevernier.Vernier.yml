@@ -22,10 +22,15 @@ build-options:
   build-args:
     - "--share=network"
   env:
+    # Sparse registry shaves multiple minutes off the cold dep
+    # fetch — see https://blog.rust-lang.org/inside-rust/2023/01/30/cargo-sparse-protocol.html
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse"
     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "clang"
-    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    # `-Wl,-z,now` forces immediate symbol resolution at load so
+    # full-RELRO actually applies; combined with mold for link speed.
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "clang"
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
 
 # Permissions, in order of decreasing-blastradius: see
 # https://docs.flatpak.org/en/latest/sandbox-permissions.html for
@@ -43,12 +48,20 @@ finish-args:
   - "--share=ipc"
   # Where measurement screenshots and exports land.
   - "--filesystem=xdg-pictures"
-  # Config (~/.config/vernier/) — vernier-platform writes
-  # preferences here.
-  - "--filesystem=xdg-config"
-  # Screen capture and other dynamic permissions go through
-  # xdg-desktop-portal, which the sandbox auto-allows. No
-  # explicit --talk-name needed for portal use.
+  # Per-app scope so a sandbox escape can't read every other app's
+  # config; vernier writes settings.toml and screencast.token to
+  # `$XDG_CONFIG_HOME/vernier/` (see crates/vernier-core/src/settings.rs
+  # and crates/vernier-platform/src/linux/screencast.rs).
+  - "--filesystem=xdg-config/vernier:rw"
+  # Enter on a measurement copies the value to the system
+  # clipboard — needs the Clipboard portal to write the selection.
+  - "--talk-name=org.freedesktop.portal.Clipboard"
+  # Capture-saved / hand-off toasts use the Notifications portal;
+  # without this they'd be silently swallowed by the sandbox.
+  - "--talk-name=org.freedesktop.Notifications"
+  # Screen capture itself goes through xdg-desktop-portal, which
+  # the sandbox auto-allows. No explicit --talk-name needed for
+  # generic portal use.
   - "--env=RUST_BACKTRACE=1"
 
 modules:
@@ -66,6 +79,9 @@ modules:
       - install -Dm0755 target/release/vernier /app/bin/vernier
       - install -Dm0644 assets/icons/hicolor/scalable/apps/vernier.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       - install -Dm0644 packaging/vernier.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      # AppStream metainfo — required by Flathub, also picked up by
+      # GNOME Software / KDE Discover for sideloaded bundles.
+      - install -Dm0644 build-aux/com.usevernier.Vernier.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
     sources:
       - type: dir
         path: ..
