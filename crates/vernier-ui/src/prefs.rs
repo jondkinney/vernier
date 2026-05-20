@@ -860,6 +860,12 @@ fn apply_style(ctx: &egui::Context) {
 static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// Only called from the Linux/Omarchy SUPER-key chip path
+// (`shortcut_chip_segments` cfg(not(target_os = "macos"))). On macOS the
+// chip uses the U+2318 Command glyph directly, so this function is
+// dead — but we don't cfg-gate it because the static it reads is set
+// during the cross-platform `install_glyph_fonts` font-load loop.
+#[allow(dead_code)]
 fn omarchy_font_available() -> bool {
     OMARCHY_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2335,6 +2341,13 @@ fn capture_outcome(i: &mut egui::InputState, target: ShortcutId) -> Option<Captu
 /// else is drawn manually so we can guarantee uniform stroke
 /// weight, baseline alignment, and the solid stubby Shift / chevron
 /// Ctrl / matching arrows the user wants.
+// OmarchyLogo / Shift / Ctrl / Alt are constructed only in the
+// Linux branches of `shortcut_chip_segments` and read by the
+// Linux-side painter — on macOS we use Unicode modifier glyphs as
+// plain Letter segments instead. The match arms that reference them
+// are unconditional, so we can't cfg-gate the variants; `allow` is
+// the targeted fix.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 enum ChipSeg {
     Letter(String),
