@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/flatpak/flatpak-builder/refs/heads/main/data/flatpak-manifest.schema.json
+#
+# Flatpak manifest for vernier. The app-id mirrors the live domain
+# (usevernier.com) — see https://docs.flathub.org/docs/for-app-authors/requirements
+# for why reverse-DNS of a domain you actually control is the safe
+# choice for Flathub publication.
+#
+# Built in CI by .github/workflows/release-flatpak.yml on every
+# published Release; the resulting .flatpak bundle is uploaded as a
+# Release asset for sideloading and for any future Flathub submission.
+app-id: com.usevernier.Vernier
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm18
+command: /app/bin/vernier
+build-options:
+  append-path: "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin"
+  prepend-ld-library-path: "/usr/lib/sdk/llvm18/lib"
+  build-args:
+    - "--share=network"
+  env:
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+
+# Permissions, in order of decreasing-blastradius: see
+# https://docs.flatpak.org/en/latest/sandbox-permissions.html for
+# what each one grants. Tighten as we learn more about vernier's
+# real runtime needs.
+finish-args:
+  # Wayland is the primary target; X11 is the documented fallback.
+  - "--socket=wayland"
+  - "--socket=fallback-x11"
+  # GPU access for the overlay renderer (wgpu / winit need DRI).
+  - "--device=dri"
+  # ipc share is required alongside fallback-x11 — the X11 server
+  # uses shared memory; without --share=ipc the fallback path
+  # silently fails with cryptic XSHM errors on some hosts.
+  - "--share=ipc"
+  # Where measurement screenshots and exports land.
+  - "--filesystem=xdg-pictures"
+  # Config (~/.config/vernier/) — vernier-platform writes
+  # preferences here.
+  - "--filesystem=xdg-config"
+  # Screen capture and other dynamic permissions go through
+  # xdg-desktop-portal, which the sandbox auto-allows. No
+  # explicit --talk-name needed for portal use.
+  - "--env=RUST_BACKTRACE=1"
+
+modules:
+  - name: vernier
+    buildsystem: simple
+    build-options:
+      build-args:
+        - "--share=network"
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
+      env:
+        CARGO_HOME: /run/build/vernier/cargo
+    build-commands:
+      - cargo fetch --manifest-path Cargo.toml --verbose
+      - cargo build --release --bin vernier
+      - install -Dm0755 target/release/vernier /app/bin/vernier
+      - install -Dm0644 assets/icons/hicolor/scalable/apps/vernier.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm0644 packaging/vernier.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+    sources:
+      - type: dir
+        path: ..
