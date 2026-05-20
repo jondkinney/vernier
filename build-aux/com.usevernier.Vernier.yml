@@ -78,6 +78,17 @@ modules:
       - cargo build --release --bin vernier
       - install -Dm0755 target/release/vernier /app/bin/vernier
       - install -Dm0644 assets/icons/hicolor/scalable/apps/vernier.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      # Render a hicolor PNG ladder from the source SVG so hosts
+      # that prefer fixed-size raster icons (older toolkits, certain
+      # KDE variants) get a sharp render without scaling the SVG at
+      # runtime. rsvg-convert ships with the freedesktop runtime.
+      - |
+        for size in 16 22 24 32 48 64 128 256 512; do
+          install -d ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps
+          rsvg-convert -w $size -h $size \
+            assets/icons/hicolor/scalable/apps/vernier.svg \
+            -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
+        done
       - install -Dm0644 packaging/vernier.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       # The shipped desktop file uses `Icon=vernier` and `Exec=vernier prefs`
       # because that's how it's consumed in non-Flatpak contexts
