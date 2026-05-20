@@ -106,15 +106,16 @@ pub(crate) fn capture_screen_native(monitor: MonitorId) -> Result<NativeFrame> {
     let alpha = unsafe { CGImageGetAlphaInfo(Some(&image)) };
     let format = pixel_format_from_cg(bitmap, alpha);
 
-    let provider_nn = unsafe { CGImageGetDataProvider(Some(&image)) }.ok_or(
-        PlatformError::Unsupported { what: "macos: CGImageGetDataProvider returned null" },
-    )?;
+    let provider_nn =
+        unsafe { CGImageGetDataProvider(Some(&image)) }.ok_or(PlatformError::Unsupported {
+            what: "macos: CGImageGetDataProvider returned null",
+        })?;
     // Borrow without retaining: provider is owned by the image and lives
     // as long as `image` does. We only need the byte slice during this
     // call.
     let provider: &CGDataProvider = unsafe { provider_nn.as_ref() };
-    let data: CFRetained<objc2_core_foundation::CFData> =
-        CGDataProviderCopyData(Some(provider)).ok_or(PlatformError::Unsupported {
+    let data: CFRetained<objc2_core_foundation::CFData> = CGDataProviderCopyData(Some(provider))
+        .ok_or(PlatformError::Unsupported {
             what: "macos: CGDataProviderCopyData returned null",
         })?;
     let len = data.length() as usize;
@@ -195,9 +196,7 @@ fn overlay_window_id_for(monitor: MonitorId) -> Option<u32> {
                 // ONLY while the overlay is on screen; when it's
                 // hidden, return None so the caller falls back to
                 // CGDisplayCreateImage (full screen, all windows).
-                o.window
-                    .isVisible()
-                    .then(|| o.window.windowNumber() as u32)
+                o.window.isVisible().then(|| o.window.windowNumber() as u32)
             })
         })
     })
@@ -222,8 +221,8 @@ fn pixel_format_from_cg(bitmap: CGBitmapInfo, alpha: CGImageAlphaInfo) -> PixelF
     // ByteOrder32Little = bytes in memory are reversed from the
     // pixel-order constants. So "alpha-first" + little-endian =
     // BGRA in memory; "alpha-first" + big-endian = ARGB in memory.
-    let little_endian = (bitmap.0 & CGBitmapInfo::ByteOrder32Little.0)
-        == CGBitmapInfo::ByteOrder32Little.0;
+    let little_endian =
+        (bitmap.0 & CGBitmapInfo::ByteOrder32Little.0) == CGBitmapInfo::ByteOrder32Little.0;
     let alpha_first = matches!(
         alpha,
         CGImageAlphaInfo::PremultipliedFirst

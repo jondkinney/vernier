@@ -116,9 +116,7 @@ fn scan(
         if x < 0 || y < 0 {
             return None;
         }
-        let Some(here) = frame.pixel(x as u32, y as u32) else {
-            return None;
-        };
+        let here = frame.pixel(x as u32, y as u32)?;
         let delta = anchor.rgb_delta(here);
         // Strict `>` (not `>=`) so Tolerance(0) means "stop on any
         // color change at all" rather than "stop immediately" — at
@@ -166,6 +164,7 @@ pub fn shrink_to_content(
 /// reference pixel explicitly. Useful for resize, where the rect's
 /// own top-left can land inside content and the default sample would
 /// collapse the algorithm.
+#[allow(clippy::too_many_arguments)]
 pub fn shrink_to_content_with_bg(
     frame: &FrameView,
     x0: i32,

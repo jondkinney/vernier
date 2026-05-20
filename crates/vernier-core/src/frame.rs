@@ -19,7 +19,9 @@ impl<'a> FrameView<'a> {
     /// dimensions. Returns `None` if `pixels.len()` is shorter than
     /// `width * height * 4`.
     pub fn packed(pixels: &'a [u8], width: u32, height: u32) -> Option<Self> {
-        let needed = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let needed = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         if pixels.len() < needed {
             return None;
         }

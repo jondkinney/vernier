@@ -74,9 +74,9 @@ pub(crate) fn create(events_tx: EventSender) -> Result<HotkeyService> {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = ready_tx_for_thread.send(Err(PlatformError::Other(
-                        anyhow::anyhow!("tokio runtime: {e}"),
-                    )));
+                    let _ = ready_tx_for_thread.send(Err(PlatformError::Other(anyhow::anyhow!(
+                        "tokio runtime: {e}"
+                    ))));
                     return;
                 }
             };
@@ -106,9 +106,11 @@ async fn run_portal_async(
     events_tx: EventSender,
     ready_tx: SyncSender<Result<()>>,
 ) -> Result<()> {
-    let proxy = GlobalShortcuts::new().await.map_err(|e| PlatformError::Portal {
-        reason: format!("create proxy: {e}"),
-    })?;
+    let proxy = GlobalShortcuts::new()
+        .await
+        .map_err(|e| PlatformError::Portal {
+            reason: format!("create proxy: {e}"),
+        })?;
     let session = proxy
         .create_session(Default::default())
         .await

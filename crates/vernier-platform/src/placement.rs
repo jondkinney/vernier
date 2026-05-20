@@ -10,7 +10,7 @@
 //! [`StuckMeasurement`] / [`HeldRect`] fields. The renderer scales
 //! these to buffer pixels by multiplying by its HiDPI scale factor.
 
-use crate::{font, GuideAxis, HeldRect, HudMeasurementFormat, StuckMeasurement};
+use crate::{GuideAxis, HeldRect, HudMeasurementFormat, StuckMeasurement, font};
 
 /// Pill bounding box in surface logical pixels.
 #[derive(Debug, Clone, Copy)]
@@ -263,10 +263,7 @@ fn rect_pill_text(r: &HeldRect, fmt: &HudMeasurementFormat) -> String {
     fmt.format_wh(rw, rh)
 }
 
-fn rect_dim_default_bbox(
-    r: &HeldRect,
-    fmt: &HudMeasurementFormat,
-) -> (PillRect, Option<PillRect>) {
+fn rect_dim_default_bbox(r: &HeldRect, fmt: &HudMeasurementFormat) -> (PillRect, Option<PillRect>) {
     let text = rect_pill_text(r, fmt);
     let (pill_w, pill_h) = pill_dims(&text, TEXT_RECT_LOGICAL_PX, RECT_PAD_X, RECT_PAD_Y);
     let rx = r.rect_start.0.min(r.rect_end.0);
@@ -344,8 +341,7 @@ pub fn compute_pill_layout(
 
     // Obstacles every stuck pill avoids: every rect's drawn box,
     // every rect's dim pill, and every earlier stuck pill.
-    let mut stuck_obstacles: Vec<PillRect> =
-        Vec::with_capacity(rects.len() * 2 + stucks.len());
+    let mut stuck_obstacles: Vec<PillRect> = Vec::with_capacity(rects.len() * 2 + stucks.len());
     for r in rects {
         let rx = r.rect_start.0.min(r.rect_end.0);
         let ry = r.rect_start.1.min(r.rect_end.1);

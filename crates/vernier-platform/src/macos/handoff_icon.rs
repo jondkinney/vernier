@@ -100,15 +100,13 @@ pub fn extract_macos_app_icon_rgba(bundle_path: &Path, size: u32) -> Option<Vec<
     // overwrites every pixel so we don't need an explicit clear.
     let zero = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize { width: 0.0, height: 0.0 },
+        size: NSSize {
+            width: 0.0,
+            height: 0.0,
+        },
     };
     unsafe {
-        icon.drawInRect_fromRect_operation_fraction(
-            rect,
-            zero,
-            NSCompositingOperation::Copy,
-            1.0,
-        );
+        icon.drawInRect_fromRect_operation_fraction(rect, zero, NSCompositingOperation::Copy, 1.0);
     }
     // Force pending Core Graphics commands to flush before reading
     // pixels. Without this, on some macOS versions the bitmapData

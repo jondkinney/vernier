@@ -39,9 +39,9 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
         let status_item = unsafe { bar.statusItemWithLength(-1.0) };
         log::info!("macos tray: status item created");
 
-        let button = status_item.button(mtm).ok_or_else(|| {
-            PlatformError::Other(anyhow::anyhow!("NSStatusItem.button was nil"))
-        })?;
+        let button = status_item
+            .button(mtm)
+            .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("NSStatusItem.button was nil")))?;
 
         // Prefer Vernier's custom V glyph (the dashed-tick variant of
         // the brand mark, designed to live in the menu bar at
@@ -103,7 +103,10 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
                 target: target.clone(),
             });
         });
-        log::info!("macos tray: stored TrayResources, visible={}", status_item.isVisible());
+        log::info!(
+            "macos tray: stored TrayResources, visible={}",
+            status_item.isVisible()
+        );
 
         Ok(TrayHandle::from_backend(MacTray {}))
     })
@@ -117,12 +120,7 @@ fn build_menu(menu: &TrayMenu, target: &TrayTarget, mtm: MainThreadMarker) -> Re
     ns_menu
 }
 
-fn append_item(
-    parent: &NSMenu,
-    item: &TrayMenuItem,
-    target: &TrayTarget,
-    mtm: MainThreadMarker,
-) {
+fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: MainThreadMarker) {
     match item {
         TrayMenuItem::Separator => {
             let sep = unsafe { NSMenuItem::separatorItem(mtm) };
@@ -172,7 +170,11 @@ fn append_item(
                 parent.addItem(&mi);
             };
         }
-        TrayMenuItem::Submenu { id: _, label, items } => {
+        TrayMenuItem::Submenu {
+            id: _,
+            label,
+            items,
+        } => {
             let mi = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
@@ -221,7 +223,9 @@ impl TrayOps for MacTray {
         super::app::run_on_main_async(move || {
             super::with_main_state(|s| {
                 if let Some(t) = s.tray.as_ref() {
-                    if let Some(button) = unsafe { t.status_item.button(MainThreadMarker::new().expect("main")) } {
+                    if let Some(button) =
+                        unsafe { t.status_item.button(MainThreadMarker::new().expect("main")) }
+                    {
                         unsafe { button.setAppearsDisabled(!active) };
                     }
                 }

@@ -112,17 +112,18 @@ impl ksni::Tray for VernierTray {
     }
     fn activate(&mut self, x: i32, y: i32) {
         log::info!("tray Activate at ({x}, {y})");
-        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked { x, y });
+        let _ = self
+            .events_tx
+            .send(PlatformEvent::TrayIconLeftClicked { x, y });
     }
     fn secondary_activate(&mut self, x: i32, y: i32) {
         log::info!("tray SecondaryActivate at ({x}, {y})");
-        let _ = self.events_tx.send(PlatformEvent::TrayIconLeftClicked { x, y });
+        let _ = self
+            .events_tx
+            .send(PlatformEvent::TrayIconLeftClicked { x, y });
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        self.items
-            .iter()
-            .filter_map(|item| build_menu_item(item))
-            .collect()
+        self.items.iter().filter_map(build_menu_item).collect()
     }
 }
 
@@ -170,7 +171,11 @@ fn build_menu_item(item: &TrayMenuItem) -> Option<ksni::MenuItem<VernierTray>> {
             )
         }
         TrayMenuItem::Separator => Some(MenuItem::Separator),
-        TrayMenuItem::Submenu { id: _, label, items } => {
+        TrayMenuItem::Submenu {
+            id: _,
+            label,
+            items,
+        } => {
             let children: Vec<ksni::MenuItem<VernierTray>> =
                 items.iter().filter_map(build_menu_item).collect();
             Some(

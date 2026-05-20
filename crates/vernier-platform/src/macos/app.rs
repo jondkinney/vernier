@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, MainThreadMarker, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
 
 use super::install_main_state;

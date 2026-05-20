@@ -58,10 +58,9 @@ fn hud_symbol_font() -> Option<&'static fontdue::Font> {
         ];
         for path in CANDIDATES {
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(f) = fontdue::Font::from_bytes(
-                    bytes.as_slice(),
-                    fontdue::FontSettings::default(),
-                ) {
+                if let Ok(f) =
+                    fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
+                {
                     log::info!("hud symbol font: {path}");
                     return Some(f);
                 }
@@ -77,7 +76,7 @@ fn hud_symbol_font() -> Option<&'static fontdue::Font> {
 /// the U+E900 SUPER logo the right-click menu uses on Omarchy hosts).
 /// Used so per-glyph rendering can substitute for missing characters
 /// without leaving tofu boxes.
-fn font_for_char<'a>(primary: &'a fontdue::Font, c: char) -> &'a fontdue::Font {
+fn font_for_char(primary: &fontdue::Font, c: char) -> &fontdue::Font {
     if primary.lookup_glyph_index(c) != 0 {
         return primary;
     }
@@ -105,11 +104,8 @@ fn omarchy_font() -> Option<&'static fontdue::Font> {
         let home = std::env::var_os("HOME")?;
         let path = std::path::PathBuf::from(home).join(".local/share/fonts/omarchy.ttf");
         let bytes = std::fs::read(&path).ok()?;
-        let font = fontdue::Font::from_bytes(
-            bytes.as_slice(),
-            fontdue::FontSettings::default(),
-        )
-        .ok()?;
+        let font =
+            fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).ok()?;
         log::info!("hud omarchy font: {}", path.display());
         Some(font)
     })
@@ -157,13 +153,20 @@ fn draw_pill_bg(pixmap: &mut tiny_skia::PixmapMut, x: f32, y: f32, w: f32, h: f3
     bg_paint.set_color_rgba8(40, 40, 40, 230);
     bg_paint.anti_alias = true;
     if let Some(path) = pill_path(x, y, w, h) {
-        pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &bg_paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
 /// Push a glyph layout centered in the rectangle `(x, y, w, h)` at
 /// `text_logical_px`. The text may be larger than the box (e.g.
 /// stuck-pill hover X overflows).
+#[allow(clippy::too_many_arguments)]
 fn push_text_in_box(
     pills: &mut Vec<PillLayout>,
     text: String,
@@ -210,13 +213,7 @@ pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: 
 /// held rects, stuck measurements, guides — into a fresh transparent
 /// canvas. Pair with [`static_hash`] so the backend can skip this
 /// call entirely when the static-affecting inputs haven't changed.
-pub(crate) fn render_static_into(
-    canvas: &mut [u8],
-    buf_w: u32,
-    buf_h: u32,
-    scale: u32,
-    hud: &Hud,
-) {
+pub(crate) fn render_static_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
     canvas.fill(0);
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
 }
@@ -242,13 +239,7 @@ pub(crate) fn render_dynamic_into(
 /// there. Pair with [`render_dynamic_onto`] for backends that want to
 /// pre-composite background + static into a single cached buffer and
 /// avoid an extra full-buffer SrcOver per frame.
-pub(crate) fn render_static_onto(
-    canvas: &mut [u8],
-    buf_w: u32,
-    buf_h: u32,
-    scale: u32,
-    hud: &Hud,
-) {
+pub(crate) fn render_static_onto(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
 }
 
@@ -366,13 +357,7 @@ fn fill_background(canvas: &mut [u8], hud: &Hud) {
 /// Static-layer strokes + pill text. Mutates `canvas` in place,
 /// expecting an existing background (transparent or tint-filled). Does
 /// NOT clear the canvas — the caller does that.
-fn render_static_layer(
-    canvas: &mut [u8],
-    buf_w: u32,
-    buf_h: u32,
-    scale: u32,
-    hud: &Hud,
-) {
+fn render_static_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
     // tiny-skia phase scoped so its &mut borrow on canvas is released
     // before the glyph rasterizer writes into it.
     let pills = render_static_strokes(canvas, buf_w, buf_h, scale, hud);
@@ -387,13 +372,7 @@ fn render_static_layer(
 
 /// Dynamic-layer strokes + pill text. Same canvas contract as
 /// [`render_static_layer`].
-fn render_dynamic_layer(
-    canvas: &mut [u8],
-    buf_w: u32,
-    buf_h: u32,
-    scale: u32,
-    hud: &Hud,
-) {
+fn render_dynamic_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
     let pills = render_dynamic_strokes(canvas, buf_w, buf_h, scale, hud);
     if !pills.is_empty() {
         if let Some(font) = hud_font() {
@@ -755,11 +734,11 @@ fn draw_resize_cursor(
     rotate_deg: f32,
 ) {
     use tiny_skia::*;
-    let l = 7.5 * scale_f;   // half-length of arms
-    let a = 3.5 * scale_f;   // arrowhead extent — smaller arrowheads
-    let t = 1.0 * scale_f;   // arm half-thickness
+    let l = 7.5 * scale_f; // half-length of arms
+    let a = 3.5 * scale_f; // arrowhead extent — smaller arrowheads
+    let t = 1.0 * scale_f; // arm half-thickness
     let s = a + 4.0 * scale_f; // serif half-width — 4 px wider than the arrowhead on each side
-    let sh = 1.0 * scale_f;  // serif half-height (along arm axis)
+    let sh = 1.0 * scale_f; // serif half-height (along arm axis)
     let mut pb = PathBuilder::new();
     // I-beam style: NS double-arrow with a horizontal serif at the
     // center. Trace outer boundary clockwise from top tip.
@@ -815,8 +794,8 @@ fn draw_resize_cursor(
 fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f: f32) {
     use tiny_skia::*;
     let l = 11.0 * scale_f; // half-length of each arm (tip distance from center)
-    let a = 5.0 * scale_f;  // arrowhead extent
-    let t = 1.5 * scale_f;  // arm half-thickness
+    let a = 5.0 * scale_f; // arrowhead extent
+    let t = 1.5 * scale_f; // arm half-thickness
     // Center square matches the arm thickness so the arms flow into
     // each other without a notch — gives the cleaner +-with-arrows
     // shape of a standard move cursor.
@@ -875,13 +854,20 @@ fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
         let mut black = Paint::default();
         black.set_color_rgba8(0, 0, 0, 255);
         black.anti_alias = true;
-        pixmap.fill_path(&path, &black, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &black,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
 /// Draw frozen single-axis measurements — coral line + tick caps +
 /// pill with the pixel count. Same visual language as the live
 /// crosshair so the user reads them as "stuck" measurements.
+#[allow(clippy::too_many_arguments)]
 fn draw_stuck_measurements(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
@@ -894,17 +880,27 @@ fn draw_stuck_measurements(
     _buf_h: f32,
     scale_f: f32,
 ) {
-    use tiny_skia::*;
     use crate::GuideAxis;
-    let line_stroke = Stroke { width: 2.0, ..Default::default() };
-    let tick_stroke = Stroke { width: 2.0, ..Default::default() };
+    use tiny_skia::*;
+    let line_stroke = Stroke {
+        width: 2.0,
+        ..Default::default()
+    };
+    let tick_stroke = Stroke {
+        width: 2.0,
+        ..Default::default()
+    };
     let tick_half = 5.0 * scale_f; // tick reach in buffer px
 
     for (i, m) in measurements.iter().enumerate() {
         // Per-stuck color (snapshot at placement). Existing pieces
         // keep whatever color they were placed in even if `X`
         // re-flips the live HUD afterward.
-        let fg = if m.color_alternate { alternate_fg } else { primary_fg };
+        let fg = if m.color_alternate {
+            alternate_fg
+        } else {
+            primary_fg
+        };
         let mut paint = Paint::default();
         paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
         paint.anti_alias = false;
@@ -1103,6 +1099,7 @@ fn draw_pill_tether(
 /// rest of the HUD so the guides sit on top of measurement strokes.
 /// When a guide is `hovered` and we have a `cursor`, draw a small dark
 /// "X" badge on the line at the cursor's free axis to signal removal.
+#[allow(clippy::too_many_arguments)]
 fn draw_guides(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
@@ -1116,8 +1113,8 @@ fn draw_guides(
     buf_h: f32,
     scale_f: f32,
 ) {
-    use tiny_skia::*;
     use crate::GuideAxis;
+    use tiny_skia::*;
     let stroke = Stroke {
         width: 1.0,
         ..Default::default()
@@ -1179,8 +1176,7 @@ fn draw_guides(
             continue;
         }
         let value = fmt.format_value(dist as f64);
-        let (pill_w, pill_h, _, _) =
-            pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
+        let (pill_w, pill_h, _, _) = pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Horizontal pair (gap is vertical) → label anchored at the
         // LEFT of the screen, vertically centered between the two
         // guide ys.
@@ -1215,8 +1211,7 @@ fn draw_guides(
             continue;
         }
         let value = fmt.format_value(dist as f64);
-        let (pill_w, pill_h, _, _) =
-            pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
+        let (pill_w, pill_h, _, _) = pill_dims_at(&value, TEXT_STUCK_LOGICAL_PX, scale_f);
         // Vertical pair (gap is horizontal) → label anchored at the
         // TOP of the screen, horizontally centered between the two
         // guide xs.
@@ -1296,233 +1291,239 @@ fn draw_hover_indicators(
     use tiny_skia::*;
     let scale_f = scale as f32;
     {
-            // Convert surface-logical coords to buffer-physical, snap
-            // to the pixel grid, offset by stroke half-width so non-AA
-            // strokes land cleanly on integer columns / rows. Without
-            // this, integer positions sit on the boundary between two
-            // pixels and the rasterizer's tie-break rule picks one or
-            // the other, giving uneven tick lengths and shimmer.
-            let half = stroke.width * 0.5;
-            let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
-            let cx = snap(cursor.0);
-            let cy = snap(cursor.1);
-            let surface_w = buf_w;
-            let surface_h = buf_h;
+        // Convert surface-logical coords to buffer-physical, snap
+        // to the pixel grid, offset by stroke half-width so non-AA
+        // strokes land cleanly on integer columns / rows. Without
+        // this, integer positions sit on the boundary between two
+        // pixels and the rasterizer's tie-break rule picks one or
+        // the other, giving uneven tick lengths and shimmer.
+        let half = stroke.width * 0.5;
+        let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
+        let cx = snap(cursor.0);
+        let cy = snap(cursor.1);
+        let surface_w = buf_w;
+        let surface_h = buf_h;
 
-            // Horizontal axis line: spans from left snap edge (or screen
-            // left) to right snap edge (or screen right), through cursor.
-            let left = edges
-                .iter()
-                .filter_map(|e| e.as_ref())
-                .find(|e| e.axis == HudAxis::Left);
-            let right = edges
-                .iter()
-                .filter_map(|e| e.as_ref())
-                .find(|e| e.axis == HudAxis::Right);
-            let left_x = left.map(|e| snap(e.position.0)).unwrap_or(half);
-            let right_x = right
-                .map(|e| snap(e.position.0))
-                .unwrap_or(surface_w - half);
-            let mut pb = PathBuilder::new();
-            pb.move_to(left_x, cy);
-            pb.line_to(right_x, cy);
-            if let Some(path) = pb.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+        // Horizontal axis line: spans from left snap edge (or screen
+        // left) to right snap edge (or screen right), through cursor.
+        let left = edges
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|e| e.axis == HudAxis::Left);
+        let right = edges
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|e| e.axis == HudAxis::Right);
+        let left_x = left.map(|e| snap(e.position.0)).unwrap_or(half);
+        let right_x = right
+            .map(|e| snap(e.position.0))
+            .unwrap_or(surface_w - half);
+        let mut pb = PathBuilder::new();
+        pb.move_to(left_x, cy);
+        pb.line_to(right_x, cy);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, paint, stroke, Transform::identity(), None);
+        }
 
-            // Vertical axis line.
-            let up = edges
-                .iter()
-                .filter_map(|e| e.as_ref())
-                .find(|e| e.axis == HudAxis::Up);
-            let down = edges
-                .iter()
-                .filter_map(|e| e.as_ref())
-                .find(|e| e.axis == HudAxis::Down);
-            let up_y = up.map(|e| snap(e.position.1)).unwrap_or(half);
-            let down_y = down
-                .map(|e| snap(e.position.1))
-                .unwrap_or(surface_h - half);
-            let mut pb = PathBuilder::new();
-            pb.move_to(cx, up_y);
-            pb.line_to(cx, down_y);
-            if let Some(path) = pb.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+        // Vertical axis line.
+        let up = edges
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|e| e.axis == HudAxis::Up);
+        let down = edges
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|e| e.axis == HudAxis::Down);
+        let up_y = up.map(|e| snap(e.position.1)).unwrap_or(half);
+        let down_y = down.map(|e| snap(e.position.1)).unwrap_or(surface_h - half);
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx, up_y);
+        pb.line_to(cx, down_y);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, paint, stroke, Transform::identity(), None);
+        }
 
-            // Tick marks. Anchor the tick CENTER on the matching axis
-            // line (cy for left/right ticks, cx for up/down ticks) so
-            // they sit exactly on the main lines.
-            // Tick half-length = 5 LOGICAL pixels. Drawn with the
-            // thicker `tick_stroke` so caps look like filled bars.
-            let tick = 5.0 * scale_f;
-            for edge in edges.iter().flatten() {
-                let ex = snap(edge.position.0);
-                let ey = snap(edge.position.1);
-                let (px, py, tdx, tdy) = match edge.axis {
-                    HudAxis::Left | HudAxis::Right => (ex, cy, 0.0, tick),
-                    HudAxis::Up | HudAxis::Down => (cx, ey, tick, 0.0),
-                };
-                let mut pb = PathBuilder::new();
-                pb.move_to(px - tdx, py - tdy);
-                pb.line_to(px + tdx, py + tdy);
-                if let Some(path) = pb.finish() {
-                    pixmap.stroke_path(&path, &paint, &tick_stroke, Transform::identity(), None);
-                }
-            }
-
-            // Cursor `+` marker: black interior with a white outline,
-            // The white outline keeps the
-            // mark visible against dark UI; the black core makes it
-            // pop on light UI. Drawn after the axis lines so it sits
-            // on top of their crossing point.
-            //
-            // Gated by `show_cursor` (the prefs "Show cursor" toggle)
-            // — the rest of this function (axis lines, tick caps,
-            // W×H pill) is the measurement HUD itself and stays
-            // visible either way.
-            if show_cursor {
-                let arm = 6.0 * scale_f;
-                let mut pb = PathBuilder::new();
-                pb.move_to(cx - arm, cy);
-                pb.line_to(cx + arm, cy);
-                pb.move_to(cx, cy - arm);
-                pb.line_to(cx, cy + arm);
-                if let Some(path) = pb.finish() {
-                    // Hard physical-pixel widths: 4 px white outline,
-                    // 2 px black core, regardless of buffer scale.
-                    let mut outline = Paint::default();
-                    outline.set_color_rgba8(255, 255, 255, 255);
-                    outline.anti_alias = true;
-                    pixmap.stroke_path(
-                        &path,
-                        &outline,
-                        &Stroke {
-                            // Total stroke = black core 2 + 3 px white
-                            // halo on each side.
-                            width: 8.0,
-                            line_cap: tiny_skia::LineCap::Round,
-                            ..Default::default()
-                        },
-                        Transform::identity(),
-                        None,
-                    );
-                    let mut fill = Paint::default();
-                    fill.set_color_rgba8(0, 0, 0, 255);
-                    fill.anti_alias = true;
-                    pixmap.stroke_path(
-                        &path,
-                        &fill,
-                        &Stroke {
-                            width: 2.0,
-                            line_cap: tiny_skia::LineCap::Round,
-                            ..Default::default()
-                        },
-                        Transform::identity(),
-                        None,
-                    );
-                }
-            }
-
-            // Width / height as a fractional logical-pixel span
-            // (buffer span / scale). The unit + rounding mode (and the
-            // Figma dimension divisor) are applied by `format_wh` —
-            // the exact path committed held rects use — so the live
-            // and committed readouts always agree.
-            let w_logical_f = ((right_x - left_x) / scale_f) as f64;
-            let h_logical_f = ((down_y - up_y) / scale_f) as f64;
-            let text = fmt.format_wh(w_logical_f, h_logical_f);
-            let px_size = TEXT_LOGICAL_PX * scale_f;
-            // Measure text via fontdue. If the font is missing we still
-            // render the pill (just empty) at a sensible width using the
-            // average glyph metric.
-            let (text_w, ascent, descent) = if let Some(font) = hud_font() {
-                let w = measure_text_width(font, &text, px_size);
-                let lm = font.horizontal_line_metrics(px_size);
-                let (a, d) = lm
-                    .map(|m| (m.ascent, -m.descent))
-                    .unwrap_or((px_size * 0.8, px_size * 0.2));
-                (w, a, d)
-            } else {
-                (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+        // Tick marks. Anchor the tick CENTER on the matching axis
+        // line (cy for left/right ticks, cx for up/down ticks) so
+        // they sit exactly on the main lines.
+        // Tick half-length = 5 LOGICAL pixels. Drawn with the
+        // thicker `tick_stroke` so caps look like filled bars.
+        let tick = 5.0 * scale_f;
+        for edge in edges.iter().flatten() {
+            let ex = snap(edge.position.0);
+            let ey = snap(edge.position.1);
+            let (px, py, tdx, tdy) = match edge.axis {
+                HudAxis::Left | HudAxis::Right => (ex, cy, 0.0, tick),
+                HudAxis::Up | HudAxis::Down => (cx, ey, tick, 0.0),
             };
-            let pad_x = 10.0 * scale_f;
-            let pad_y = 5.0 * scale_f;
-            let pill_w = text_w.ceil() + pad_x * 2.0;
-            let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
-            // Lower-right of cursor by 14 LOGICAL px each axis.
-            let cursor_buf_x = (cursor.0 * scale as f64) as f32;
-            let cursor_buf_y = (cursor.1 * scale as f64) as f32;
-            let offset = 14.0 * scale_f;
-            let mut pill_x = (cursor_buf_x + offset).floor();
-            let mut pill_y = (cursor_buf_y + offset).floor();
-            pill_x = pill_x.min(surface_w - pill_w - 1.0).max(0.0);
-            pill_y = pill_y.min(surface_h - pill_h - 1.0).max(0.0);
-
-            // Fully opaque dark gray (not pure black). Unlike the
-            // committed-measurement pills — which are translucent so
-            // screenshot content shows through a little — the live
-            // readout is the highest-priority element: it always
-            // renders above everything else, and an opaque background
-            // guarantees it stays legible even when it lands on top
-            // of another pill (a translucent fill would let that pill
-            // ghost through).
-            let mut bg_paint = Paint::default();
-            bg_paint.set_color_rgba8(40, 40, 40, 255);
-            bg_paint.anti_alias = true;
-            if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
-                pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+            let mut pb = PathBuilder::new();
+            pb.move_to(px - tdx, py - tdy);
+            pb.line_to(px + tdx, py + tdy);
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, paint, tick_stroke, Transform::identity(), None);
             }
+        }
 
-            pills.push(PillLayout {
-                text,
-                text_x: pill_x + pad_x,
-                baseline_y: pill_y + pad_y + ascent,
-                px_size,
-            });
+        // Cursor `+` marker: black interior with a white outline,
+        // The white outline keeps the
+        // mark visible against dark UI; the black core makes it
+        // pop on light UI. Drawn after the axis lines so it sits
+        // on top of their crossing point.
+        //
+        // Gated by `show_cursor` (the prefs "Show cursor" toggle)
+        // — the rest of this function (axis lines, tick caps,
+        // W×H pill) is the measurement HUD itself and stays
+        // visible either way.
+        if show_cursor {
+            let arm = 6.0 * scale_f;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - arm, cy);
+            pb.line_to(cx + arm, cy);
+            pb.move_to(cx, cy - arm);
+            pb.line_to(cx, cy + arm);
+            if let Some(path) = pb.finish() {
+                // Hard physical-pixel widths: 4 px white outline,
+                // 2 px black core, regardless of buffer scale.
+                let mut outline = Paint::default();
+                outline.set_color_rgba8(255, 255, 255, 255);
+                outline.anti_alias = true;
+                pixmap.stroke_path(
+                    &path,
+                    &outline,
+                    &Stroke {
+                        // Total stroke = black core 2 + 3 px white
+                        // halo on each side.
+                        width: 8.0,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+                let mut fill = Paint::default();
+                fill.set_color_rgba8(0, 0, 0, 255);
+                fill.anti_alias = true;
+                pixmap.stroke_path(
+                    &path,
+                    &fill,
+                    &Stroke {
+                        width: 2.0,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
 
-            // Aspect-ratio pill, stacked directly under the W×H pill
-            // and gated by the "Enable in distance tool" pref. Mirrors
-            // the held-rect aspect pill but follows the live cursor.
-            // Reuses `bg_paint` (opaque), `pad_x`/`pad_y`, `ascent`,
-            // `pill_h`, and `px_size` from the W×H pill above.
-            if fmt.aspect_in_distance {
-                let aw = w_logical_f.round() as u32;
-                let ah = h_logical_f.round() as u32;
-                if let Some(aspect_text) =
-                    estimate_aspect_text(aw, ah, fmt.aspect_mode)
-                {
-                    let atext_w = if let Some(font) = hud_font() {
-                        measure_text_width(font, &aspect_text, px_size)
-                    } else {
-                        aspect_text.len() as f32 * px_size * 0.55
-                    };
-                    let apill_w = atext_w.ceil() + pad_x * 2.0;
-                    let apill_x = (pill_x + (pill_w - apill_w) * 0.5)
-                        .floor()
-                        .min(surface_w - apill_w - 1.0)
-                        .max(0.0);
-                    let apill_y = (pill_y + pill_h + 6.0 * scale_f)
-                        .floor()
-                        .min(surface_h - pill_h - 1.0)
-                        .max(0.0);
-                    if let Some(path) = pill_path(apill_x, apill_y, apill_w, pill_h) {
-                        pixmap.fill_path(
-                            &path,
-                            &bg_paint,
-                            FillRule::Winding,
-                            Transform::identity(),
-                            None,
-                        );
-                    }
-                    pills.push(PillLayout {
-                        text: aspect_text,
-                        text_x: apill_x + pad_x,
-                        baseline_y: apill_y + pad_y + ascent,
-                        px_size,
-                    });
+        // Width / height as a fractional logical-pixel span
+        // (buffer span / scale). The unit + rounding mode (and the
+        // Figma dimension divisor) are applied by `format_wh` —
+        // the exact path committed held rects use — so the live
+        // and committed readouts always agree.
+        let w_logical_f = ((right_x - left_x) / scale_f) as f64;
+        let h_logical_f = ((down_y - up_y) / scale_f) as f64;
+        let text = fmt.format_wh(w_logical_f, h_logical_f);
+        let px_size = TEXT_LOGICAL_PX * scale_f;
+        // Measure text via fontdue. If the font is missing we still
+        // render the pill (just empty) at a sensible width using the
+        // average glyph metric.
+        let (text_w, ascent, descent) = if let Some(font) = hud_font() {
+            let w = measure_text_width(font, &text, px_size);
+            let lm = font.horizontal_line_metrics(px_size);
+            let (a, d) = lm
+                .map(|m| (m.ascent, -m.descent))
+                .unwrap_or((px_size * 0.8, px_size * 0.2));
+            (w, a, d)
+        } else {
+            (
+                text.len() as f32 * px_size * 0.55,
+                px_size * 0.8,
+                px_size * 0.2,
+            )
+        };
+        let pad_x = 10.0 * scale_f;
+        let pad_y = 5.0 * scale_f;
+        let pill_w = text_w.ceil() + pad_x * 2.0;
+        let pill_h = (ascent + descent).ceil() + pad_y * 2.0;
+        // Lower-right of cursor by 14 LOGICAL px each axis.
+        let cursor_buf_x = (cursor.0 * scale as f64) as f32;
+        let cursor_buf_y = (cursor.1 * scale as f64) as f32;
+        let offset = 14.0 * scale_f;
+        let mut pill_x = (cursor_buf_x + offset).floor();
+        let mut pill_y = (cursor_buf_y + offset).floor();
+        pill_x = pill_x.min(surface_w - pill_w - 1.0).max(0.0);
+        pill_y = pill_y.min(surface_h - pill_h - 1.0).max(0.0);
+
+        // Fully opaque dark gray (not pure black). Unlike the
+        // committed-measurement pills — which are translucent so
+        // screenshot content shows through a little — the live
+        // readout is the highest-priority element: it always
+        // renders above everything else, and an opaque background
+        // guarantees it stays legible even when it lands on top
+        // of another pill (a translucent fill would let that pill
+        // ghost through).
+        let mut bg_paint = Paint::default();
+        bg_paint.set_color_rgba8(40, 40, 40, 255);
+        bg_paint.anti_alias = true;
+        if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
+            pixmap.fill_path(
+                &path,
+                &bg_paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        pills.push(PillLayout {
+            text,
+            text_x: pill_x + pad_x,
+            baseline_y: pill_y + pad_y + ascent,
+            px_size,
+        });
+
+        // Aspect-ratio pill, stacked directly under the W×H pill
+        // and gated by the "Enable in distance tool" pref. Mirrors
+        // the held-rect aspect pill but follows the live cursor.
+        // Reuses `bg_paint` (opaque), `pad_x`/`pad_y`, `ascent`,
+        // `pill_h`, and `px_size` from the W×H pill above.
+        if fmt.aspect_in_distance {
+            let aw = w_logical_f.round() as u32;
+            let ah = h_logical_f.round() as u32;
+            if let Some(aspect_text) = estimate_aspect_text(aw, ah, fmt.aspect_mode) {
+                let atext_w = if let Some(font) = hud_font() {
+                    measure_text_width(font, &aspect_text, px_size)
+                } else {
+                    aspect_text.len() as f32 * px_size * 0.55
+                };
+                let apill_w = atext_w.ceil() + pad_x * 2.0;
+                let apill_x = (pill_x + (pill_w - apill_w) * 0.5)
+                    .floor()
+                    .min(surface_w - apill_w - 1.0)
+                    .max(0.0);
+                let apill_y = (pill_y + pill_h + 6.0 * scale_f)
+                    .floor()
+                    .min(surface_h - pill_h - 1.0)
+                    .max(0.0);
+                if let Some(path) = pill_path(apill_x, apill_y, apill_w, pill_h) {
+                    pixmap.fill_path(
+                        &path,
+                        &bg_paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
                 }
+                pills.push(PillLayout {
+                    text: aspect_text,
+                    text_x: apill_x + pad_x,
+                    baseline_y: apill_y + pad_y + ascent,
+                    px_size,
+                });
             }
+        }
     }
 }
 
@@ -1589,8 +1590,7 @@ fn draw_area_rect(
     let dim_bbox_logical = match precomputed_dim_bbox {
         Some(b) => b,
         None => {
-            let (dim_pill_w_buf, dim_pill_h_buf) =
-                pill_dimensions_for_text(&dim_text, scale_f);
+            let (dim_pill_w_buf, dim_pill_h_buf) = pill_dimensions_for_text(&dim_text, scale_f);
             let dim_pill_w = dim_pill_w_buf / scale_f;
             let dim_pill_h = dim_pill_h_buf / scale_f;
             let cx_log = (rx + rw * 0.5) as f64 / scale as f64;
@@ -1604,8 +1604,7 @@ fn draw_area_rect(
             } else {
                 crate::placement::PillRect {
                     x: cx_log - dim_pill_w as f64 * 0.5,
-                    y: (ry as f64 + rh as f64 * 0.5) / scale as f64
-                        - dim_pill_h as f64 * 0.5,
+                    y: (ry as f64 + rh as f64 * 0.5) / scale as f64 - dim_pill_h as f64 * 0.5,
                     w: dim_pill_w as f64,
                     h: dim_pill_h as f64,
                 }
@@ -1695,11 +1694,7 @@ fn draw_area_rect(
 /// user's configured `AspectMode` (Automatic / Standard / Reduced /
 /// CommonOnly). Returns `None` when the configured mode declines to
 /// report a ratio (CommonOnly with no curated match).
-fn estimate_aspect_text(
-    width: u32,
-    height: u32,
-    mode: vernier_core::AspectMode,
-) -> Option<String> {
+fn estimate_aspect_text(width: u32, height: u32, mode: vernier_core::AspectMode) -> Option<String> {
     use vernier_core::{CommonRatio, Ratio};
     if width == 0 || height == 0 {
         return None;
@@ -1757,7 +1752,9 @@ fn push_pill(
     text_logical_px: f32,
 ) {
     use tiny_skia::*;
-    let Some(font) = hud_font() else { return; };
+    let Some(font) = hud_font() else {
+        return;
+    };
     let px_size = text_logical_px * scale_f;
     let text_w = measure_text_width(font, &text, px_size);
     let (ascent, descent) = font
@@ -1786,7 +1783,13 @@ fn push_pill(
     bg_paint.set_color_rgba8(40, 40, 40, 230);
     bg_paint.anti_alias = true;
     if let Some(path) = pill_path(pill_x, pill_y, pill_w, pill_h) {
-        pixmap.fill_path(&path, &bg_paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &bg_paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
     pills.push(PillLayout {
         text,
@@ -1826,8 +1829,7 @@ fn render_pill_text(
         } else {
             0.0
         };
-        let glyph_origin_y =
-            baseline - metrics.ymin as f32 - metrics.height as f32 + y_bias;
+        let glyph_origin_y = baseline - metrics.ymin as f32 - metrics.height as f32 + y_bias;
         composite_glyph(
             canvas,
             buf_w,
@@ -1842,6 +1844,7 @@ fn render_pill_text(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn composite_glyph(
     canvas: &mut [u8],
     buf_w: u32,
@@ -1898,11 +1901,18 @@ fn pill_dimensions_for_text(text: &str, scale_f: f32) -> (f32, f32) {
             .unwrap_or((px_size * 0.8, px_size * 0.2));
         (w, a, d)
     } else {
-        (text.len() as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2)
+        (
+            text.len() as f32 * px_size * 0.55,
+            px_size * 0.8,
+            px_size * 0.2,
+        )
     };
     let pad_x = 10.0 * scale_f;
     let pad_y = 5.0 * scale_f;
-    (text_w.ceil() + pad_x * 2.0, (ascent + descent).ceil() + pad_y * 2.0)
+    (
+        text_w.ceil() + pad_x * 2.0,
+        (ascent + descent).ceil() + pad_y * 2.0,
+    )
 }
 
 /// Tiny line-art camera icon centered at `(cx, cy)`. Sized in LOGICAL
@@ -1949,7 +1959,13 @@ fn draw_camera_icon(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
     pb.quad_to(body_x, body_y, body_x + radius, body_y);
     pb.close();
     if let Some(path) = pb.finish() {
-        pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &white,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     // Lens (dark filled circle) and a small highlight for liveliness.
@@ -1965,7 +1981,13 @@ fn draw_camera_icon(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
     let mut pb = PathBuilder::new();
     pb.push_circle(lens_cx + 0.8 * scale_f, lens_cy - 0.8 * scale_f, hi_r);
     if let Some(path) = pb.finish() {
-        pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &white,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -1979,13 +2001,13 @@ fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_
     // Slimmer and slightly taller — closer to the Hyprland default
     // silhouette in image #30 (sharp tip, refined tail).
     let pts: [(f32, f32); 7] = [
-        (0.0, 0.0),    // sharp tip
-        (0.0, 17.0),   // bottom of left edge
-        (4.5, 13.5),   // notch where tail starts
-        (7.5, 18.0),   // tail bottom-left
-        (9.0, 17.5),   // tail bottom-right
-        (5.5, 11.5),   // right notch
-        (10.5, 11.0),  // top of right edge
+        (0.0, 0.0),   // sharp tip
+        (0.0, 17.0),  // bottom of left edge
+        (4.5, 13.5),  // notch where tail starts
+        (7.5, 18.0),  // tail bottom-left
+        (9.0, 17.5),  // tail bottom-right
+        (5.5, 11.5),  // right notch
+        (10.5, 11.0), // top of right edge
     ];
     let mut pb = PathBuilder::new();
     pb.move_to(cx + pts[0].0 * s, cy + pts[0].1 * s);
@@ -2006,11 +2028,19 @@ fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_
     let mut black = Paint::default();
     black.set_color_rgba8(0, 0, 0, 255);
     black.anti_alias = true;
-    let mut stroke = Stroke::default();
-    stroke.width = 2.0;
-    stroke.line_join = LineJoin::Miter;
+    let stroke = Stroke {
+        width: 2.0,
+        line_join: LineJoin::Miter,
+        ..Default::default()
+    };
     pixmap.stroke_path(&path, &white, &stroke, Transform::identity(), None);
-    pixmap.fill_path(&path, &black, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &black,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Toast pill ("Tolerance: High" / "Screenshot taken"). Anchored in
@@ -2045,7 +2075,12 @@ fn draw_toast(
         (w, a, d, lh)
     } else {
         let widest = lines.iter().map(|l| l.len()).max().unwrap_or(0);
-        (widest as f32 * px_size * 0.55, px_size * 0.8, px_size * 0.2, px_size * 1.3)
+        (
+            widest as f32 * px_size * 0.55,
+            px_size * 0.8,
+            px_size * 0.2,
+            px_size * 1.3,
+        )
     };
     let pad_x = 22.0 * scale_f;
     let pad_y = 12.0 * scale_f;
@@ -2062,9 +2097,7 @@ fn draw_toast(
     bg.anti_alias = true;
     // Fixed corner radius (not a capsule) — a tall multi-line toast
     // with `pill_path`'s height-derived radius reads as a huge ellipse.
-    if let Some(path) =
-        rounded_rect_path(pill_x, pill_y, pill_w, pill_h, 12.0 * scale_f)
-    {
+    if let Some(path) = rounded_rect_path(pill_x, pill_y, pill_w, pill_h, 12.0 * scale_f) {
         pixmap.fill_path(&path, &bg, FillRule::Winding, Transform::identity(), None);
     }
     for (i, line) in lines.iter().enumerate() {
@@ -2204,7 +2237,13 @@ fn draw_context_menu(
             dpb.line_to(dx0, row_y + div_h);
             dpb.close();
             if let Some(path) = dpb.finish() {
-                pixmap.fill_path(&path, &dpaint, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &dpaint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
             row_y += div_h + div_pad_v;
         }
@@ -2365,7 +2404,13 @@ fn draw_menu_icon(
             pb.push_circle(cx - 2.5 * scale_f, cy + 1.0 * scale_f, dot_r);
             pb.push_circle(cx + 2.5 * scale_f, cy + 1.0 * scale_f, dot_r);
             if let Some(path) = pb.finish() {
-                pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &white,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
         }
         I::Restore => {
@@ -2449,7 +2494,13 @@ fn draw_menu_icon(
                 knobs.push_circle(cx + x_off * scale_f, y, knob_r);
             }
             if let Some(path) = knobs.finish() {
-                pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &white,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
         }
     }
@@ -2481,8 +2532,6 @@ fn pill_path(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
     pb.close();
     pb.finish()
 }
-
-
 
 /// Pre-multiplied RGBA, stored in memory as R G B A. Matches both
 /// tiny-skia's `PremultipliedColorU8` byte layout and wl_shm's
@@ -2680,11 +2729,7 @@ mod tests {
 
         let mut toasted = hud.clone();
         toasted.toast = Some(HudToast { text: "hi".into() });
-        assert_eq!(
-            static_hash(&toasted),
-            base,
-            "toast set changed static hash"
-        );
+        assert_eq!(static_hash(&toasted), base, "toast set changed static hash");
 
         let mut menu_open = hud.clone();
         menu_open.context_menu = Some(crate::HudContextMenu {
@@ -2736,11 +2781,16 @@ mod tests {
             rect_start: (1.0, 2.0),
             rect_end: (3.0, 4.0),
             cursor: (5.0, 6.0),
-            edges: [Some(HudEdge {
-                axis: crate::HudAxis::Left,
-                position: (5.0, 5.0),
-                distance_px: 10,
-            }), None, None, None],
+            edges: [
+                Some(HudEdge {
+                    axis: crate::HudAxis::Left,
+                    position: (5.0, 5.0),
+                    distance_px: 10,
+                }),
+                None,
+                None,
+                None,
+            ],
             camera_armed: true,
             cursor_in_rect: false,
         };

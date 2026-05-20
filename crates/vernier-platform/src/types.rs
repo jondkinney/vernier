@@ -170,8 +170,8 @@ pub struct Hud {
     /// rounding mode). Defaults to integer logical pixels with a
     /// "px" suffix.
     pub measurement_format: HudMeasurementFormat,
-    /// Show the live measurement crosshair (axis lines + tick caps
-    /// + `+` marker + W×H pill) on hover/held screens. When false
+    /// Show the live measurement crosshair (axis lines + tick caps +
+    /// `+` marker + W×H pill) on hover/held screens. When false
     /// the renderer skips that whole block. The move cursor
     /// (guides) and resize cursors (held-rect handles) are NOT
     /// gated by this — they remain visible since they're the
@@ -476,7 +476,10 @@ pub enum HudKind {
         edges: [Option<HudEdge>; 4],
     },
     /// User is mid-drag from `start` to `cursor`.
-    Drawing { start: (f64, f64), cursor: (f64, f64) },
+    Drawing {
+        start: (f64, f64),
+        cursor: (f64, f64),
+    },
     /// A measurement was committed and is being held on screen, while the
     /// live crosshair still tracks the cursor on top of it. Click again to
     /// start a new measurement; click on the W×H pill to capture the held
@@ -590,14 +593,20 @@ impl Accelerator {
                         }
                     }
                     if other.chars().count() == 1 {
-                        key = other.chars().next().map(|c| Key::Char(c.to_ascii_lowercase()));
+                        key = other
+                            .chars()
+                            .next()
+                            .map(|c| Key::Char(c.to_ascii_lowercase()));
                         continue;
                     }
                     return None;
                 }
             }
         }
-        Some(Self { modifiers, key: key? })
+        Some(Self {
+            modifiers,
+            key: key?,
+        })
     }
 
     /// Render back to a stable text form (`SHIFT+CTRL+ALT+SUPER+KEY`)
@@ -755,23 +764,38 @@ pub enum TrayMenuItem {
 #[derive(Debug, Clone)]
 pub enum PlatformEvent {
     HotkeyPressed(HotkeyId),
-    TrayMenuActivated { id: String },
+    TrayMenuActivated {
+        id: String,
+    },
     /// Tray icon was activated by the SNI host (left click on
     /// waybar). `x`/`y` are the host-supplied screen coordinates if
     /// available — many hosts pass `(0, 0)` on Wayland because
     /// `x_root` isn't meaningful, in which case the daemon falls
     /// back to querying the cursor position.
-    TrayIconLeftClicked { x: i32, y: i32 },
+    TrayIconLeftClicked {
+        x: i32,
+        y: i32,
+    },
     OverlayClosed(MonitorId),
     MonitorsChanged,
     /// Pointer entered the overlay surface for `monitor`.
-    PointerEnter { monitor: MonitorId, x: f64, y: f64 },
+    PointerEnter {
+        monitor: MonitorId,
+        x: f64,
+        y: f64,
+    },
     /// Pointer left the overlay surface for `monitor`.
-    PointerLeave { monitor: MonitorId },
+    PointerLeave {
+        monitor: MonitorId,
+    },
     /// Pointer moved over the overlay. Coordinates are surface-local
     /// pixels (not logical points; multiply your scale_factor when
     /// rendering at HiDPI).
-    PointerMove { monitor: MonitorId, x: f64, y: f64 },
+    PointerMove {
+        monitor: MonitorId,
+        x: f64,
+        y: f64,
+    },
     /// A mouse button was pressed (`pressed=true`) or released
     /// (`pressed=false`). `button` is a Linux input event code
     /// (BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112).

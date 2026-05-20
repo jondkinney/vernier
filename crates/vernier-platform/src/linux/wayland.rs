@@ -19,8 +19,6 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_pointer_constraints, delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
     reexports::protocols::wp::{
         cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
         pointer_constraints::zv1::client::{
@@ -29,10 +27,14 @@ use smithay_client_toolkit::{
             zwp_pointer_constraints_v1::Lifetime as PointerLifetime,
         },
     },
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager},
+        pointer::{
+            PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager,
+        },
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
     },
     shell::{
@@ -51,9 +53,9 @@ use wayland_client::{
 };
 
 use crate::{
-    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud,
-    MonitorId, MonitorInfo, NativeFrame, OverlayHandle, OverlayOps, PixelFormat, Platform,
-    PlatformError, PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
+    Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud, MonitorId,
+    MonitorInfo, NativeFrame, OverlayHandle, OverlayOps, PixelFormat, Platform, PlatformError,
+    PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
 };
 
 pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
@@ -85,11 +87,9 @@ pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
         })
         .map_err(|e| PlatformError::Other(anyhow::anyhow!("spawn wayland thread: {e}")))?;
 
-    ready_rx
-        .recv()
-        .map_err(|_| {
-            PlatformError::Other(anyhow::anyhow!("wayland event loop failed before ready"))
-        })??;
+    ready_rx.recv().map_err(|_| {
+        PlatformError::Other(anyhow::anyhow!("wayland event loop failed before ready"))
+    })??;
 
     let hotkey_service = match super::hotkey::create(events_tx.clone()) {
         Ok(s) => {
@@ -130,7 +130,10 @@ pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
             for s in &state.streams {
                 log::info!(
                     "  stream node_id={} pos={:?} size={:?} id={:?}",
-                    s.node_id, s.position, s.size, s.stream_id
+                    s.node_id,
+                    s.position,
+                    s.size,
+                    s.stream_id
                 );
             }
             match super::screencast::start_capture(state) {
@@ -189,18 +192,25 @@ impl Platform for WaylandPlatform {
 
     fn capture_screen_native(&self, monitor: MonitorId) -> Result<NativeFrame> {
         let guard = self.screencast_session.lock().unwrap();
-        let svc = guard.as_ref().ok_or_else(|| {
-            PlatformError::Other(anyhow::anyhow!("screencast not ready yet"))
-        })?;
-        let stream_info = svc.streams().first().ok_or_else(|| {
-            PlatformError::Other(anyhow::anyhow!("screencast has no streams"))
-        })?;
+        let svc = guard
+            .as_ref()
+            .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("screencast not ready yet")))?;
+        let stream_info = svc
+            .streams()
+            .first()
+            .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("screencast has no streams")))?;
         let captured = svc.latest_frame(stream_info.node_id).ok_or_else(|| {
             PlatformError::Other(anyhow::anyhow!(
                 "no frame captured yet — try again in a moment"
             ))
         })?;
-        let monitor_info = self.monitors.lock().unwrap().iter().find(|m| m.id == monitor).cloned();
+        let monitor_info = self
+            .monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == monitor)
+            .cloned();
         let (bounds, scale_factor) = monitor_info
             .map(|m| (m.bounds, m.scale_factor))
             .unwrap_or((Rect::default(), 1.0));
@@ -218,15 +228,18 @@ impl Platform for WaylandPlatform {
 
     fn capture_screen(&self, monitor: MonitorId) -> Result<Frame> {
         let guard = self.screencast_session.lock().unwrap();
-        let svc = guard.as_ref().ok_or_else(|| PlatformError::Other(
-            anyhow::anyhow!("screencast not ready yet — portal handshake or PipeWire connect still in flight"),
-        ))?;
+        let svc = guard.as_ref().ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!(
+                "screencast not ready yet — portal handshake or PipeWire connect still in flight"
+            ))
+        })?;
         // First-stream mapping: portal-side stream order matches the monitor
         // order the user picked in the consent dialog. Multi-monitor proper
         // mapping is a milestone-3 refinement.
-        let stream_info = svc.streams().first().ok_or_else(|| {
-            PlatformError::Other(anyhow::anyhow!("screencast has no streams"))
-        })?;
+        let stream_info = svc
+            .streams()
+            .first()
+            .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("screencast has no streams")))?;
         let captured = svc.latest_frame(stream_info.node_id).ok_or_else(|| {
             PlatformError::Other(anyhow::anyhow!(
                 "no frame captured yet — try again in a moment"
@@ -239,7 +252,13 @@ impl Platform for WaylandPlatform {
             captured.height,
             captured.format,
         );
-        let monitor_info = self.monitors.lock().unwrap().iter().find(|m| m.id == monitor).cloned();
+        let monitor_info = self
+            .monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == monitor)
+            .cloned();
         let (bounds, scale_factor) = monitor_info
             .map(|m| (m.bounds, m.scale_factor))
             .unwrap_or((Rect::default(), 1.0));
@@ -292,6 +311,9 @@ impl Platform for WaylandPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OverlayKey(u64);
 
+// Variants vary widely in size; Box-ing the largest would help memory
+// at the cost of touching every match arm. Skip for now.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Cmd {
     CreateOverlay {
@@ -372,7 +394,9 @@ impl OverlayOps for WaylandOverlay {
         } else {
             SystemPointerKind::Hidden
         };
-        let _ = self.cmd_tx.send(Cmd::OverlaySetSystemPointer(self.key, kind));
+        let _ = self
+            .cmd_tx
+            .send(Cmd::OverlaySetSystemPointer(self.key, kind));
     }
     fn confine_pointer(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let _ = self
@@ -684,12 +708,9 @@ impl WaylandState {
         // free us when the surface loses input focus (`Persistent`
         // would keep it reapplying on every refocus, which is more
         // than we need for a single drag gesture).
-        let region = Region::new(&self.compositor)
-            .ok()
-            .map(|r| {
-                r.add(x, y, w, h);
-                r
-            });
+        let region = Region::new(&self.compositor).ok().inspect(|r| {
+            r.add(x, y, w, h);
+        });
         let region_ref = region.as_ref().map(|r| r.wl_region());
         match self.pointer_constraints.confine_pointer(
             &surface,
@@ -700,9 +721,7 @@ impl WaylandState {
         ) {
             Ok(cp) => {
                 self.active_confined_pointer = Some(cp);
-                log::debug!(
-                    "pointer confined to surface rect ({x},{y}) {w}x{h}"
-                );
+                log::debug!("pointer confined to surface rect ({x},{y}) {w}x{h}");
             }
             Err(e) => log::warn!("confine_pointer failed: {e}"),
         }
@@ -881,7 +900,11 @@ impl WaylandState {
         };
         log::debug!(
             "draw_overlay key={:?} configured={} {}x{} visible={} frame_pending={}",
-            key, inst.configured, inst.width, inst.height, inst.visible_intent,
+            key,
+            inst.configured,
+            inst.width,
+            inst.height,
+            inst.visible_intent,
             inst.frame_pending,
         );
         if !inst.configured || inst.width == 0 || inst.height == 0 {
@@ -902,18 +925,17 @@ impl WaylandState {
         let buf_h = inst.height as i32 * scale;
         let stride = buf_w * 4;
 
-        let (buffer, canvas) = match self.pool.create_buffer(
-            buf_w,
-            buf_h,
-            stride,
-            wl_shm::Format::Abgr8888,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("shm create_buffer failed: {e}");
-                return;
-            }
-        };
+        let (buffer, canvas) =
+            match self
+                .pool
+                .create_buffer(buf_w, buf_h, stride, wl_shm::Format::Abgr8888)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("shm create_buffer failed: {e}");
+                    return;
+                }
+            };
 
         if !inst.visible_intent {
             // Hidden: clear to transparent.
@@ -947,9 +969,7 @@ impl WaylandState {
                 if bg == [0, 0, 0, 0] {
                     inst.combined_bg_static_pixmap.fill(0);
                 } else {
-                    for chunk in
-                        inst.combined_bg_static_pixmap.chunks_exact_mut(4)
-                    {
+                    for chunk in inst.combined_bg_static_pixmap.chunks_exact_mut(4) {
                         chunk.copy_from_slice(&bg);
                     }
                 }
@@ -999,13 +1019,7 @@ impl WaylandState {
             // `OverlaySetHud` handler — it's drawn by the OS
             // pointer cursor instead, so the screencast portal
             // strips it from live captures.
-            render_dynamic_onto(
-                canvas,
-                buf_w as u32,
-                buf_h as u32,
-                scale as u32,
-                hud,
-            );
+            render_dynamic_onto(canvas, buf_w as u32, buf_h as u32, scale as u32, hud);
         } else {
             // Plain tint, no HUD.
             let pixel = rgba8888_premul(inst.tint);
@@ -1057,14 +1071,11 @@ impl WaylandState {
             let Some(info) = self.output_state.info(&output) else {
                 continue;
             };
-            let id = *self
-                .output_to_id
-                .entry(info.id)
-                .or_insert_with(|| {
-                    let id = MonitorId(self.next_monitor_id);
-                    self.next_monitor_id += 1;
-                    id
-                });
+            let id = *self.output_to_id.entry(info.id).or_insert_with(|| {
+                let id = MonitorId(self.next_monitor_id);
+                self.next_monitor_id += 1;
+                id
+            });
             let (lw, lh) = info
                 .logical_size
                 .map(|(w, h)| (w as u32, h as u32))
@@ -1192,10 +1203,9 @@ impl PointerHandler for WaylandState {
                 self.last_pointer_enter = Some((pointer.clone(), serial));
                 if let Some(mgr) = &self.cursor_shape_manager {
                     let pid = pointer.id();
-                    if !self.pointer_shape_devices.contains_key(&pid) {
-                        let device = mgr.get_shape_device(pointer, _qh);
-                        self.pointer_shape_devices.insert(pid, device);
-                    }
+                    self.pointer_shape_devices
+                        .entry(pid)
+                        .or_insert_with(|| mgr.get_shape_device(pointer, _qh));
                 }
                 let kind = self
                     .overlay_pointer_kind
@@ -1535,7 +1545,8 @@ impl PointerConstraintsHandler for WaylandState {
         _locked_pointer: &ZwpLockedPointerV1,
         _surface: &wl_surface::WlSurface,
         _pointer: &wl_pointer::WlPointer,
-    ) {}
+    ) {
+    }
     fn unlocked(
         &mut self,
         _conn: &wayland_client::Connection,
@@ -1543,7 +1554,8 @@ impl PointerConstraintsHandler for WaylandState {
         _locked_pointer: &ZwpLockedPointerV1,
         _surface: &wl_surface::WlSurface,
         _pointer: &wl_pointer::WlPointer,
-    ) {}
+    ) {
+    }
 }
 // (delegate_pointer! already wires Dispatch for the wp_cursor_shape
 // manager + device through SCTK's CursorShapeManager.)
@@ -1588,7 +1600,6 @@ fn to_rgba8(
     dst
 }
 
-
 // HUD rasterization lives in `crate::hud_render`. The Wayland backend
 // caches the pre-baked bg+static composite and per cursor frame just
 // memcpys it into the SHM canvas then strokes the dynamic layer on
@@ -1607,10 +1618,8 @@ fn video_format_to_pixel_format(
         VF::RGBx => Ok(PixelFormat::Rgbx8),
         VF::xRGB => Ok(PixelFormat::Xrgb8),
         VF::xBGR => Ok(PixelFormat::Xbgr8),
-        other => Err(PlatformError::Unsupported {
-            what: match other {
-                _ => "unrecognized PipeWire video format",
-            },
+        _other => Err(PlatformError::Unsupported {
+            what: "unrecognized PipeWire video format",
         }),
     }
 }

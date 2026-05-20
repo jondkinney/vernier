@@ -324,7 +324,7 @@ impl ColorRgba {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RoundingMode {
     /// Display values as logical (point) pixels, fractional values
     /// allowed to one decimal place. `100.5px`.
@@ -333,6 +333,7 @@ pub enum RoundingMode {
     PointsRounded,
     /// Display physical (device) pixels — multiplies by the display
     /// scale factor before rounding. `201px` on a 2× display.
+    #[default]
     ScreenPixels,
 }
 
@@ -380,9 +381,10 @@ impl Default for IntegrationSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CopyFormat {
     /// `1024,768`
+    #[default]
     WidthCommaHeight,
     /// `768,1024`
     HeightCommaWidth,
@@ -600,16 +602,6 @@ impl Settings {
 impl Default for ToleranceLevel {
     fn default() -> Self {
         Self::Medium
-    }
-}
-impl Default for RoundingMode {
-    fn default() -> Self {
-        Self::ScreenPixels
-    }
-}
-impl Default for CopyFormat {
-    fn default() -> Self {
-        Self::WidthCommaHeight
     }
 }
 impl Default for ColorRgba {

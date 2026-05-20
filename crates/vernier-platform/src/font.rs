@@ -36,10 +36,9 @@ pub fn hud_font() -> Option<&'static fontdue::Font> {
         ];
         for path in CANDIDATES {
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = fontdue::Font::from_bytes(
-                    bytes.as_slice(),
-                    fontdue::FontSettings::default(),
-                ) {
+                if let Ok(font) =
+                    fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
+                {
                     log::info!("hud font: {path}");
                     return Some(font);
                 }

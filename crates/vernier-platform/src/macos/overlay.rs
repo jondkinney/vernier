@@ -216,8 +216,8 @@ impl OverlayOps for MacOverlay {
                         // crosshair. canBecomeKeyWindow on OverlayWindow
                         // permits the promotion; activate + makeKey
                         // actually performs it.
-                        let mtm = MainThreadMarker::new()
-                            .expect("set_input_capturing on main thread");
+                        let mtm =
+                            MainThreadMarker::new().expect("set_input_capturing on main thread");
                         let app = NSApplication::sharedApplication(mtm);
                         app.activateIgnoringOtherApps(true);
                         o.window.makeKeyAndOrderFront(None);
@@ -275,9 +275,7 @@ impl OverlayOps for MacOverlay {
         super::app::run_on_main_async(move || {
             super::with_main_state(|s| {
                 if let Some(o) = s.overlays.get(&monitor) {
-                    use crate::hud_render::{
-                        render_dynamic_into, render_static_into, static_hash,
-                    };
+                    use crate::hud_render::{render_dynamic_into, render_static_into, static_hash};
                     let ivars = o.view.ivars();
                     let tint = match &hud {
                         // Tint is the HUD background; the renderer
@@ -735,8 +733,8 @@ fn screen_to_view_xy(monitor: MonitorId, sx: f64, sy: f64) -> (f64, f64) {
 }
 
 fn install_tracking_area(view: &OverlayView, size: objc2_foundation::NSSize) {
-    use objc2_app_kit::{NSTrackingArea, NSTrackingAreaOptions};
     use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSTrackingArea, NSTrackingAreaOptions};
     let rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size,
@@ -824,9 +822,7 @@ fn transparent_cursor(view: &OverlayView) -> Retained<objc2_app_kit::NSCursor> {
     };
     let image = unsafe { NSImage::initWithSize(NSImage::alloc(), size) };
     let hot = NSPoint { x: 0.0, y: 0.0 };
-    let cursor = unsafe {
-        NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, hot)
-    };
+    let cursor = unsafe { NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, hot) };
     *view.ivars().transparent_cursor.borrow_mut() = Some(cursor.clone());
     cursor
 }

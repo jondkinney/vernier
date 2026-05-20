@@ -185,7 +185,6 @@ fn handoff_for_macos_bundle(bundle_path: &Path, display_name: &str) -> HandoffAp
     }
 }
 
-
 /// Quote `s` so `render_args`'s `.desktop`-style tokenizer keeps it
 /// as a single argv slot. Only quotes when whitespace is present;
 /// internal double-quotes are escaped the way the tokenizer's
@@ -526,7 +525,10 @@ mod macos_tests {
 
     #[test]
     fn shell_quote_wraps_paths_with_spaces() {
-        assert_eq!(shell_quote_for_template("/Applications/Shottr.app"), "/Applications/Shottr.app");
+        assert_eq!(
+            shell_quote_for_template("/Applications/Shottr.app"),
+            "/Applications/Shottr.app"
+        );
         assert_eq!(
             shell_quote_for_template("/Applications/Setapp/CleanShot X.app"),
             "\"/Applications/Setapp/CleanShot X.app\""

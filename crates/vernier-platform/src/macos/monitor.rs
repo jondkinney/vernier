@@ -12,8 +12,9 @@ fn monitors_main_thread() -> Result<Vec<MonitorInfo>> {
     let mtm = MainThreadMarker::new().expect("monitors_main_thread off-main");
     let screens = NSScreen::screens(mtm);
     let main_screen = NSScreen::mainScreen(mtm);
-    let main_screen_ptr =
-        main_screen.as_deref().map(|s| s as *const _ as *const () as usize);
+    let main_screen_ptr = main_screen
+        .as_deref()
+        .map(|s| s as *const _ as *const () as usize);
 
     let mut out = Vec::with_capacity(screens.len());
     for (idx, screen) in screens.iter().enumerate() {
@@ -22,7 +23,9 @@ fn monitors_main_thread() -> Result<Vec<MonitorInfo>> {
         // NSScreen::localizedName landed in macOS 10.15.
         let name = screen.localizedName().to_string();
         let screen_ptr = (&**screen) as *const _ as *const () as usize;
-        let is_primary = main_screen_ptr.map(|mp| screen_ptr == mp).unwrap_or(idx == 0);
+        let is_primary = main_screen_ptr
+            .map(|mp| screen_ptr == mp)
+            .unwrap_or(idx == 0);
         out.push(MonitorInfo {
             // Stable per-session: NSScreen ordering is stable
             // until display configuration changes. `idx` works.
@@ -52,7 +55,10 @@ fn focused_app_main_thread() -> Result<Option<AppIdentity>> {
         return Ok(None);
     };
     let bundle = app.bundleIdentifier().map(|s| s.to_string());
-    let name = app.localizedName().map(|s| s.to_string()).unwrap_or_default();
+    let name = app
+        .localizedName()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     let exe = app
         .executableURL()
         .and_then(|url| url.path())

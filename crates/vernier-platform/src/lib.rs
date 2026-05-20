@@ -144,10 +144,7 @@ where
 ///
 /// MUST be called on the main thread.
 #[cfg(target_os = "macos")]
-pub fn extract_macos_app_icon_rgba(
-    bundle_path: &std::path::Path,
-    size: u32,
-) -> Option<Vec<u8>> {
+pub fn extract_macos_app_icon_rgba(bundle_path: &std::path::Path, size: u32) -> Option<Vec<u8>> {
     macos::extract_macos_app_icon_rgba(bundle_path, size)
 }
 
@@ -194,22 +191,16 @@ pub fn promote_to_foreground_application() {
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
-        fn TransformProcessType(
-            psn: *const ProcessSerialNumber,
-            transform_type: u32,
-        ) -> c_int;
+        fn TransformProcessType(psn: *const ProcessSerialNumber, transform_type: u32) -> c_int;
     }
     let psn = ProcessSerialNumber {
         high: 0,
         low: K_CURRENT_PROCESS,
     };
-    let status = unsafe {
-        TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION)
-    };
+    let status =
+        unsafe { TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION) };
     if status != 0 {
-        log::warn!(
-            "promote_to_foreground_application: TransformProcessType returned {status}"
-        );
+        log::warn!("promote_to_foreground_application: TransformProcessType returned {status}");
         return;
     }
     log::info!("macos: promoted process to ForegroundApplication");
@@ -231,13 +222,9 @@ pub fn promote_to_foreground_application() {
             std::thread::sleep(std::time::Duration::from_millis(400));
             let running = unsafe { NSRunningApplication::currentApplication() };
             unsafe {
-                running.activateWithOptions(
-                    NSApplicationActivationOptions::ActivateAllWindows,
-                );
+                running.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
             }
-            log::info!(
-                "macos: deferred activate fired (NSRunningApplication.activateWithOptions)"
-            );
+            log::info!("macos: deferred activate fired (NSRunningApplication.activateWithOptions)");
         })
         .expect("spawn vernier-foreground-activate thread");
 }
@@ -252,8 +239,7 @@ pub fn promote_to_foreground_application() {
 #[cfg(target_os = "macos")]
 pub fn focus_macos_app_by_pid(pid: i32) {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-    let Some(app) =
-        (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
+    let Some(app) = (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
     else {
         log::debug!("focus_macos_app_by_pid: no NSRunningApplication for pid {pid}");
         return;
@@ -543,12 +529,17 @@ mod icon_extract_test {
             "/System/Applications/Preview.app",
         ] {
             let result = extract_macos_app_icon_rgba(std::path::Path::new(app), 128);
-            eprintln!("{app}: {}", match &result {
-                Some(b) => format!("Some({} bytes, {} non-transparent)",
-                    b.len(),
-                    b.chunks_exact(4).filter(|p| p[3] > 0).count()),
-                None => "None".into(),
-            });
+            eprintln!(
+                "{app}: {}",
+                match &result {
+                    Some(b) => format!(
+                        "Some({} bytes, {} non-transparent)",
+                        b.len(),
+                        b.chunks_exact(4).filter(|p| p[3] > 0).count()
+                    ),
+                    None => "None".into(),
+                }
+            );
         }
     }
 }

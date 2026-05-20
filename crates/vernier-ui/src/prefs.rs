@@ -9,7 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use eframe::{egui, App, CreationContext, Frame, NativeOptions};
+use eframe::{App, CreationContext, Frame, NativeOptions, egui};
 use vernier_core::{
     AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
@@ -169,9 +169,11 @@ impl PrefsApp {
         // its own because it depends on update() running.
         {
             let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(500));
-                ctx.request_repaint();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    ctx.request_repaint();
+                }
             });
         }
         let logo = load_logo_texture(&cc.egui_ctx);
@@ -187,11 +189,7 @@ impl PrefsApp {
                 .into_iter()
                 .map(|app| {
                     let tex_name = format!("handoff_dropdown_{}", app.command);
-                    let tex = load_handoff_icon_texture(
-                        &cc.egui_ctx,
-                        &tex_name,
-                        &app.icon_path,
-                    );
+                    let tex = load_handoff_icon_texture(&cc.egui_ctx, &tex_name, &app.icon_path);
                     (app, tex)
                 })
                 .collect();
@@ -302,9 +300,7 @@ impl App for PrefsApp {
             match rx.try_recv() {
                 Ok(authorized) => {
                     if authorized != self.screen_recording_ok {
-                        log::info!(
-                            "prefs: screen-recording authorized -> {authorized}"
-                        );
+                        log::info!("prefs: screen-recording authorized -> {authorized}");
                     }
                     self.screen_recording_ok = authorized;
                     self.screen_recording_probe = None;
@@ -323,8 +319,7 @@ impl App for PrefsApp {
         if self.screen_recording_probe.is_none()
             && self.last_recording_probe.elapsed() > Duration::from_secs(3)
         {
-            self.screen_recording_probe =
-                Some(vernier_platform::probe_screen_recording());
+            self.screen_recording_probe = Some(vernier_platform::probe_screen_recording());
             self.last_recording_probe = Instant::now();
         }
 
@@ -341,41 +336,23 @@ impl App for PrefsApp {
                     CaptureOutcome::Commit(s) => {
                         match target {
                             ShortcutId::Toggle => self.edited.shortcuts.toggle = s,
-                            ShortcutId::ClearAndHide => {
-                                self.edited.shortcuts.clear_and_hide = s
-                            }
-                            ShortcutId::ClearAndExit => {
-                                self.edited.shortcuts.clear_and_exit = s
-                            }
+                            ShortcutId::ClearAndHide => self.edited.shortcuts.clear_and_hide = s,
+                            ShortcutId::ClearAndExit => self.edited.shortcuts.clear_and_exit = s,
                             ShortcutId::Restore => self.edited.shortcuts.restore_session = s,
                             ShortcutId::Capture => self.edited.shortcuts.capture = s,
-                            ShortcutId::Crosshair => {
-                                self.edited.shortcuts.crosshair_mode = s
-                            }
+                            ShortcutId::Crosshair => self.edited.shortcuts.crosshair_mode = s,
                             ShortcutId::GuideHorizontal => {
                                 self.edited.shortcuts.guide_horizontal = s
                             }
-                            ShortcutId::GuideVertical => {
-                                self.edited.shortcuts.guide_vertical = s
-                            }
-                            ShortcutId::ColorToggle => {
-                                self.edited.shortcuts.color_toggle = s
-                            }
+                            ShortcutId::GuideVertical => self.edited.shortcuts.guide_vertical = s,
+                            ShortcutId::ColorToggle => self.edited.shortcuts.color_toggle = s,
                             ShortcutId::StuckHorizontal => {
                                 self.edited.shortcuts.stuck_horizontal = s
                             }
-                            ShortcutId::StuckVertical => {
-                                self.edited.shortcuts.stuck_vertical = s
-                            }
-                            ShortcutId::RefreshCapture => {
-                                self.edited.shortcuts.refresh_capture = s
-                            }
-                            ShortcutId::ToleranceUp => {
-                                self.edited.shortcuts.tolerance_up = s
-                            }
-                            ShortcutId::ToleranceDown => {
-                                self.edited.shortcuts.tolerance_down = s
-                            }
+                            ShortcutId::StuckVertical => self.edited.shortcuts.stuck_vertical = s,
+                            ShortcutId::RefreshCapture => self.edited.shortcuts.refresh_capture = s,
+                            ShortcutId::ToleranceUp => self.edited.shortcuts.tolerance_up = s,
+                            ShortcutId::ToleranceDown => self.edited.shortcuts.tolerance_down = s,
                             ShortcutId::NudgeLeft => self.edited.shortcuts.nudge_left = s,
                             ShortcutId::NudgeRight => self.edited.shortcuts.nudge_right = s,
                             ShortcutId::NudgeUp => self.edited.shortcuts.nudge_up = s,
@@ -480,10 +457,7 @@ impl App for PrefsApp {
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
                     if let Some(logo) = &self.logo {
-                        ui.add(
-                            egui::Image::new(logo)
-                                .fit_to_exact_size(egui::vec2(28.0, 28.0)),
-                        );
+                        ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
                         ui.add_space(8.0);
                     }
                     ui.heading("Vernier");
@@ -532,8 +506,7 @@ impl App for PrefsApp {
                                 relaunch_daemon_now();
                                 // Force the next probe to fire immediately so the
                                 // banner clears as soon as the new daemon binds.
-                                self.last_daemon_probe =
-                                    Instant::now() - Duration::from_secs(60);
+                                self.last_daemon_probe = Instant::now() - Duration::from_secs(60);
                             }
                         }
                     }
@@ -559,7 +532,10 @@ impl App for PrefsApp {
                             self.save_now();
                         }
                         ui.add_space(4.0);
-                        if ui.add_enabled(revertable, egui::Button::new("Revert")).clicked() {
+                        if ui
+                            .add_enabled(revertable, egui::Button::new("Revert"))
+                            .clicked()
+                        {
                             self.revert_now();
                         }
                         if dirty {
@@ -571,8 +547,7 @@ impl App for PrefsApp {
                             // circle from the painter avoids the
                             // font dependency entirely.
                             let dot_size = egui::vec2(8.0, 8.0);
-                            let (rect, _) =
-                                ui.allocate_exact_size(dot_size, egui::Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(dot_size, egui::Sense::hover());
                             ui.painter().circle_filled(
                                 rect.center(),
                                 4.0,
@@ -604,10 +579,7 @@ impl App for PrefsApp {
                 .frame(
                     egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(60, 32, 32))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(170, 80, 70),
-                        ))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 80, 70)))
                         .inner_margin(egui::Margin::symmetric(20, 12)),
                 )
                 .show(ctx, |ui| {
@@ -653,7 +625,10 @@ impl App for PrefsApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(20, 18)))
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(20, 18)),
+            )
             .show(ctx, |ui| {
                 if !matches!(self.section, Section::About) {
                     ui.heading(self.section.label());
@@ -672,9 +647,7 @@ impl App for PrefsApp {
                             &self.installed_handoff_apps,
                         ),
                         Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
-                        Section::Appearance => {
-                            appearance_section(ui, &mut self.edited.appearance)
-                        }
+                        Section::Appearance => appearance_section(ui, &mut self.edited.appearance),
                         Section::Integrations => {
                             integrations_section(ui, &mut self.edited.integrations)
                         }
@@ -844,10 +817,7 @@ fn paint_daemon_dead_modal(ctx: &egui::Context, last_probe: &mut Instant) {
     if relaunch_clicked {
         if let Ok(exe) = std::env::current_exe() {
             match std::process::Command::new(&exe).spawn() {
-                Ok(c) => log::info!(
-                    "daemon relaunched from prefs modal (pid {})",
-                    c.id()
-                ),
+                Ok(c) => log::info!("daemon relaunched from prefs modal (pid {})", c.id()),
                 Err(e) => log::warn!("relaunch from prefs modal failed: {e:#}"),
             }
         }
@@ -869,7 +839,10 @@ fn apply_style(ctx: &egui::Context) {
         style.text_styles = [
             (Heading, egui::FontId::new(21.0, Proportional)),
             (Body, egui::FontId::new(14.0, Proportional)),
-            (Monospace, egui::FontId::new(13.0, egui::FontFamily::Monospace)),
+            (
+                Monospace,
+                egui::FontId::new(13.0, egui::FontFamily::Monospace),
+            ),
             (Button, egui::FontId::new(14.0, Proportional)),
             (Small, egui::FontId::new(12.0, Proportional)),
         ]
@@ -937,9 +910,8 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     }
 
     // Omarchy launcher glyph at U+E900.
-    let omarchy_path = std::env::var_os("HOME").map(|h| {
-        std::path::PathBuf::from(h).join(".local/share/fonts/omarchy.ttf")
-    });
+    let omarchy_path = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".local/share/fonts/omarchy.ttf"));
     if let Some(path) = omarchy_path {
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -959,8 +931,7 @@ fn install_glyph_fonts(ctx: &egui::Context) {
                     .font_data
                     .insert("omarchy".into(), std::sync::Arc::new(data));
                 shortcut_chain.push("omarchy".to_string());
-                OMARCHY_FONT_AVAILABLE
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                OMARCHY_FONT_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 log::debug!("omarchy font not loaded ({}): {e}", path.display());
@@ -975,11 +946,7 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     // the family unbound, and the Shortcuts pane would panic at
     // first paint with "FontFamily::Name(\"shortcut\") is not
     // bound to any fonts".
-    if let Some(default_prop) = fonts
-        .families
-        .get(&egui::FontFamily::Proportional)
-        .cloned()
-    {
+    if let Some(default_prop) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
         shortcut_chain.extend(default_prop);
     }
     fonts
@@ -1100,16 +1067,15 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     let s = &mut settings.general;
     setting(ui, |ui| {
         ui.checkbox(&mut s.launch_at_login, "Launch at login");
-        caption(ui, 
-            "Adds an autostart entry. Uncheck to remove it on save.",
-        );
+        caption(ui, "Adds an autostart entry. Uncheck to remove it on save.");
     });
     setting(ui, |ui| {
         let mut show_tray = !s.hide_tray_icon;
         if ui.checkbox(&mut show_tray, "Show tray icon").changed() {
             s.hide_tray_icon = !show_tray;
         }
-        caption(ui, 
+        caption(
+            ui,
             "Off keeps the daemon running but hides the tray menu. Drive it via the global hotkey or `vernier toggle`.",
         );
     });
@@ -1150,7 +1116,8 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
             &mut s.copy_dimensions_linebreak,
             "Line break between width and height",
         );
-        caption(ui,
+        caption(
+            ui,
             "Format used when the copy-dimensions shortcut puts a held rectangle's width and height on the clipboard. The unit applies to the CSS and SASS formats — rem divides by the base font size.",
         );
     });
@@ -1173,8 +1140,12 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
             "Screen pixels (multiplied by display scale)",
         );
         ui.checkbox(&mut s.display_units, "Display units");
-        ui.checkbox(&mut s.display_wh_indicators, "Display width/height indicators");
-        caption(ui,
+        ui.checkbox(
+            &mut s.display_wh_indicators,
+            "Display width/height indicators",
+        );
+        caption(
+            ui,
             "How dimensions are reported on scaled displays. Screen pixels is the exact device-pixel count, identical to logical pixels on 1\u{00D7} displays; the Points modes divide by the display scale. Display units appends a `px` suffix; W/H indicators prefix area pills with `W:` / `H:`.",
         );
     });
@@ -1182,12 +1153,15 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
     setting(ui, |ui| {
         field_label(ui, "Cursor");
         ui.checkbox(&mut s.show_cursor, "Show");
-        caption(ui, &format!(
-            "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
+        caption(
+            ui,
+            &format!(
+                "Toggle the white-outlined `+` over the cursor. Off hides only the `+`, \
              leaving the axis lines, ticks, and W\u{00D7}H pill rendering. \
              Hold {} to hide the cursor momentarily for a clean read.",
-            alt_key_label(),
-        ));
+                alt_key_label(),
+            ),
+        );
     });
 
     setting(ui, |ui| {
@@ -1220,13 +1194,16 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
         field_label(ui, "Distance tool");
         ui.checkbox(&mut s.snap_to_guides, "Snap to guides");
         ui.checkbox(&mut s.snap_to_objects, "Snap to selected objects");
-        caption(ui, &format!(
-            "Snap to guides magnetizes drag endpoints to the nearest reference guide \
+        caption(
+            ui,
+            &format!(
+                "Snap to guides magnetizes drag endpoints to the nearest reference guide \
              (30 px on the initial click, 8 px during and at the end of the drag). \
              Snap to selected objects stops the live measurement on the edges of held \
              rectangles. Hold {} to measure freeform.",
-            alt_key_label(),
-        ));
+                alt_key_label(),
+            ),
+        );
     });
 
     setting(ui, |ui| {
@@ -1244,18 +1221,24 @@ fn general_section(ui: &mut egui::Ui, settings: &mut Settings) {
                 false,
                 egui::Checkbox::new(&mut s.freeze_screen, "Freeze screen"),
             );
-            caption(ui, &format!(
-                "Required on Wayland: the compositor's screencast captures Vernier's own \
+            caption(
+                ui,
+                &format!(
+                    "Required on Wayland: the compositor's screencast captures Vernier's own \
                  overlay along with the screen, so live measurements were inaccurate. Live \
                  mode needs upstream support for excluding overlay layers from the capture. \
                  Press `{refresh_key}` while measuring to refresh the frozen frame.",
-            ));
+                ),
+            );
         } else {
             ui.checkbox(&mut s.freeze_screen, "Freeze screen");
-            caption(ui, &format!(
-                "On (default): the captured frame is locked when measure mode opens; press `{refresh_key}` to refresh manually. \
+            caption(
+                ui,
+                &format!(
+                    "On (default): the captured frame is locked when measure mode opens; press `{refresh_key}` to refresh manually. \
                  Off: edge detection follows live screen content as the cursor moves.",
-            ));
+                ),
+            );
         }
     });
 }
@@ -1280,17 +1263,14 @@ fn screenshots_section(
             field_label(ui, "Context margin");
             let mut pad = s.padding_px as i32;
             if ui
-                .add(
-                    egui::DragValue::new(&mut pad)
-                        .range(0..=64)
-                        .suffix(" px"),
-                )
+                .add(egui::DragValue::new(&mut pad).range(0..=64).suffix(" px"))
                 .changed()
             {
                 s.padding_px = pad.max(0) as u32;
             }
         });
-        caption(ui,
+        caption(
+            ui,
             "Pixels of extra screen content captured outside the measured region — \
              useful for annotation context, since the W×H is already in the saved image.",
         );
@@ -1298,14 +1278,16 @@ fn screenshots_section(
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.retina_downscale, "Retina downscale");
-        caption(ui, 
+        caption(
+            ui,
             "Save the captured region at logical (point) pixels rather than the raw HiDPI buffer.",
         );
     });
 
     setting(ui, |ui| {
         ui.checkbox(&mut s.capture_sound, "Play shutter sound");
-        caption(ui, 
+        caption(
+            ui,
             "Plays the system screen-capture sound when a screenshot fires.",
         );
     });
@@ -1313,7 +1295,8 @@ fn screenshots_section(
     setting(ui, |ui| {
         field_label(ui, "Take normal screenshot (right-click menu)");
         padded_text_edit(ui, &mut s.external_screenshot_command);
-        caption(ui, 
+        caption(
+            ui,
             "Shell command for \"Take Normal Screenshot\" (right-click menu / `CTRL+S`). \
              Vernier exits measure mode first, then spawns this via `sh -c` so pipelines work, \
              e.g. `grim -g \"$(slurp)\" - | wl-copy`. Distinct from the handoff app above, \
@@ -1333,18 +1316,22 @@ fn screenshots_section(
     // on `detail_enabled`.
     field_label(ui, "Vernier-managed save");
     if detail_enabled {
-        caption(ui,
+        caption(
+            ui,
             "Where Vernier writes the captured PNG, the filename template, \
              and post-capture clipboard / notification behavior. Active \
              because handoff is off.",
         );
     } else {
-        caption(ui, &format!(
-            "Disabled because handoff is on — {} owns where the screenshot \
+        caption(
+            ui,
+            &format!(
+                "Disabled because handoff is on — {} owns where the screenshot \
              goes, its filename, and any clipboard / edit-action behavior. \
              Turn the Enable checkbox above off to manage these here.",
-            handoff_label_for(s),
-        ));
+                handoff_label_for(s),
+            ),
+        );
     }
     ui.add_space(8.0);
     ui.add_enabled_ui(detail_enabled, |ui| {
@@ -1388,7 +1375,7 @@ fn screenshots_section(
                 *folder_pick = Some(rx);
             }
         });
-        caption(ui, 
+        caption(ui,
             "Empty = $XDG_PICTURES_DIR (or ~/Pictures). Non-existent paths are created on capture.",
         );
     });
@@ -1477,18 +1464,14 @@ fn paint_handoff_card(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(tex) = icon {
-                    ui.add(
-                        egui::Image::new(tex).fit_to_exact_size(egui::vec2(72.0, 72.0)),
-                    );
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(72.0, 72.0)));
                     ui.add_space(14.0);
                 } else {
                     // Placeholder square so the layout stays consistent
                     // in the empty state (and when a picked app's
                     // icon couldn't be resolved).
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(72.0, 72.0),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(72.0, 72.0), egui::Sense::hover());
                     ui.painter().rect_filled(
                         rect,
                         egui::CornerRadius::same(14),
@@ -1527,9 +1510,7 @@ fn paint_handoff_card(
                         let pick_enabled = handoff_pick.is_none();
                         if ui
                             .add_enabled(pick_enabled, egui::Button::new("Browse…"))
-                            .on_hover_text(
-                                "Pick a binary that isn't in the dropdown list",
-                            )
+                            .on_hover_text("Pick a binary that isn't in the dropdown list")
                             .clicked()
                         {
                             let starting = if has_pick {
@@ -1541,8 +1522,8 @@ fn paint_handoff_card(
                             };
                             let (tx, rx) = std::sync::mpsc::channel();
                             std::thread::spawn(move || {
-                                let mut dialog = rfd::FileDialog::new()
-                                    .set_title("Choose screenshot app");
+                                let mut dialog =
+                                    rfd::FileDialog::new().set_title("Choose screenshot app");
                                 let start = starting
                                     .filter(|p| p.exists())
                                     .unwrap_or_else(|| PathBuf::from("/usr/bin"));
@@ -1680,10 +1661,7 @@ fn paint_handoff_dropdown(
                     let w = ui.available_width();
                     ui.set_min_width(w);
                     if let Some(t) = tex {
-                        ui.add(
-                            egui::Image::new(t)
-                                .fit_to_exact_size(egui::vec2(20.0, 20.0)),
-                        );
+                        ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(20.0, 20.0)));
                         ui.add_space(6.0);
                     } else {
                         // Reserve the same horizontal slot when no
@@ -1727,10 +1705,8 @@ fn tick_slider(
     width: f32,
 ) -> egui::Response {
     let height = 16.0;
-    let (rect, mut response) = ui.allocate_exact_size(
-        egui::vec2(width, height),
-        egui::Sense::click_and_drag(),
-    );
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
 
     let knob_radius = 5.5;
     let track_left = rect.left() + knob_radius;
@@ -1769,11 +1745,7 @@ fn tick_slider(
         egui::pos2(track_left, track_y - rail_thickness * 0.5),
         egui::pos2(track_right, track_y + rail_thickness * 0.5),
     );
-    painter.rect_filled(
-        rail_rect,
-        egui::CornerRadius::same(2),
-        rail_color,
-    );
+    painter.rect_filled(rail_rect, egui::CornerRadius::same(2), rail_color);
 
     // Tick notches drawn ON the rail (vertical lines slightly
     // taller than the rail so they read as a visual ruler — no
@@ -1818,7 +1790,8 @@ fn tick_slider(
 }
 
 fn tolerance_section(ui: &mut egui::Ui, s: &mut ToleranceSettings) {
-    caption(ui, 
+    caption(
+        ui,
         "Numeric value (sum-of-channel difference, 0–255) for each tolerance level. \
          Live + / − cycles between levels in a session; the dropdown picks which one \
          is active each time measure mode opens.",
@@ -1875,14 +1848,11 @@ fn tolerance_section(ui: &mut egui::Ui, s: &mut ToleranceSettings) {
             });
         // Push the Restore Defaults button to the far right so it
         // doesn't crowd the dropdown.
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                if ui.button("Restore Defaults").clicked() {
-                    *s = ToleranceSettings::default();
-                }
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Restore Defaults").clicked() {
+                *s = ToleranceSettings::default();
+            }
+        });
     });
 }
 
@@ -1903,7 +1873,10 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
     });
 
     setting(ui, |ui| {
-        field_label(ui, "Alternative guide color (toggled with `x` while placing)");
+        field_label(
+            ui,
+            "Alternative guide color (toggled with `x` while placing)",
+        );
         color_picker(ui, &mut s.alternative_guide_color);
     });
 
@@ -1935,10 +1908,8 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
         .inner_margin(egui::Margin::symmetric(18, 16))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(72.0, 72.0),
-                    egui::Sense::hover(),
-                );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(72.0, 72.0), egui::Sense::hover());
                 ui.painter().rect_filled(
                     rect,
                     egui::CornerRadius::same(14),
@@ -1953,11 +1924,7 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
                 );
                 ui.add_space(14.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Figma integration")
-                            .size(16.0)
-                            .strong(),
-                    );
+                    ui.label(egui::RichText::new("Figma integration").size(16.0).strong());
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
@@ -1978,23 +1945,14 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
                         );
                     ui.add_space(8.0);
 
-                    let connected = vernier_platform::figma_bridge::current_figma_zoom()
-                        .is_some();
+                    let connected = vernier_platform::figma_bridge::current_figma_zoom().is_some();
                     ui.horizontal(|ui| {
-                        let (dot_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(10.0, 10.0),
-                            egui::Sense::hover(),
-                        );
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                         let (color, label) = if connected {
-                            (
-                                egui::Color32::from_rgb(80, 200, 120),
-                                "Plugin connected",
-                            )
+                            (egui::Color32::from_rgb(80, 200, 120), "Plugin connected")
                         } else {
-                            (
-                                egui::Color32::from_gray(120),
-                                "Plugin not connected",
-                            )
+                            (egui::Color32::from_gray(120), "Plugin not connected")
                         };
                         ui.painter().circle_filled(dot_rect.center(), 5.0, color);
                         ui.label(
@@ -2071,7 +2029,10 @@ fn shortcuts_section(
     if let Some(path) = static_bind_warning {
         egui::Frame::NONE
             .fill(egui::Color32::from_rgb(60, 48, 16))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 140, 50)))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(180, 140, 50),
+            ))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -2283,7 +2244,8 @@ fn shortcuts_section(
         capturing,
     );
     ui.add_space(4.0);
-    caption(ui, 
+    caption(
+        ui,
         "Nudge shortcuts: hold Shift to step 10 px instead of 1 px (built-in modifier).",
     );
     // See appearance_section for the rationale on dropping
@@ -2474,8 +2436,8 @@ fn shortcut_chip_segments(stored: &str) -> Vec<ChipSeg> {
 }
 
 const CHIP_GLYPH_SIZE: f32 = 14.0; // square box (px) each painter glyph fits in
-const CHIP_LETTER_PT: f32 = 15.0;  // letters / SUPER font size — sized to match omarchy cap height
-const CHIP_GAP: f32 = 6.0;         // gap between segments
+const CHIP_LETTER_PT: f32 = 15.0; // letters / SUPER font size — sized to match omarchy cap height
+const CHIP_GAP: f32 = 6.0; // gap between segments
 
 fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
     match seg {
@@ -2483,14 +2445,10 @@ fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
         ChipSeg::OmarchyLogo => measure_chip_text(ctx, "\u{e900}", CHIP_LETTER_PT),
         // Painter glyphs: most fit in a square, plus/equal/minus/underscore
         // get a slightly wider box so the bars look proportional.
-        ChipSeg::Shift
-        | ChipSeg::Ctrl
-        | ChipSeg::Alt
-        | ChipSeg::Enter
-        | ChipSeg::Arrow(_) => CHIP_GLYPH_SIZE,
-        ChipSeg::Plus | ChipSeg::Minus | ChipSeg::Equal | ChipSeg::Underscore => {
+        ChipSeg::Shift | ChipSeg::Ctrl | ChipSeg::Alt | ChipSeg::Enter | ChipSeg::Arrow(_) => {
             CHIP_GLYPH_SIZE
         }
+        ChipSeg::Plus | ChipSeg::Minus | ChipSeg::Equal | ChipSeg::Underscore => CHIP_GLYPH_SIZE,
     }
 }
 
@@ -2606,17 +2564,11 @@ fn paint_caret(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
     let foot_y = rect.top() + h * 0.55;
     let stroke = egui::Stroke::new(2.4, color);
     painter.line_segment(
-        [
-            egui::pos2(cx - w * 0.40, foot_y),
-            egui::pos2(cx, apex_y),
-        ],
+        [egui::pos2(cx - w * 0.40, foot_y), egui::pos2(cx, apex_y)],
         stroke,
     );
     painter.line_segment(
-        [
-            egui::pos2(cx, apex_y),
-            egui::pos2(cx + w * 0.40, foot_y),
-        ],
+        [egui::pos2(cx, apex_y), egui::pos2(cx + w * 0.40, foot_y)],
         stroke,
     );
 }
@@ -2647,22 +2599,34 @@ fn paint_alt(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let corner_bot_x = left + w * 0.52;
     // Top-LEFT horizontal.
     painter.line_segment(
-        [egui::pos2(left + w * 0.02, top_y), egui::pos2(corner_top_x, top_y)],
+        [
+            egui::pos2(left + w * 0.02, top_y),
+            egui::pos2(corner_top_x, top_y),
+        ],
         stroke,
     );
     // Diagonal connector: bar-corner top to bar-corner bottom.
     painter.line_segment(
-        [egui::pos2(corner_top_x, top_y), egui::pos2(corner_bot_x, bot_y)],
+        [
+            egui::pos2(corner_top_x, top_y),
+            egui::pos2(corner_bot_x, bot_y),
+        ],
         stroke,
     );
     // Bottom-RIGHT horizontal — starts where the diagonal lands.
     painter.line_segment(
-        [egui::pos2(corner_bot_x, bot_y), egui::pos2(left + w * 0.92, bot_y)],
+        [
+            egui::pos2(corner_bot_x, bot_y),
+            egui::pos2(left + w * 0.92, bot_y),
+        ],
         stroke,
     );
     // Detached upper-right segment.
     painter.line_segment(
-        [egui::pos2(left + w * 0.64, top_y), egui::pos2(left + w * 0.92, top_y)],
+        [
+            egui::pos2(left + w * 0.64, top_y),
+            egui::pos2(left + w * 0.92, top_y),
+        ],
         stroke,
     );
 }
@@ -2693,9 +2657,11 @@ fn paint_enter(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
         egui::pos2(left_x + 4.0, mid_y - 3.0),
         egui::pos2(left_x + 4.0, mid_y + 3.0),
     ];
-    painter.add(egui::Shape::Path(
-        egui::epaint::PathShape::convex_polygon(head, color, egui::Stroke::NONE),
-    ));
+    painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
+        head,
+        color,
+        egui::Stroke::NONE,
+    )));
 }
 
 /// Identical arrow shape rotated for each direction so the four
@@ -2721,9 +2687,11 @@ fn paint_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, 
                 egui::pos2(cx - half_head, head_base_y),
                 egui::pos2(cx + half_head, head_base_y),
             ];
-            painter.add(egui::Shape::Path(
-                egui::epaint::PathShape::convex_polygon(head, color, egui::Stroke::NONE),
-            ));
+            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
+                head,
+                color,
+                egui::Stroke::NONE,
+            )));
         }
         ArrowDir::Down => {
             let cx = rect.center().x;
@@ -2739,9 +2707,11 @@ fn paint_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, 
                 egui::pos2(cx - half_head, head_base_y),
                 egui::pos2(cx + half_head, head_base_y),
             ];
-            painter.add(egui::Shape::Path(
-                egui::epaint::PathShape::convex_polygon(head, color, egui::Stroke::NONE),
-            ));
+            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
+                head,
+                color,
+                egui::Stroke::NONE,
+            )));
         }
         ArrowDir::Right => {
             let cy = rect.center().y;
@@ -2757,9 +2727,11 @@ fn paint_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, 
                 egui::pos2(head_base_x, cy - half_head),
                 egui::pos2(head_base_x, cy + half_head),
             ];
-            painter.add(egui::Shape::Path(
-                egui::epaint::PathShape::convex_polygon(head, color, egui::Stroke::NONE),
-            ));
+            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
+                head,
+                color,
+                egui::Stroke::NONE,
+            )));
         }
         ArrowDir::Left => {
             let cy = rect.center().y;
@@ -2775,9 +2747,11 @@ fn paint_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, 
                 egui::pos2(head_base_x, cy - half_head),
                 egui::pos2(head_base_x, cy + half_head),
             ];
-            painter.add(egui::Shape::Path(
-                egui::epaint::PathShape::convex_polygon(head, color, egui::Stroke::NONE),
-            ));
+            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
+                head,
+                color,
+                egui::Stroke::NONE,
+            )));
         }
     }
 }
@@ -2789,24 +2763,17 @@ const CHIP_BAR_THICKNESS: f32 = 1.8;
 
 fn paint_minus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
-    let bar = egui::Rect::from_center_size(
-        rect.center(),
-        egui::vec2(w * 0.80, CHIP_BAR_THICKNESS),
-    );
+    let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(w * 0.80, CHIP_BAR_THICKNESS));
     painter.rect_filled(bar, egui::CornerRadius::same(1), color);
 }
 
 fn paint_plus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
     let h = rect.height();
-    let horiz = egui::Rect::from_center_size(
-        rect.center(),
-        egui::vec2(w * 0.80, CHIP_BAR_THICKNESS),
-    );
-    let vert = egui::Rect::from_center_size(
-        rect.center(),
-        egui::vec2(CHIP_BAR_THICKNESS, h * 0.80),
-    );
+    let horiz =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(w * 0.80, CHIP_BAR_THICKNESS));
+    let vert =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(CHIP_BAR_THICKNESS, h * 0.80));
     painter.rect_filled(horiz, egui::CornerRadius::same(1), color);
     painter.rect_filled(vert, egui::CornerRadius::same(1), color);
 }
@@ -2922,6 +2889,7 @@ fn shortcut_row(
 ///   - launches via the user's preferred terminal (when `Terminal=true`,
 ///     so terminal editors like nvim/vim/helix work), or
 ///   - launches via `gtk-launch` for GUI editors.
+///
 /// Falls back to `xdg-open` if any step fails.
 fn open_in_editor(path: &std::path::Path) {
     use std::process::{Command, Stdio};
@@ -2944,18 +2912,17 @@ fn open_in_editor(path: &std::path::Path) {
                     log::info!("opened {} via terminal handler {}", path_str, desktop_id);
                     return;
                 }
-            } else if !argv.is_empty() {
-                if Command::new(&argv[0])
+            } else if !argv.is_empty()
+                && Command::new(&argv[0])
                     .args(&argv[1..])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
                     .is_ok()
-                {
-                    log::info!("opened {} via {} ({})", path_str, argv[0], desktop_id);
-                    return;
-                }
+            {
+                log::info!("opened {} via {} ({})", path_str, argv[0], desktop_id);
+                return;
             }
         }
         // Last attempt before xdg-open: gtk-launch the .desktop id.
@@ -3117,7 +3084,7 @@ fn launch_in_terminal(argv: &[String]) -> bool {
         ("alacritty", &["-e"]),
         ("foot", &["-e"]),
         ("kitty", &[][..]), // kitty takes the command directly
-        ("gnome-terminal", &["--", ]),
+        ("gnome-terminal", &["--"]),
         ("konsole", &["-e"]),
         ("xterm", &["-e"]),
     ] {
@@ -3256,11 +3223,17 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
 fn open_path_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/usr/bin/open").arg(path).spawn().map(|_| ())
+        std::process::Command::new("/usr/bin/open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
@@ -3500,10 +3473,7 @@ fn color_picker(ui: &mut egui::Ui, c: &mut ColorRgba) {
         c.b = color.b();
         c.a = color.a();
     }
-    ui.label(format!(
-        "#{:02X}{:02X}{:02X} (a={})",
-        c.r, c.g, c.b, c.a
-    ));
+    ui.label(format!("#{:02X}{:02X}{:02X} (a={})", c.r, c.g, c.b, c.a));
 }
 
 /// Open the prefs window. Returns when the user closes it.
@@ -3535,7 +3505,11 @@ pub fn run_prefs(
     let icon_data = {
         let size = 256u32;
         let rgba = vernier_platform::render_app_icon_rgba(size);
-        std::sync::Arc::new(egui::IconData { rgba, width: size, height: size })
+        std::sync::Arc::new(egui::IconData {
+            rgba,
+            width: size,
+            height: size,
+        })
     };
     let viewport = egui::ViewportBuilder::default()
         .with_title("Vernier Preferences")

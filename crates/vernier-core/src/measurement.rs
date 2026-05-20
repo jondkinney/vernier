@@ -133,9 +133,10 @@ pub enum Axis {
 }
 
 /// Top-level interaction state for the overlay.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum Mode {
     /// Overlay is hidden / not measuring.
+    #[default]
     Idle,
     /// Overlay is shown; cursor moves trigger live edge detection but
     /// no segment is being drawn yet.
@@ -144,13 +145,10 @@ pub enum Mode {
     Drawing { start: SnapPoint, cursor: Px },
     /// A measurement was committed (mouse released) and is being
     /// displayed; the next press starts a new one.
-    Held { measurement: Measurement, cursor: Px },
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Idle
-    }
+    Held {
+        measurement: Measurement,
+        cursor: Px,
+    },
 }
 
 #[cfg(test)]

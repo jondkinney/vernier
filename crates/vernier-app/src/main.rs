@@ -1,20 +1,19 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use vernier_core::{
-    classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
-    EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
-    Tolerance,
-};
-use vernier_platform::{
-    Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId,
-    Hud, HudAxis, HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
-    HudMeasurementFormat, HudRounding, HudToast, MonitorId, NativeFrame, Platform, PlatformEvent,
-    StuckMeasurement, TrayMenu,
-};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
+use vernier_core::{
+    EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
+    Tolerance, classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
+};
+use vernier_platform::{
+    Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId, Hud,
+    HudAxis, HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
+    HudMeasurementFormat, HudRounding, HudToast, MonitorId, NativeFrame, Platform, PlatformEvent,
+    StuckMeasurement, TrayMenu,
+};
 
 mod capture_worker;
 use capture_worker::CaptureWorker;
@@ -87,11 +86,9 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(
-            "info,zbus=warn,zbus_router=warn,tracing=warn,async_io=warn,polling=warn",
-        ),
-    )
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "info,zbus=warn,zbus_router=warn,tracing=warn,async_io=warn,polling=warn",
+    ))
     .init();
     match cli.command {
         Some(Cmd::Toggle) => run_client_command("toggle"),
@@ -232,7 +229,8 @@ fn run_client_command(cmd: &str) -> Result<()> {
     use std::io::{Read, Write};
     stream.write_all(cmd.as_bytes())?;
     stream.write_all(b"\n")?;
-    stream.shutdown(std::net::Shutdown::Write)
+    stream
+        .shutdown(std::net::Shutdown::Write)
         .with_context(|| "shutdown write half of ipc socket")?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok();
@@ -298,7 +296,13 @@ fn run_daemon() -> Result<()> {
     for m in &monitors {
         log::info!(
             "  id={:?} name={:?} {}x{}+{},{} scale={}",
-            m.id, m.name, m.bounds.w, m.bounds.h, m.bounds.x, m.bounds.y, m.scale_factor
+            m.id,
+            m.name,
+            m.bounds.w,
+            m.bounds.h,
+            m.bounds.x,
+            m.bounds.y,
+            m.scale_factor
         );
     }
 
@@ -362,9 +366,7 @@ fn run_daemon() -> Result<()> {
         spawn_active_window_watcher();
     }
     if initial_settings.integrations.figma_zoom_correction {
-        vernier_platform::figma_bridge::spawn(
-            initial_settings.integrations.figma_bridge_port,
-        );
+        vernier_platform::figma_bridge::spawn(initial_settings.integrations.figma_bridge_port);
     }
 
     let mut current_hotkey: Option<HotkeyId> = None;
@@ -465,9 +467,7 @@ fn run_daemon() -> Result<()> {
         .name("vernier-ipc".into())
         .spawn(move || ipc_loop(listener, combined_for_ipc))?;
 
-    log::info!(
-        "running. Hotkey toggles measurement; tray Quit or `vernier quit` exits."
-    );
+    log::info!("running. Hotkey toggles measurement; tray Quit or `vernier quit` exits.");
 
     let mut mode = InteractionMode::Idle;
     // Rate-limit overlay redraws driven by pointer-move events. Wayland
@@ -658,12 +658,27 @@ fn run_daemon() -> Result<()> {
                 log::info!("quit requested via tray");
                 break;
             }
-            MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "toggle_overlay" => {
+            MainEvent::Platform(PlatformEvent::TrayMenuActivated { id })
+                if id == "toggle_overlay" =>
+            {
                 // Wipe transient state so an explicit toggle doesn't
                 // leave us in a pending-guide limbo.
                 pending_guide = None;
                 pending_guide_shift_acked = false;
-                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
+                toggle_measurement(
+                    &mut mode,
+                    &mut overlay,
+                    &platform,
+                    primary.id,
+                    &mut frozen_frame,
+                    &mut capture_worker,
+                    &held_rects,
+                    &guides,
+                    &stuck_measurements,
+                    color_alternate,
+                    prefs_hotkey_accel,
+                    &mut prefs_hotkey,
+                );
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
                 ensure_prefs_window(&mut prefs_child);
@@ -671,9 +686,7 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) => {
                 log::info!("unhandled tray menu id: {id}");
             }
-            MainEvent::Platform(PlatformEvent::HotkeyPressed(id))
-                if prefs_hotkey == Some(id) =>
-            {
+            MainEvent::Platform(PlatformEvent::HotkeyPressed(id)) if prefs_hotkey == Some(id) => {
                 // Cmd+, (Ctrl+, elsewhere) — universal "open
                 // preferences" shortcut. Treat it as an explicit exit
                 // from measurement mode: save persisted content,
@@ -727,7 +740,20 @@ fn run_daemon() -> Result<()> {
                 // toggle is the user's "get me out of any sub-mode".
                 pending_guide = None;
                 pending_guide_shift_acked = false;
-                toggle_measurement(&mut mode, &mut overlay, &platform, primary.id, &mut frozen_frame, &mut capture_worker, &held_rects, &guides, &stuck_measurements, color_alternate, prefs_hotkey_accel, &mut prefs_hotkey);
+                toggle_measurement(
+                    &mut mode,
+                    &mut overlay,
+                    &platform,
+                    primary.id,
+                    &mut frozen_frame,
+                    &mut capture_worker,
+                    &held_rects,
+                    &guides,
+                    &stuck_measurements,
+                    color_alternate,
+                    prefs_hotkey_accel,
+                    &mut prefs_hotkey,
+                );
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
                 let now = Instant::now();
@@ -772,10 +798,9 @@ fn run_daemon() -> Result<()> {
                         overlay.set_pointing_hand_cursor(false);
                         pointing_hand_cursor = false;
                     }
-                    let new_hovered = {
-                        let m = context_menu.as_ref().unwrap();
-                        menu_hit_row(m.origin, MENU_ITEMS, (x, y))
-                    };
+                    let new_hovered = context_menu
+                        .as_ref()
+                        .and_then(|m| menu_hit_row(m.origin, MENU_ITEMS, (x, y)));
                     let needs_redraw = context_menu
                         .as_ref()
                         .map(|m| m.hovered != new_hovered)
@@ -826,10 +851,9 @@ fn run_daemon() -> Result<()> {
                 // Clamped to ±STUCK_PILL_DRAG_MAX in each axis so it
                 // can't be flung off-screen.
                 if let Some(idx) = dragging_stuck_pill {
-                    if let (Some(press), Some(m)) = (
-                        stuck_press_pos,
-                        stuck_measurements.get_mut(idx),
-                    ) {
+                    if let (Some(press), Some(m)) =
+                        (stuck_press_pos, stuck_measurements.get_mut(idx))
+                    {
                         let raw_dx = stuck_initial_offset.0 + (x - press.0);
                         let raw_dy = stuck_initial_offset.1 + (y - press.1);
                         m.pill_offset = (
@@ -853,13 +877,9 @@ fn run_daemon() -> Result<()> {
                             // pill_offset so the cursor's reachable
                             // range mirrors the pill's ±50 clamp from
                             // its default anchor.
-                            let rx = (press.0
-                                - STUCK_PILL_DRAG_MAX
-                                - stuck_initial_offset.0)
+                            let rx = (press.0 - STUCK_PILL_DRAG_MAX - stuck_initial_offset.0)
                                 .round() as i32;
-                            let ry = (press.1
-                                - STUCK_PILL_DRAG_MAX
-                                - stuck_initial_offset.1)
+                            let ry = (press.1 - STUCK_PILL_DRAG_MAX - stuck_initial_offset.1)
                                 .round() as i32;
                             let side = (2.0 * STUCK_PILL_DRAG_MAX) as i32;
                             overlay.confine_pointer(rx, ry, side, side);
@@ -939,7 +959,11 @@ fn run_daemon() -> Result<()> {
                 }
             }
             MainEvent::Platform(PlatformEvent::PointerButton {
-                button, pressed, x, y, ..
+                button,
+                pressed,
+                x,
+                y,
+                ..
             }) => {
                 // Right-click toggles the floating context menu. An
                 // active drag / resize blocks it (don't disrupt
@@ -1146,8 +1170,7 @@ fn run_daemon() -> Result<()> {
                                 };
                                 active_toast = Some(HudToast { text: toast_text });
                                 toast_until = Some(
-                                    Instant::now()
-                                        + Duration::from_millis(TOAST_TOLERANCE_MS),
+                                    Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS),
                                 );
                                 spawn_toast_timer(
                                     &combined_tx,
@@ -1175,13 +1198,13 @@ fn run_daemon() -> Result<()> {
                                 last_selected_guide = None;
                                 if !matches!(mode, InteractionMode::Idle) {
                                     toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
+                                        &mut mode,
+                                        &mut overlay,
+                                        &platform,
+                                        primary.id,
+                                        &mut frozen_frame,
+                                        &mut capture_worker,
+                                        &held_rects,
                                         &guides,
                                         &stuck_measurements,
                                         color_alternate,
@@ -1296,9 +1319,7 @@ fn run_daemon() -> Result<()> {
                         let idx = dragging_stuck_pill.take().unwrap();
                         let press_pos = stuck_press_pos.take();
                         let was_click = press_pos
-                            .map(|(px, py)| {
-                                (x - px).abs() <= 2.0 && (y - py).abs() <= 2.0
-                            })
+                            .map(|(px, py)| (x - px).abs() <= 2.0 && (y - py).abs() <= 2.0)
                             .unwrap_or(false);
                         if was_click {
                             if idx < stuck_measurements.len() {
@@ -1306,9 +1327,7 @@ fn run_daemon() -> Result<()> {
                                 stuck_measurements.remove(idx);
                             }
                         } else {
-                            log::info!(
-                                "stuck pill drag released at idx {idx} (offset kept)"
-                            );
+                            log::info!("stuck pill drag released at idx {idx} (offset kept)");
                         }
                         stuck_initial_offset = (0.0, 0.0);
                         if stuck_pill_drag_committed {
@@ -1373,8 +1392,7 @@ fn run_daemon() -> Result<()> {
                         // any pending click instead.
                         let was_click = press_pos
                             .map(|p| {
-                                (cursor_px.x - p.x).abs() <= 2
-                                    && (cursor_px.y - p.y).abs() <= 2
+                                (cursor_px.x - p.x).abs() <= 2 && (cursor_px.y - p.y).abs() <= 2
                             })
                             .unwrap_or(false);
                         let mut deleted = false;
@@ -1482,8 +1500,9 @@ fn run_daemon() -> Result<()> {
                             );
                             continue;
                         }
-                        if let Some(idx) =
-                            guides.iter().position(|g| cursor_over_guide_line(cursor_px, g))
+                        if let Some(idx) = guides
+                            .iter()
+                            .position(|g| cursor_over_guide_line(cursor_px, g))
                         {
                             log::info!("guide drag started at idx {idx}");
                             dragging_guide = Some(idx);
@@ -1521,20 +1540,12 @@ fn run_daemon() -> Result<()> {
                     if pressed && pending_guide.is_none() {
                         let mut started_resize = false;
                         for (idx, rect) in held_rects.iter().enumerate() {
-                            let rs = Px::new(
-                                rect.rect_start.0 as i32,
-                                rect.rect_start.1 as i32,
-                            );
-                            let re = Px::new(
-                                rect.rect_end.0 as i32,
-                                rect.rect_end.1 as i32,
-                            );
+                            let rs = Px::new(rect.rect_start.0 as i32, rect.rect_start.1 as i32);
+                            let re = Px::new(rect.rect_end.0 as i32, rect.rect_end.1 as i32);
                             if cursor_over_pill(cursor_px, rs, re) {
                                 continue;
                             }
-                            if let Some(handle) =
-                                cursor_over_rect_handle(cursor_px, rs, re)
-                            {
+                            if let Some(handle) = cursor_over_rect_handle(cursor_px, rs, re) {
                                 resizing = Some(ResizeOp {
                                     rect_idx: idx,
                                     handle,
@@ -1542,10 +1553,7 @@ fn run_daemon() -> Result<()> {
                                     initial_end: rect.rect_end,
                                     initial_cursor: (x, y),
                                 });
-                                log::info!(
-                                    "resize start: rect={idx} handle={:?}",
-                                    handle
-                                );
+                                log::info!("resize start: rect={idx} handle={:?}", handle);
                                 started_resize = true;
                                 break;
                             }
@@ -1603,7 +1611,9 @@ fn run_daemon() -> Result<()> {
                                     &held_rects,
                                 );
                                 match axis {
-                                    GuideAxis::Horizontal => snap_to_nearest_y_edge(y, &edges) as i32,
+                                    GuideAxis::Horizontal => {
+                                        snap_to_nearest_y_edge(y, &edges) as i32
+                                    }
                                     GuideAxis::Vertical => snap_to_nearest_x_edge(x, &edges) as i32,
                                 }
                             };
@@ -1696,8 +1706,7 @@ fn run_daemon() -> Result<()> {
                             overlay.set_system_pointer_visible(want);
                             system_pointer_visible = want;
                         }
-                        let want_hand =
-                            want && cursor_over_any_camera_pill(cursor_px, &held_rects);
+                        let want_hand = want && cursor_over_any_camera_pill(cursor_px, &held_rects);
                         if want_hand != pointing_hand_cursor {
                             overlay.set_pointing_hand_cursor(want_hand);
                             pointing_hand_cursor = want_hand;
@@ -1748,8 +1757,7 @@ fn run_daemon() -> Result<()> {
                                 guides.len(),
                                 stuck_measurements.len(),
                             );
-                            if let Err(e) =
-                                save_session(&held_rects, &guides, &stuck_measurements)
+                            if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements)
                             {
                                 log::warn!("save session: {e:#}");
                             }
@@ -1763,13 +1771,13 @@ fn run_daemon() -> Result<()> {
                             active_toast = None;
                             toast_until = None;
                             toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
+                                &mut mode,
+                                &mut overlay,
+                                &platform,
+                                primary.id,
+                                &mut frozen_frame,
+                                &mut capture_worker,
+                                &held_rects,
                                 &guides,
                                 &stuck_measurements,
                                 color_alternate,
@@ -1783,7 +1791,9 @@ fn run_daemon() -> Result<()> {
                             // re-toggling. Toast just confirms the
                             // capture; it elapses without exiting
                             // measure mode.
-                            let toast = HudToast { text: "Screenshot taken".into() };
+                            let toast = HudToast {
+                                text: "Screenshot taken".into(),
+                            };
                             active_toast = Some(toast.clone());
                             toast_until =
                                 Some(Instant::now() + Duration::from_millis(TOAST_SCREENSHOT_MS));
@@ -1859,11 +1869,16 @@ fn run_daemon() -> Result<()> {
             }
             MainEvent::Platform(PlatformEvent::PointerLeave { .. }) => {}
             MainEvent::Platform(PlatformEvent::KeyboardKey {
-                keysym, pressed, is_repeat, ..
+                keysym,
+                pressed,
+                is_repeat,
+                ..
             }) => {
                 log::debug!(
                     "key event: keysym=0x{:x} pressed={} repeat={}",
-                    keysym, pressed, is_repeat
+                    keysym,
+                    pressed,
+                    is_repeat
                 );
                 // Track modifiers regardless of mode so they're
                 // current when the next non-modifier action fires.
@@ -1874,10 +1889,18 @@ fn run_daemon() -> Result<()> {
                 if is_shift || is_ctrl || is_alt || is_super {
                     let shift_was = shift_held;
                     let alt_was = alt_held;
-                    if is_shift { shift_held = pressed; }
-                    if is_ctrl { ctrl_held = pressed; }
-                    if is_alt { alt_held = pressed; }
-                    if is_super { super_held = pressed; }
+                    if is_shift {
+                        shift_held = pressed;
+                    }
+                    if is_ctrl {
+                        ctrl_held = pressed;
+                    }
+                    if is_alt {
+                        alt_held = pressed;
+                    }
+                    if is_super {
+                        super_held = pressed;
+                    }
                     // First SHIFT release after entering pending guide
                     // mode "acknowledges" the trigger keypress — from
                     // here on, each SHIFT press toggles the pending
@@ -1896,9 +1919,8 @@ fn run_daemon() -> Result<()> {
                     // place — the user can drop a horizontal guide,
                     // tap SHIFT, drop a vertical one, etc.
                     let shift_pressed_edge = !shift_was && shift_held;
-                    let pending_flipped = pending_guide.is_some()
-                        && pending_guide_shift_acked
-                        && shift_pressed_edge;
+                    let pending_flipped =
+                        pending_guide.is_some() && pending_guide_shift_acked && shift_pressed_edge;
                     if pending_flipped {
                         pending_guide = pending_guide.map(flip_axis);
                         log::info!("guide toggled via SHIFT: now {:?}", pending_guide);
@@ -1924,26 +1946,18 @@ fn run_daemon() -> Result<()> {
                         if let Some((px_x, px_y)) = last_pointer_xy {
                             if alt_changed {
                                 let cursor_px = Px::new(px_x as i32, px_y as i32);
-                                let active_handle =
-                                    resizing.map(|op| op.handle).or_else(|| {
-                                        held_rects.iter().find_map(|r| {
-                                            let rs = Px::new(
-                                                r.rect_start.0 as i32,
-                                                r.rect_start.1 as i32,
-                                            );
-                                            let re = Px::new(
-                                                r.rect_end.0 as i32,
-                                                r.rect_end.1 as i32,
-                                            );
-                                            if cursor_over_pill(cursor_px, rs, re) {
-                                                None
-                                            } else {
-                                                cursor_over_rect_handle(
-                                                    cursor_px, rs, re,
-                                                )
-                                            }
-                                        })
-                                    });
+                                let active_handle = resizing.map(|op| op.handle).or_else(|| {
+                                    held_rects.iter().find_map(|r| {
+                                        let rs =
+                                            Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                                        let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                                        if cursor_over_pill(cursor_px, rs, re) {
+                                            None
+                                        } else {
+                                            cursor_over_rect_handle(cursor_px, rs, re)
+                                        }
+                                    })
+                                });
                                 let want = want_system_pointer(
                                     cursor_px,
                                     &held_rects,
@@ -2017,8 +2031,7 @@ fn run_daemon() -> Result<()> {
                 if !pressed {
                     if let Some((_, _, active_keysym)) = active_nudge {
                         if active_keysym == keysym {
-                            nudge_active_gen
-                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            nudge_active_gen.store(0, std::sync::atomic::Ordering::Relaxed);
                             active_nudge = None;
                         }
                     }
@@ -2059,19 +2072,7 @@ fn run_daemon() -> Result<()> {
                             );
                         }
                     }
-                } else if {
-                    // Open Prefs binding. macOS expects Cmd+, (Apple's
-                    // long-standing "open preferences" convention);
-                    // Linux/Windows use Ctrl+, — Super+, would be the
-                    // direct port of macOS but Omarchy already binds
-                    // that combo at the compositor level (mako's
-                    // "Dismiss last notification") so the keypress
-                    // never reaches our layer surface.
-                    #[cfg(target_os = "macos")]
-                    { super_held && keysym == 0x002c }
-                    #[cfg(not(target_os = "macos"))]
-                    { ctrl_held && keysym == 0x002c }
-                } {
+                } else if ctrl_held && keysym == 0x002c {
                     log::info!("prefs hotkey → opening prefs");
                     // If a measurement is in progress, exit it cleanly
                     // before the prefs window opens. Otherwise the user
@@ -2085,13 +2086,13 @@ fn run_daemon() -> Result<()> {
                         pending_guide = None;
                         pending_guide_shift_acked = false;
                         toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
+                            &mut mode,
+                            &mut overlay,
+                            &platform,
+                            primary.id,
+                            &mut frozen_frame,
+                            &mut capture_worker,
+                            &held_rects,
                             &guides,
                             &stuck_measurements,
                             color_alternate,
@@ -2136,8 +2137,7 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.clear_and_exit
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.clear_and_exit
                 {
                     // Configured clear-and-exit shortcut (default
                     // Ctrl+F): wipe every held rect, guide, and stuck
@@ -2146,9 +2146,7 @@ fn run_daemon() -> Result<()> {
                     // keyboard, so it's a plain single press — the
                     // deliberate multi-key combo is what keeps it from
                     // being an accidental wipe.
-                    if let Err(e) =
-                        save_session(&held_rects, &guides, &stuck_measurements)
-                    {
+                    if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
                         log::warn!("save session: {e:#}");
                     }
                     log::info!(
@@ -2181,8 +2179,7 @@ fn run_daemon() -> Result<()> {
                         prefs_hotkey_accel,
                         &mut prefs_hotkey,
                     );
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.clear_and_hide
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.clear_and_hide
                 {
                     // Configured exit shortcut (default Esc): leave
                     // measure mode in a single press. Held content is
@@ -2191,9 +2188,7 @@ fn run_daemon() -> Result<()> {
                     // passthrough mode — so an accidental press can
                     // never wipe a session. Clearing is an explicit
                     // action via the right-click "Clear" menu item.
-                    if let Err(e) =
-                        save_session(&held_rects, &guides, &stuck_measurements)
-                    {
+                    if let Err(e) = save_session(&held_rects, &guides, &stuck_measurements) {
                         log::warn!("save session: {e:#}");
                     }
                     log::info!("exit shortcut — leaving measure mode");
@@ -2265,9 +2260,7 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.color_toggle
-                {
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.color_toggle {
                     // Configured color-toggle shortcut (default `X`).
                     // Swaps the live HUD foreground (and pending
                     // guide preview) between primary and alternate.
@@ -2365,11 +2358,13 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.tolerance_up
-                {
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.tolerance_up {
                     tol_level = tol_level.higher();
-                    log::info!("tolerance → {} ({})", tol_level.label(), current_tol_value(tol_level));
+                    log::info!(
+                        "tolerance → {} ({})",
+                        tol_level.label(),
+                        current_tol_value(tol_level)
+                    );
                     let toast = HudToast {
                         text: format!("Tolerance: {}", tol_level.label()),
                     };
@@ -2405,11 +2400,14 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.tolerance_down
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.tolerance_down
                 {
                     tol_level = tol_level.lower();
-                    log::info!("tolerance → {} ({})", tol_level.label(), current_tol_value(tol_level));
+                    log::info!(
+                        "tolerance → {} ({})",
+                        tol_level.label(),
+                        current_tol_value(tol_level)
+                    );
                     let toast = HudToast {
                         text: format!("Tolerance: {}", tol_level.label()),
                     };
@@ -2491,13 +2489,13 @@ fn run_daemon() -> Result<()> {
                     // spawn as the right-click menu's
                     // "Take Normal Screenshot" row.
                     do_take_normal_screenshot(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &mut held_rects,
+                        &mut mode,
+                        &mut overlay,
+                        &platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut capture_worker,
+                        &mut held_rects,
                         &mut guides,
                         &mut stuck_measurements,
                         &mut nudge_selection,
@@ -2510,9 +2508,7 @@ fn run_daemon() -> Result<()> {
                         prefs_hotkey_accel,
                         &mut prefs_hotkey,
                     );
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.restore
-                {
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.restore {
                     // Configured restore-session shortcut (default
                     // Shift+R). Restores held rects / guides /
                     // stuck measurements saved automatically on
@@ -2537,8 +2533,7 @@ fn run_daemon() -> Result<()> {
                         }
                     };
                     active_toast = Some(HudToast { text: toast_text });
-                    toast_until =
-                        Some(Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS));
+                    toast_until = Some(Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS));
                     spawn_toast_timer(
                         &combined_tx,
                         Duration::from_millis(TOAST_TOLERANCE_MS),
@@ -2569,15 +2564,12 @@ fn run_daemon() -> Result<()> {
                             context_menu.as_ref(),
                         );
                     }
-                } else if pressed_accel.is_some()
-                    && pressed_accel == shortcut_accels.capture
-                {
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.capture {
                     // Configured capture shortcut (default Enter) —
                     // copy the dimensions of the hovered held rect
                     // (or the only rect if just one exists) using
                     // the configured CopyFormat.
-                    let cursor_px = last_pointer_xy
-                        .map(|(x, y)| Px::new(x as i32, y as i32));
+                    let cursor_px = last_pointer_xy.map(|(x, y)| Px::new(x as i32, y as i32));
                     let target = cursor_px
                         .and_then(|c| {
                             held_rects.iter().find(|r| {
@@ -2586,9 +2578,7 @@ fn run_daemon() -> Result<()> {
                                 cursor_in_held_rect(c, rs, re) || cursor_over_pill(c, rs, re)
                             })
                         })
-                        .or_else(|| {
-                            (held_rects.len() == 1).then(|| &held_rects[0])
-                        });
+                        .or_else(|| (held_rects.len() == 1).then(|| &held_rects[0]));
                     if let Some(rect) = target {
                         let w = (rect.rect_end.0 - rect.rect_start.0).abs().round() as u32;
                         let h = (rect.rect_end.1 - rect.rect_start.1).abs().round() as u32;
@@ -2611,9 +2601,8 @@ fn run_daemon() -> Result<()> {
                                     format!("Copied to clipboard: {text}")
                                 },
                             });
-                            toast_until = Some(
-                                Instant::now() + Duration::from_millis(TOAST_COPY_MS),
-                            );
+                            toast_until =
+                                Some(Instant::now() + Duration::from_millis(TOAST_COPY_MS));
                             spawn_toast_timer(
                                 &combined_tx,
                                 Duration::from_millis(TOAST_COPY_MS),
@@ -2667,16 +2656,9 @@ fn run_daemon() -> Result<()> {
                             last_pointer_xy.and_then(|(x, y)| {
                                 let c = Px::new(x as i32, y as i32);
                                 held_rects.iter().position(|r| {
-                                    let rs = Px::new(
-                                        r.rect_start.0 as i32,
-                                        r.rect_start.1 as i32,
-                                    );
-                                    let re = Px::new(
-                                        r.rect_end.0 as i32,
-                                        r.rect_end.1 as i32,
-                                    );
-                                    cursor_in_held_rect(c, rs, re)
-                                        || cursor_over_pill(c, rs, re)
+                                    let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
+                                    let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                                    cursor_in_held_rect(c, rs, re) || cursor_over_pill(c, rs, re)
                                 })
                             })
                         });
@@ -2687,19 +2669,17 @@ fn run_daemon() -> Result<()> {
                     // — a horizontal guide only moves Up/Down, a
                     // vertical guide only moves Left/Right.
                     if idx.is_none() {
-                        if let Some(g_idx) = last_selected_guide
-                            .filter(|i| *i < guides.len())
-                        {
+                        if let Some(g_idx) = last_selected_guide.filter(|i| *i < guides.len()) {
                             let step: i32 = if shift_held { 10 } else { 1 };
-                            let nudged = apply_guide_nudge(
-                                &mut guides, g_idx, dir, step,
-                            );
+                            let nudged = apply_guide_nudge(&mut guides, g_idx, dir, step);
                             if nudged {
                                 nudge_guide_idx = Some(g_idx);
                                 nudge_selection = None;
                                 log::debug!(
                                     "guide nudge {:?} by {} px → {}",
-                                    dir, step, guides[g_idx].position
+                                    dir,
+                                    step,
+                                    guides[g_idx].position
                                 );
                                 if let Some((px_x, px_y)) = last_pointer_xy {
                                     last_hud_redraw = Instant::now();
@@ -2746,8 +2726,7 @@ fn run_daemon() -> Result<()> {
                                                 NUDGE_INITIAL_DELAY_MS,
                                             ));
                                             loop {
-                                                if atomic
-                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                if atomic.load(std::sync::atomic::Ordering::Relaxed)
                                                     != this_gen
                                                 {
                                                     return;
@@ -2817,20 +2796,16 @@ fn run_daemon() -> Result<()> {
                     if !is_repeat {
                         nudge_generation = nudge_generation.wrapping_add(1);
                         let this_gen = nudge_generation;
-                        nudge_active_gen
-                            .store(this_gen, std::sync::atomic::Ordering::Relaxed);
+                        nudge_active_gen.store(this_gen, std::sync::atomic::Ordering::Relaxed);
                         active_nudge = Some((dir, this_gen, keysym));
                         let tx = combined_tx.clone();
                         let atomic = nudge_active_gen.clone();
                         std::thread::Builder::new()
                             .name("vernier-nudge-repeat".into())
                             .spawn(move || {
-                                std::thread::sleep(Duration::from_millis(
-                                    NUDGE_INITIAL_DELAY_MS,
-                                ));
+                                std::thread::sleep(Duration::from_millis(NUDGE_INITIAL_DELAY_MS));
                                 loop {
-                                    if atomic.load(std::sync::atomic::Ordering::Relaxed)
-                                        != this_gen
+                                    if atomic.load(std::sync::atomic::Ordering::Relaxed) != this_gen
                                     {
                                         return;
                                     }
@@ -2843,9 +2818,7 @@ fn run_daemon() -> Result<()> {
                                     {
                                         return;
                                     }
-                                    std::thread::sleep(Duration::from_millis(
-                                        NUDGE_INTERVAL_MS,
-                                    ));
+                                    std::thread::sleep(Duration::from_millis(NUDGE_INTERVAL_MS));
                                 }
                             })
                             .ok();
@@ -2855,13 +2828,13 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(other) => log::debug!("platform event: {other:?}"),
             MainEvent::Ipc(IpcCmd::Toggle) => {
                 toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
+                    &mut mode,
+                    &mut overlay,
+                    &platform,
+                    primary.id,
+                    &mut frozen_frame,
+                    &mut capture_worker,
+                    &held_rects,
                     &guides,
                     &stuck_measurements,
                     color_alternate,
@@ -3044,7 +3017,7 @@ fn run_daemon() -> Result<()> {
                 // toast), keep waiting — the newer timer's elapsed
                 // event will handle the dismissal.
                 let now = Instant::now();
-                let still_active = toast_until.map_or(false, |t| now < t);
+                let still_active = toast_until.is_some_and(|t| now < t);
                 if still_active {
                     continue;
                 }
@@ -3052,13 +3025,13 @@ fn run_daemon() -> Result<()> {
                 toast_until = None;
                 if exit_measurement {
                     toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
+                        &mut mode,
+                        &mut overlay,
+                        &platform,
+                        primary.id,
+                        &mut frozen_frame,
+                        &mut capture_worker,
+                        &held_rects,
                         &guides,
                         &stuck_measurements,
                         color_alternate,
@@ -3103,9 +3076,7 @@ fn run_daemon() -> Result<()> {
                 // Guide repeat takes precedence: if the initial press
                 // nudged a guide, every subsequent tick should keep
                 // nudging that same guide until the key releases.
-                if let Some(g_idx) = nudge_guide_idx
-                    .filter(|i| *i < guides.len())
-                {
+                if let Some(g_idx) = nudge_guide_idx.filter(|i| *i < guides.len()) {
                     let step: i32 = if shift_held { 10 } else { 1 };
                     if apply_guide_nudge(&mut guides, g_idx, dir, step) {
                         if let Some((px_x, px_y)) = last_pointer_xy {
@@ -3268,7 +3239,6 @@ fn current_measurement_format() -> HudMeasurementFormat {
     }
 }
 
-
 fn scale_factor_lock() -> &'static std::sync::Mutex<f64> {
     use std::sync::{Mutex, OnceLock};
     static CELL: OnceLock<Mutex<f64>> = OnceLock::new();
@@ -3394,7 +3364,8 @@ fn ensure_app_icons() -> Result<PathBuf> {
         let rgba = vernier_platform::render_app_icon_rgba(size);
         let img = image::RgbaImage::from_raw(size, size, rgba)
             .ok_or_else(|| anyhow::anyhow!("RgbaImage::from_raw ({size}px)"))?;
-        img.save(&path).with_context(|| format!("write {}", path.display()))?;
+        img.save(&path)
+            .with_context(|| format!("write {}", path.display()))?;
     }
     let svg_dir = hicolor.join("scalable/apps");
     std::fs::create_dir_all(&svg_dir).with_context(|| format!("create {}", svg_dir.display()))?;
@@ -3414,8 +3385,7 @@ fn ensure_app_icons() -> Result<PathBuf> {
 /// pick it up even on systems without an `index.theme`.
 fn ensure_application_desktop_file(icon_path: Option<&Path>) -> Result<()> {
     let dir = xdg_data_dir()?.join("applications");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("vernier.desktop");
     let exe = std::env::current_exe()
         .context("current_exe")?
@@ -3437,15 +3407,16 @@ fn ensure_application_desktop_file(icon_path: Option<&Path>) -> Result<()> {
          Keywords=measure;ruler;pixel;design;screenshot;\n\
          StartupNotify=false\n"
     );
-    std::fs::write(&path, body)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 /// Helper: read the PNG path the daemon just installed, fall back
 /// to `Icon=vernier` (XDG name lookup) if it isn't present.
 fn icon_path_for_desktop_entries() -> Option<PathBuf> {
-    let p = xdg_data_dir().ok()?.join("icons/hicolor/256x256/apps/vernier.png");
+    let p = xdg_data_dir()
+        .ok()?
+        .join("icons/hicolor/256x256/apps/vernier.png");
     if p.exists() { Some(p) } else { None }
 }
 
@@ -3539,11 +3510,13 @@ fn first_launch_marker_path() -> Result<PathBuf> {
 
 fn write_first_launch_marker(marker: &Path) -> Result<()> {
     if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(marker, "Vernier ran its one-time first-launch desktop integration.\n")
-        .with_context(|| format!("write {}", marker.display()))?;
+    std::fs::write(
+        marker,
+        "Vernier ran its one-time first-launch desktop integration.\n",
+    )
+    .with_context(|| format!("write {}", marker.display()))?;
     Ok(())
 }
 
@@ -3614,8 +3587,8 @@ fn binary_on_path(name: &str) -> bool {
 /// user whether a capable portal backend is installed.
 #[cfg(target_os = "linux")]
 fn global_shortcuts_portal_present() -> bool {
-    let dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    let dirs =
+        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
     dirs.split(':')
         .map(|d| PathBuf::from(d).join("xdg-desktop-portal/portals"))
         .filter_map(|d| std::fs::read_dir(d).ok())
@@ -3670,10 +3643,16 @@ fn run_doctor() -> Result<()> {
         }
     }
     if global_shortcuts_portal_present() {
-        println!("  ok       {:<12} GlobalShortcuts portal (compositor-agnostic hotkey)", "portal");
+        println!(
+            "  ok       {:<12} GlobalShortcuts portal (compositor-agnostic hotkey)",
+            "portal"
+        );
     } else {
         missing += 1;
-        println!("  MISSING  {:<12} no GlobalShortcuts portal backend detected", "portal");
+        println!(
+            "  MISSING  {:<12} no GlobalShortcuts portal backend detected",
+            "portal"
+        );
         println!("           → install an xdg-desktop-portal backend implementing");
         println!("             GlobalShortcuts, e.g. xdg-desktop-portal-hyprland");
         println!("             (not needed on Hyprland — Vernier binds the key directly)");
@@ -3682,9 +3661,7 @@ fn run_doctor() -> Result<()> {
     if missing == 0 {
         println!("All optional tools present.");
     } else {
-        println!(
-            "{missing} item(s) missing — the related features stay disabled until installed."
-        );
+        println!("{missing} item(s) missing — the related features stay disabled until installed.");
     }
     Ok(())
 }
@@ -3693,9 +3670,7 @@ fn run_doctor() -> Result<()> {
 /// native APIs, so there are no optional CLI tools to check.
 #[cfg(not(target_os = "linux"))]
 fn run_doctor() -> Result<()> {
-    println!(
-        "On this platform Vernier uses native capture APIs — no optional CLI tools to check."
-    );
+    println!("On this platform Vernier uses native capture APIs — no optional CLI tools to check.");
     Ok(())
 }
 
@@ -3709,8 +3684,7 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
         .join("autostart");
     let path = dir.join("vernier.desktop");
     if general.launch_at_login {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let exe = std::env::current_exe()
             .context("current_exe")?
             .display()
@@ -3725,11 +3699,9 @@ fn apply_autostart(general: &vernier_core::GeneralSettings) -> Result<()> {
              Exec={exe}\nTerminal=false\n\
              Categories=Utility;\nX-GNOME-Autostart-enabled=true\n"
         );
-        std::fs::write(&path, body)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     } else if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
 }
@@ -3782,9 +3754,7 @@ fn static_vernier_bind_in_hypr_config() -> Option<std::path::PathBuf> {
                         if !trimmed.starts_with("bind") || trimmed.starts_with('#') {
                             continue;
                         }
-                        if trimmed.contains("vernier toggle")
-                            || trimmed.contains("vernier")
-                        {
+                        if trimmed.contains("vernier toggle") || trimmed.contains("vernier") {
                             return Some(path);
                         }
                     }
@@ -3954,7 +3924,7 @@ fn current_hyprland_instance() -> Option<(String, PathBuf)> {
             Err(_) => continue,
         };
         let sig = entry.file_name().to_string_lossy().into_owned();
-        if newest.as_ref().map_or(true, |(t, _, _)| mtime > *t) {
+        if newest.as_ref().is_none_or(|(t, _, _)| mtime > *t) {
             newest = Some((mtime, sig, sock));
         }
     }
@@ -4010,9 +3980,7 @@ fn spawn_hyprland_bind_watcher() {
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
                     if line.starts_with("configreloaded>>") {
-                        log::info!(
-                            "hyprland configreloaded — re-applying vernier toggle bind"
-                        );
+                        log::info!("hyprland configreloaded — re-applying vernier toggle bind");
                         if let Some(accel) = current_toggle_accel() {
                             register_hyprland_toggle_for(&accel, Some(&sig));
                         }
@@ -4043,7 +4011,10 @@ fn active_window_lock() -> &'static std::sync::RwLock<ActiveWindow> {
 }
 
 fn current_active_window() -> ActiveWindow {
-    active_window_lock().read().map(|g| g.clone()).unwrap_or_default()
+    active_window_lock()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 /// Subscribe to Hyprland's `socket2.sock` event stream and keep
@@ -4056,46 +4027,48 @@ fn spawn_active_window_watcher() {
     use std::time::Duration;
     std::thread::Builder::new()
         .name("vernier-active-window".into())
-        .spawn(|| loop {
-            let path = match current_hyprland_instance() {
-                Some((_, p)) => p,
-                None => {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            };
-            let stream = match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(s) => s,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            };
-            // Prime the cache on (re)connect — without this, the
-            // first poll after Hyprland restart still sees the old
-            // window class.
-            if let Some(initial) = read_active_window_via_hyprctl() {
-                if let Ok(mut g) = active_window_lock().write() {
-                    *g = initial;
-                }
-            }
-            let reader = BufReader::new(stream);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                // `activewindow>>CLASS,TITLE` — note that titles
-                // can contain commas, so split on the first one
-                // only and treat the rest as title.
-                if let Some(rest) = line.strip_prefix("activewindow>>") {
-                    let (class, title) = match rest.split_once(',') {
-                        Some((c, t)) => (c.to_string(), t.to_string()),
-                        None => (rest.to_string(), String::new()),
-                    };
+        .spawn(|| {
+            loop {
+                let path = match current_hyprland_instance() {
+                    Some((_, p)) => p,
+                    None => {
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                let stream = match std::os::unix::net::UnixStream::connect(&path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                // Prime the cache on (re)connect — without this, the
+                // first poll after Hyprland restart still sees the old
+                // window class.
+                if let Some(initial) = read_active_window_via_hyprctl() {
                     if let Ok(mut g) = active_window_lock().write() {
-                        *g = ActiveWindow { class, title };
+                        *g = initial;
                     }
                 }
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    // `activewindow>>CLASS,TITLE` — note that titles
+                    // can contain commas, so split on the first one
+                    // only and treat the rest as title.
+                    if let Some(rest) = line.strip_prefix("activewindow>>") {
+                        let (class, title) = match rest.split_once(',') {
+                            Some((c, t)) => (c.to_string(), t.to_string()),
+                            None => (rest.to_string(), String::new()),
+                        };
+                        if let Ok(mut g) = active_window_lock().write() {
+                            *g = ActiveWindow { class, title };
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_millis(500));
         })
         .ok();
 }
@@ -4125,10 +4098,10 @@ fn read_active_window_via_hyprctl() -> Option<ActiveWindow> {
     Some(ActiveWindow { class, title })
 }
 
-/// Resolve the current Figma-correction state from the active window
-/// + the bridge's cached zoom + the user's settings. Returns the
-/// divisor to apply (1.0 means no correction) and an indicator
-/// string for the corner pill (`None` if no correction).
+/// Resolve the current Figma-correction state from the active window +
+/// the bridge's cached zoom + the user's settings. Returns the divisor
+/// to apply (1.0 means no correction) and an indicator string for the
+/// corner pill (`None` if no correction).
 fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
     if !settings.integrations.figma_zoom_correction {
         return (1.0, None);
@@ -4143,7 +4116,9 @@ fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
         .figma_browser_classes
         .iter()
         .any(|c| c.eq_ignore_ascii_case(&win.class));
-    let title_match = win.title.contains(&settings.integrations.figma_title_suffix);
+    let title_match = win
+        .title
+        .contains(&settings.integrations.figma_title_suffix);
     if !(class_match && title_match) {
         return (1.0, None);
     }
@@ -4193,7 +4168,13 @@ fn parse_modifier_only(s: &str) -> Option<vernier_platform::Modifiers> {
 /// where the user pressing Cmd+Shift+4 (macOS screenshot) shouldn't
 /// also trip the alignment lines. A loose "is Shift down?" check
 /// would fire on every system shortcut that happens to include Shift.
-fn modifier_held(m: vernier_platform::Modifiers, shift: bool, ctrl: bool, alt: bool, sup: bool) -> bool {
+fn modifier_held(
+    m: vernier_platform::Modifiers,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    sup: bool,
+) -> bool {
     use vernier_platform::Modifiers;
     let want_shift = m == Modifiers::SHIFT;
     let want_ctrl = m == Modifiers::CTRL;
@@ -4223,10 +4204,7 @@ struct NudgeSelection {
 /// Match `pressed` against any of the four nudge bindings, ignoring
 /// SHIFT (which is reserved as the step-multiplier modifier — the
 /// caller still reads `shift_held` separately).
-fn matches_nudge(
-    pressed: &Option<Accelerator>,
-    accels: &ParsedShortcuts,
-) -> Option<NudgeDir> {
+fn matches_nudge(pressed: &Option<Accelerator>, accels: &ParsedShortcuts) -> Option<NudgeDir> {
     use vernier_platform::Modifiers;
     let Some(a) = pressed else { return None };
     let stripped = Accelerator {
@@ -4251,18 +4229,27 @@ fn matches_nudge(
 /// direction matches the guide's free axis (vertical guide → L/R,
 /// horizontal guide → U/D); perpendicular nudges are no-ops. Used by
 /// both the initial keypress and the repeat-timer NudgeTick handler.
-fn apply_guide_nudge(
-    guides: &mut [Guide],
-    idx: usize,
-    dir: NudgeDir,
-    step: i32,
-) -> bool {
-    let Some(g) = guides.get_mut(idx) else { return false };
+fn apply_guide_nudge(guides: &mut [Guide], idx: usize, dir: NudgeDir, step: i32) -> bool {
+    let Some(g) = guides.get_mut(idx) else {
+        return false;
+    };
     match (dir, g.axis) {
-        (NudgeDir::Left, GuideAxis::Vertical) => { g.position -= step; true }
-        (NudgeDir::Right, GuideAxis::Vertical) => { g.position += step; true }
-        (NudgeDir::Up, GuideAxis::Horizontal) => { g.position -= step; true }
-        (NudgeDir::Down, GuideAxis::Horizontal) => { g.position += step; true }
+        (NudgeDir::Left, GuideAxis::Vertical) => {
+            g.position -= step;
+            true
+        }
+        (NudgeDir::Right, GuideAxis::Vertical) => {
+            g.position += step;
+            true
+        }
+        (NudgeDir::Up, GuideAxis::Horizontal) => {
+            g.position -= step;
+            true
+        }
+        (NudgeDir::Down, GuideAxis::Horizontal) => {
+            g.position += step;
+            true
+        }
         _ => false,
     }
 }
@@ -4280,7 +4267,7 @@ fn apply_nudge_step(
     align_mode: bool,
     color_alternate: bool,
     last_pointer_xy: Option<(f64, f64)>,
-    held_rects: &mut Vec<HeldRect>,
+    held_rects: &mut [HeldRect],
     mode: &InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
     frozen_frame: Option<&NativeFrame>,
@@ -4550,14 +4537,16 @@ fn ensure_prefs_window(handle: &mut Option<std::process::Child>) {
 fn focus_prefs_window(child: Option<&std::process::Child>) {
     #[cfg(target_os = "macos")]
     {
-        let Some(pid) = child.map(|c| c.id() as i32) else { return };
+        let Some(pid) = child.map(|c| c.id() as i32) else {
+            return;
+        };
         vernier_platform::focus_macos_app_by_pid(pid);
     }
 }
 
 /// Returns the active toast iff its dismissal time hasn't passed.
-fn current_toast<'a>(toast: &'a Option<HudToast>, until: Option<Instant>) -> Option<&'a HudToast> {
-    if until.map_or(false, |t| Instant::now() < t) {
+fn current_toast(toast: &Option<HudToast>, until: Option<Instant>) -> Option<&HudToast> {
+    if until.is_some_and(|t| Instant::now() < t) {
         toast.as_ref()
     } else {
         None
@@ -4589,12 +4578,17 @@ enum MainEvent {
     /// post-screenshot confirmation) has elapsed and should be cleared.
     /// `exit_measurement` is true for the screenshot toast — the
     /// overlay closes after the toast fades.
-    ToastElapsed { exit_measurement: bool },
+    ToastElapsed {
+        exit_measurement: bool,
+    },
     /// Internal: nudge auto-repeat tick. Fired by a worker thread
     /// while the user holds a nudge key — SCTK's software repeat
     /// wasn't reliably scheduling on Hyprland, so we drive our
     /// own timer with a generation counter for cancellation.
-    NudgeTick { dir: NudgeDir, generation: u64 },
+    NudgeTick {
+        dir: NudgeDir,
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4607,7 +4601,10 @@ enum ButtonOutcome {
     /// bakes those decorations into the saved PNG. The caller does
     /// the clean-capture dance: blank the HUD, wait for a fresh
     /// PipeWire frame, capture, save, restore.
-    ScreenshotPillClicked { rs: Px, re: Px },
+    ScreenshotPillClicked {
+        rs: Px,
+        re: Px,
+    },
 }
 
 /// Result of [`take_held_screenshot`]. Propagated through
@@ -4646,7 +4643,10 @@ enum IpcCmd {
     OpenPrefs,
 }
 
-fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc::Sender<MainEvent>) {
+fn ipc_loop(
+    listener: std::os::unix::net::UnixListener,
+    sender: std::sync::mpsc::Sender<MainEvent>,
+) {
     use std::io::{BufRead, BufReader, Write};
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -4691,7 +4691,10 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                     let parts: Vec<&str> = arg.split_whitespace().collect();
                     let x = parts.first().and_then(|s| s.parse::<i32>().ok());
                     let y = parts.get(1).and_then(|s| s.parse::<i32>().ok());
-                    let tol = parts.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(30);
+                    let tol = parts
+                        .get(2)
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(30);
                     let (Some(x), Some(y)) = (x, y) else {
                         let _ = writer.write_all(b"error: detect-edges X Y [tolerance]\n");
                         continue;
@@ -4718,10 +4721,7 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                     }
                 }
                 "reload-settings" => {
-                    if sender
-                        .send(MainEvent::Ipc(IpcCmd::ReloadSettings))
-                        .is_err()
-                    {
+                    if sender.send(MainEvent::Ipc(IpcCmd::ReloadSettings)).is_err() {
                         return;
                     }
                 }
@@ -4734,8 +4734,7 @@ fn ipc_loop(listener: std::os::unix::net::UnixListener, sender: std::sync::mpsc:
                     // Answered directly here — no main-loop roundtrip
                     // needed since the build_id is a process-lifetime
                     // constant captured at daemon startup.
-                    let _ = writer
-                        .write_all(format!("{}\n", vernier_core::build_id()).as_bytes());
+                    let _ = writer.write_all(format!("{}\n", vernier_core::build_id()).as_bytes());
                 }
                 other => log::debug!("ipc unknown command: {other:?}"),
             }
@@ -4900,14 +4899,10 @@ fn menu_content_height_logical(items: &[MenuItemDef]) -> f64 {
 /// Hit-test the cursor against the menu. Returns the row index under
 /// the cursor, or `None` if the cursor is on a divider gap or outside
 /// the menu bounds.
-fn menu_hit_row(
-    origin: (f64, f64),
-    items: &[MenuItemDef],
-    cursor: (f64, f64),
-) -> Option<usize> {
+fn menu_hit_row(origin: (f64, f64), items: &[MenuItemDef], cursor: (f64, f64)) -> Option<usize> {
     let cx = cursor.0 - origin.0;
     let cy = cursor.1 - origin.1;
-    if cx < 0.0 || cx >= MENU_WIDTH_LOGICAL {
+    if !(0.0..MENU_WIDTH_LOGICAL).contains(&cx) {
         return None;
     }
     let mut row_y = MENU_PAD_Y;
@@ -4928,10 +4923,7 @@ fn menu_hit_row(
 fn menu_contains(origin: (f64, f64), items: &[MenuItemDef], cursor: (f64, f64)) -> bool {
     let cx = cursor.0 - origin.0;
     let cy = cursor.1 - origin.1;
-    cx >= 0.0
-        && cx < MENU_WIDTH_LOGICAL
-        && cy >= 0.0
-        && cy < menu_content_height_logical(items)
+    (0.0..MENU_WIDTH_LOGICAL).contains(&cx) && cy >= 0.0 && cy < menu_content_height_logical(items)
 }
 
 /// Convert the static items table to the renderer-friendly form.
@@ -4956,8 +4948,7 @@ fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<Capture
         anyhow::bail!("empty screenshot region");
     }
     let region = format!("{},{} {}x{}", lo_x, lo_y, w, h);
-    let tmp_path = std::env::temp_dir()
-        .join(format!("vernier-grim-{}.png", current_timestamp()));
+    let tmp_path = std::env::temp_dir().join(format!("vernier-grim-{}.png", current_timestamp()));
     let mut cmd = std::process::Command::new("grim");
     cmd.args(["-g", &region]);
     // grim -s downscales the output by the given factor. retina_downscale
@@ -4998,10 +4989,7 @@ fn take_held_screenshot_via_grim(rect_start: Px, rect_end: Px) -> Result<Capture
 /// `retina_downscale` preference is currently honored only on Linux.
 /// Add post-decode resizing here when wiring it up on macOS.
 #[cfg(target_os = "macos")]
-fn take_held_screenshot_via_screencapture(
-    rect_start: Px,
-    rect_end: Px,
-) -> Result<CaptureOutcome> {
+fn take_held_screenshot_via_screencapture(rect_start: Px, rect_end: Px) -> Result<CaptureOutcome> {
     let s = current_settings();
     let prefs = s.screenshots.clone();
     let pad = prefs.padding_px as i32;
@@ -5015,8 +5003,8 @@ fn take_held_screenshot_via_screencapture(
         anyhow::bail!("empty screenshot region");
     }
     let region = format!("{},{},{},{}", lo_x, lo_y, w, h);
-    let tmp_path = std::env::temp_dir()
-        .join(format!("vernier-screencapture-{}.png", current_timestamp()));
+    let tmp_path =
+        std::env::temp_dir().join(format!("vernier-screencapture-{}.png", current_timestamp()));
     let status = std::process::Command::new("/usr/sbin/screencapture")
         .args(["-R", &region, "-x", "-t", "png"])
         .arg(&tmp_path)
@@ -5054,10 +5042,7 @@ fn take_held_screenshot_via_screencapture(
     if dpi != 72 {
         let dpi_str = dpi.to_string();
         let dpi_status = std::process::Command::new("/usr/bin/sips")
-            .args([
-                "-s", "dpiWidth", &dpi_str,
-                "-s", "dpiHeight", &dpi_str,
-            ])
+            .args(["-s", "dpiWidth", &dpi_str, "-s", "dpiHeight", &dpi_str])
             .arg(&tmp_path)
             .arg("--out")
             .arg(&tmp_path)
@@ -5114,12 +5099,11 @@ fn finish_held_screenshot(
             prefs.handoff_args.clone()
         };
         let cmd = prefs.handoff_command.clone();
-        let temp_path = std::env::temp_dir()
-            .join(format!("vernier-handoff-{}.png", current_timestamp()));
+        let temp_path =
+            std::env::temp_dir().join(format!("vernier-handoff-{}.png", current_timestamp()));
         if let Some(src) = source_png {
-            std::fs::copy(src, &temp_path).with_context(|| {
-                format!("copy {} → {}", src.display(), temp_path.display())
-            })?;
+            std::fs::copy(src, &temp_path)
+                .with_context(|| format!("copy {} → {}", src.display(), temp_path.display()))?;
         } else {
             img.save(&temp_path)
                 .with_context(|| format!("write {}", temp_path.display()))?;
@@ -5131,7 +5115,10 @@ fn finish_held_screenshot(
             Ok(_) => {
                 log::info!(
                     "screenshot handed off to {}: {} ({}×{})",
-                    app_label, path_str, final_w, final_h
+                    app_label,
+                    path_str,
+                    final_w,
+                    final_h
                 );
                 return Ok(CaptureOutcome::HandedOff);
             }
@@ -5190,9 +5177,7 @@ fn finish_held_screenshot(
     // notification thread closure owns simple Strings — no Settings
     // borrow held across the notify-send wait. Only fires when both
     // edit_action is on AND the user actually picked an app.
-    let handoff_for_action = if prefs.handoff_edit_action
-        && !prefs.handoff_command.is_empty()
-    {
+    let handoff_for_action = if prefs.handoff_edit_action && !prefs.handoff_command.is_empty() {
         let label = if !prefs.handoff_app_name.is_empty() {
             prefs.handoff_app_name.clone()
         } else {
@@ -5209,13 +5194,7 @@ fn finish_held_screenshot(
     };
     std::thread::spawn(move || {
         let edit_label;
-        let mut args: Vec<&str> = vec![
-            "-i",
-            &path_str,
-            "-t",
-            "10000",
-            "Screenshot saved",
-        ];
+        let mut args: Vec<&str> = vec!["-i", &path_str, "-t", "10000", "Screenshot saved"];
         if let Some((_, _, ref name)) = handoff_for_action {
             edit_label = format!("Click to edit with {name}");
             args.insert(0, "default=Edit");
@@ -5224,7 +5203,9 @@ fn finish_held_screenshot(
         } else {
             args.push(&path_str);
         }
-        let result = std::process::Command::new("notify-send").args(&args).output();
+        let result = std::process::Command::new("notify-send")
+            .args(&args)
+            .output();
         let Some((cmd, args_template, _)) = handoff_for_action else {
             return;
         };
@@ -5245,6 +5226,7 @@ fn finish_held_screenshot(
 /// `external_screenshot_command` detached on a 250ms timer (so the
 /// overlay-hide commit lands first) and a watchdog that SIGKILLs
 /// `hyprpicker` once `slurp` closes.
+#[allow(clippy::too_many_arguments)]
 fn do_take_normal_screenshot(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
@@ -5269,9 +5251,7 @@ fn do_take_normal_screenshot(
         .screenshots
         .external_screenshot_command
         .clone();
-    log::info!(
-        "external screenshot: running clear-and-hide, then spawning {cmd:?}"
-    );
+    log::info!("external screenshot: running clear-and-hide, then spawning {cmd:?}");
     if let Err(e) = save_session(held_rects, guides, stuck_measurements) {
         log::warn!("save session: {e:#}");
     }
@@ -5380,6 +5360,7 @@ fn omarchy_font_present() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn toggle_measurement(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
@@ -5402,7 +5383,9 @@ fn toggle_measurement(
             Ok(frame) => {
                 log::info!(
                     "measurement mode: ON (frozen {}×{} {:?})",
-                    frame.width, frame.height, frame.format
+                    frame.width,
+                    frame.height,
+                    frame.format
                 );
                 // Push the captured frame to the overlay as its
                 // background so the user sees a literal snapshot —
@@ -5438,7 +5421,9 @@ fn toggle_measurement(
                 LIVE_CAPTURE_INTERVAL,
             ));
         }
-        *mode = InteractionMode::Hover { cursor: Px::default() };
+        *mode = InteractionMode::Hover {
+            cursor: Px::default(),
+        };
         overlay.set_input_capturing(true);
         // Claim the prefs hotkey only while we're the active tool —
         // see the comment at the prefs_hotkey_accel declaration. A
@@ -5483,9 +5468,8 @@ fn toggle_measurement(
             log::info!("prefs hotkey released");
         }
     }
-    let has_content = !held_rects.is_empty()
-        || !guides.is_empty()
-        || !stuck_measurements.is_empty();
+    let has_content =
+        !held_rects.is_empty() || !guides.is_empty() || !stuck_measurements.is_empty();
     if has_content {
         // Going OFF with persisted content: drop the frozen frame and
         // switch the overlay into passthrough mode (no input grab, no
@@ -5685,20 +5669,18 @@ fn refresh_hud(
     // rect edge/corner). After that, guide-line hover gets a
     // direction-matching resize cursor; X-badge / pill / interior
     // hover get the arrow.
-    let cursor_in_rect = (cursor_in_held || any_stuck_hover || over_guide_x)
-        && resize_handle.is_none();
-    let resize_cursor_kind = resize_handle
-        .map(handle_to_cursor_kind)
-        .or_else(|| {
-            if !over_guide_x {
-                hovered_guide.map(|g| match g.axis {
-                    GuideAxis::Horizontal => CursorKind::ResizeNS,
-                    GuideAxis::Vertical => CursorKind::ResizeEW,
-                })
-            } else {
-                None
-            }
-        });
+    let cursor_in_rect =
+        (cursor_in_held || any_stuck_hover || over_guide_x) && resize_handle.is_none();
+    let resize_cursor_kind = resize_handle.map(handle_to_cursor_kind).or_else(|| {
+        if !over_guide_x {
+            hovered_guide.map(|g| match g.axis {
+                GuideAxis::Horizontal => CursorKind::ResizeNS,
+                GuideAxis::Vertical => CursorKind::ResizeEW,
+            })
+        } else {
+            None
+        }
+    });
 
     // Right-click context menu: built once here and attached to
     // whichever HUD the regular branches end up producing. The menu
@@ -5768,7 +5750,10 @@ fn refresh_hud(
                 edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects)
             };
             let mut hud = Hud {
-                kind: HudKind::Hover { cursor: (x, y), edges },
+                kind: HudKind::Hover {
+                    cursor: (x, y),
+                    edges,
+                },
                 ..Hud::hover((x, y))
             };
             hud.foreground = fg;
@@ -5804,13 +5789,19 @@ fn refresh_hud(
                 } else {
                     (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
                 };
-                hud.kind = HudKind::Drawing { start: start_pos, cursor: (cx, cy) };
+                hud.kind = HudKind::Drawing {
+                    start: start_pos,
+                    cursor: (cx, cy),
+                };
             } else {
                 // Below the drag threshold the rect would just be a
                 // 1×1 dot — fall back to the live measurement HUD so a
                 // mis-click looks identical to hovering.
                 let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
-                hud.kind = HudKind::Hover { cursor: (x, y), edges };
+                hud.kind = HudKind::Hover {
+                    cursor: (x, y),
+                    edges,
+                };
             }
             hud.toast = toast.cloned();
             hud.guides = composed_guides.clone();
@@ -5983,8 +5974,8 @@ fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
 }
 
 /// Snapshot the current axis distance into a [`StuckMeasurement`].
-/// Uses whatever edges the cursor is sitting between (detected pixels
-/// + guide-clamps); falls back to the surface bounds when an edge is
+/// Uses whatever edges the cursor is sitting between (detected pixels +
+/// guide-clamps); falls back to the surface bounds when an edge is
 /// missing on a side so the user always gets a meaningful value.
 fn freeze_axis_measurement(
     axis: GuideAxis,
@@ -6003,9 +5994,7 @@ fn freeze_axis_measurement(
     match axis {
         GuideAxis::Vertical => {
             let up = edges[2].map(|e| e.position.1).unwrap_or(0.0);
-            let down = edges[3]
-                .map(|e| e.position.1)
-                .unwrap_or(surface_h as f64);
+            let down = edges[3].map(|e| e.position.1).unwrap_or(surface_h as f64);
             StuckMeasurement {
                 axis,
                 at: x,
@@ -6018,9 +6007,7 @@ fn freeze_axis_measurement(
         }
         GuideAxis::Horizontal => {
             let left = edges[0].map(|e| e.position.0).unwrap_or(0.0);
-            let right = edges[1]
-                .map(|e| e.position.0)
-                .unwrap_or(surface_w as f64);
+            let right = edges[1].map(|e| e.position.0).unwrap_or(surface_w as f64);
             StuckMeasurement {
                 axis,
                 at: y,
@@ -6038,19 +6025,14 @@ fn freeze_axis_measurement(
 /// existing edge takes that edge's slot — effectively making guides
 /// behave like detected pixel boundaries. Slot order matches
 /// [`detect_edges`]: 0=Left, 1=Right, 2=Up, 3=Down.
-fn apply_guides_to_edges(
-    edges: &mut [Option<HudEdge>; 4],
-    guides: &[Guide],
-    x: f64,
-    y: f64,
-) {
+fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: f64, y: f64) {
     for guide in guides {
         match guide.axis {
             GuideAxis::Vertical => {
                 let dx = guide.position as f64 - x;
                 if dx <= -1.0 {
                     let dist = (-dx) as u32;
-                    if edges[0].map_or(true, |e| e.distance_px > dist) {
+                    if edges[0].is_none_or(|e| e.distance_px > dist) {
                         edges[0] = Some(HudEdge {
                             axis: HudAxis::Left,
                             position: (guide.position as f64, y),
@@ -6059,7 +6041,7 @@ fn apply_guides_to_edges(
                     }
                 } else if dx >= 1.0 {
                     let dist = dx as u32;
-                    if edges[1].map_or(true, |e| e.distance_px > dist) {
+                    if edges[1].is_none_or(|e| e.distance_px > dist) {
                         edges[1] = Some(HudEdge {
                             axis: HudAxis::Right,
                             position: (guide.position as f64, y),
@@ -6072,7 +6054,7 @@ fn apply_guides_to_edges(
                 let dy = guide.position as f64 - y;
                 if dy <= -1.0 {
                     let dist = (-dy) as u32;
-                    if edges[2].map_or(true, |e| e.distance_px > dist) {
+                    if edges[2].is_none_or(|e| e.distance_px > dist) {
                         edges[2] = Some(HudEdge {
                             axis: HudAxis::Up,
                             position: (x, guide.position as f64),
@@ -6081,7 +6063,7 @@ fn apply_guides_to_edges(
                     }
                 } else if dy >= 1.0 {
                     let dist = dy as u32;
-                    if edges[3].map_or(true, |e| e.distance_px > dist) {
+                    if edges[3].is_none_or(|e| e.distance_px > dist) {
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, guide.position as f64),
@@ -6135,7 +6117,7 @@ fn apply_held_rects_to_edges(
                     // right (toward the cursor) so it stops before the
                     // border, not on it.
                     let dist = ((-dx) as u32).saturating_sub(1);
-                    if edges[0].map_or(true, |e| e.distance_px > dist) {
+                    if edges[0].is_none_or(|e| e.distance_px > dist) {
                         edges[0] = Some(HudEdge {
                             axis: HudAxis::Left,
                             position: (side_x + 1.0, y),
@@ -6144,7 +6126,7 @@ fn apply_held_rects_to_edges(
                     }
                 } else if dx >= 1.0 {
                     let dist = (dx as u32).saturating_sub(1);
-                    if edges[1].map_or(true, |e| e.distance_px > dist) {
+                    if edges[1].is_none_or(|e| e.distance_px > dist) {
                         edges[1] = Some(HudEdge {
                             axis: HudAxis::Right,
                             position: (side_x - 1.0, y),
@@ -6161,7 +6143,7 @@ fn apply_held_rects_to_edges(
                 let dy = side_y - y;
                 if dy <= -1.0 {
                     let dist = ((-dy) as u32).saturating_sub(1);
-                    if edges[2].map_or(true, |e| e.distance_px > dist) {
+                    if edges[2].is_none_or(|e| e.distance_px > dist) {
                         edges[2] = Some(HudEdge {
                             axis: HudAxis::Up,
                             position: (x, side_y + 1.0),
@@ -6170,7 +6152,7 @@ fn apply_held_rects_to_edges(
                     }
                 } else if dy >= 1.0 {
                     let dist = (dy as u32).saturating_sub(1);
-                    if edges[3].map_or(true, |e| e.distance_px > dist) {
+                    if edges[3].is_none_or(|e| e.distance_px > dist) {
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, side_y - 1.0),
@@ -6299,11 +6281,7 @@ struct ResizeOp {
 /// take priority over edges. Returns `None` if the cursor isn't on
 /// any handle (in which case the click is interior — remove — or
 /// outside the rect entirely).
-fn cursor_over_rect_handle(
-    cursor: Px,
-    rect_start: Px,
-    rect_end: Px,
-) -> Option<ResizeHandle> {
+fn cursor_over_rect_handle(cursor: Px, rect_start: Px, rect_end: Px) -> Option<ResizeHandle> {
     let lo_x = rect_start.x.min(rect_end.x);
     let hi_x = rect_start.x.max(rect_end.x);
     let lo_y = rect_start.y.min(rect_end.y);
@@ -6545,11 +6523,7 @@ fn detect_hud_edges(
     Some(convert_edges_to_surface(&edges, scale_x, scale_y))
 }
 
-fn convert_edges_to_surface(
-    edges: &EdgeQuad,
-    scale_x: f64,
-    scale_y: f64,
-) -> [Option<HudEdge>; 4] {
+fn convert_edges_to_surface(edges: &EdgeQuad, scale_x: f64, scale_y: f64) -> [Option<HudEdge>; 4] {
     use vernier_core::Direction;
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
@@ -6579,6 +6553,10 @@ fn convert_edges_to_surface(
     out
 }
 
+// held_rects is kept as &mut Vec because the function calls .push()/
+// .remove() on it (creating new held rects, removing on close). The
+// other two collections are mutated in place only, so they take slices.
+#[allow(clippy::ptr_arg, clippy::too_many_arguments)]
 fn handle_pointer_button(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
@@ -6587,8 +6565,8 @@ fn handle_pointer_button(
     y: f64,
     frozen_frame: Option<&vernier_platform::NativeFrame>,
     tolerance: u32,
-    guides: &mut Vec<Guide>,
-    stuck_measurements: &mut Vec<StuckMeasurement>,
+    guides: &mut [Guide],
+    stuck_measurements: &mut [StuckMeasurement],
     held_rects: &mut Vec<HeldRect>,
     nudge_selection: &mut Option<NudgeSelection>,
     color_alternate: bool,
@@ -6653,9 +6631,15 @@ fn handle_pointer_button(
             let snap = SnapPoint::loose(snapped_start);
             log::info!(
                 "drag started at ({},{}) (raw cursor ({},{}))",
-                snapped_start.x, snapped_start.y, cursor_px.x, cursor_px.y
+                snapped_start.x,
+                snapped_start.y,
+                cursor_px.x,
+                cursor_px.y
             );
-            *mode = InteractionMode::Drawing { start: snap, cursor: cursor_px };
+            *mode = InteractionMode::Drawing {
+                start: snap,
+                cursor: cursor_px,
+            };
             // Don't paint the rect yet — wait for the user to actually
             // move past `DRAG_THRESHOLD_PX`. A bare click should look
             // like a hover, not a 1×1 box.
@@ -6663,7 +6647,10 @@ fn handle_pointer_button(
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
-            hud.kind = HudKind::Hover { cursor: (x, y), edges };
+            hud.kind = HudKind::Hover {
+                cursor: (x, y),
+                edges,
+            };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
             hud.held_rects = held_rects.to_vec();
@@ -6678,7 +6665,10 @@ fn handle_pointer_button(
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
-            hud.kind = HudKind::Hover { cursor: (x, y), edges };
+            hud.kind = HudKind::Hover {
+                cursor: (x, y),
+                edges,
+            };
             hud.guides = guides.to_vec();
             hud.stuck_measurements = stuck_measurements.to_vec();
             hud.held_rects = held_rects.to_vec();
@@ -6698,8 +6688,14 @@ fn handle_pointer_button(
         let (snapped_start, snapped_end) =
             snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance);
         let measurement = Measurement::new(
-            SnapPoint::loose(Px::new(snapped_start.0.round() as i32, snapped_start.1.round() as i32)),
-            SnapPoint::loose(Px::new(snapped_end.0.round() as i32, snapped_end.1.round() as i32)),
+            SnapPoint::loose(Px::new(
+                snapped_start.0.round() as i32,
+                snapped_start.1.round() as i32,
+            )),
+            SnapPoint::loose(Px::new(
+                snapped_end.0.round() as i32,
+                snapped_end.1.round() as i32,
+            )),
         );
         let aspect = if measurement.width() > 0 && measurement.height() > 0 {
             classify_aspect(
@@ -6769,8 +6765,7 @@ fn snap_shrink_logical_rect(
     let fy0 = (a.1 * scale_y).round() as i32;
     let fx1 = (b.0 * scale_x).round() as i32;
     let fy1 = (b.1 * scale_y).round() as i32;
-    let (sx0, sy0, sx1, sy1) =
-        shrink_to_content(&view, fx0, fy0, fx1, fy1, Tolerance(tolerance));
+    let (sx0, sy0, sx1, sy1) = shrink_to_content(&view, fx0, fy0, fx1, fy1, Tolerance(tolerance));
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
     (
@@ -6827,16 +6822,8 @@ fn snap_shrink_resize(
         Left => (fx1 + pad_x, mid_fy),
         Right => (fx0 - pad_x, mid_fy),
     };
-    let (sx0, sy0, sx1, sy1) = shrink_to_content_with_bg(
-        &view,
-        fx0,
-        fy0,
-        fx1,
-        fy1,
-        bg_x,
-        bg_y,
-        Tolerance(tolerance),
-    );
+    let (sx0, sy0, sx1, sy1) =
+        shrink_to_content_with_bg(&view, fx0, fy0, fx1, fy1, bg_x, bg_y, Tolerance(tolerance));
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
     let snapped_lo_x = match handle {
@@ -6905,10 +6892,10 @@ fn save_frame_png(path: &Path, frame: &Frame) -> Result<()> {
                 frame.height
             )
         })?;
-    img.save(path).with_context(|| format!("write {}", path.display()))?;
+    img.save(path)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
-
 
 /// Pipe `text` into `wl-copy`. Used by the Enter-to-copy-dimensions
 /// path; the screenshot capture has its own image-mode call.
@@ -6985,11 +6972,7 @@ fn save_session(
     for r in rects {
         s.push_str(&format!(
             "rect {} {} {} {} {}\n",
-            r.rect_start.0,
-            r.rect_start.1,
-            r.rect_end.0,
-            r.rect_end.1,
-            r.color_alternate as u8,
+            r.rect_start.0, r.rect_start.1, r.rect_end.0, r.rect_end.1, r.color_alternate as u8,
         ));
     }
     for g in guides {
@@ -7009,12 +6992,7 @@ fn save_session(
         };
         s.push_str(&format!(
             "stuck {axis} {} {} {} {} {} {}\n",
-            m.at,
-            m.start,
-            m.end,
-            m.pill_offset.0,
-            m.pill_offset.1,
-            m.color_alternate as u8,
+            m.at, m.start, m.end, m.pill_offset.0, m.pill_offset.1, m.color_alternate as u8,
         ));
     }
     std::fs::write(&path, s)
@@ -7036,9 +7014,12 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts.as_slice() {
             ["rect", a, b, c, d] => {
-                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by)) =
-                    (a.parse::<f64>(), b.parse::<f64>(), c.parse::<f64>(), d.parse::<f64>())
-                {
+                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by)) = (
+                    a.parse::<f64>(),
+                    b.parse::<f64>(),
+                    c.parse::<f64>(),
+                    d.parse::<f64>(),
+                ) {
                     rects.push(HeldRect {
                         rect_start: (ax, ay),
                         rect_end: (bx, by),
@@ -7107,9 +7088,7 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     "v" => GuideAxis::Vertical,
                     _ => continue,
                 };
-                if let (Ok(at), Ok(start), Ok(end)) =
-                    (at.parse(), start.parse(), end.parse())
-                {
+                if let (Ok(at), Ok(start), Ok(end)) = (at.parse(), start.parse(), end.parse()) {
                     stuck.push(StuckMeasurement {
                         axis: ax,
                         at,
@@ -7130,9 +7109,13 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     "v" => GuideAxis::Vertical,
                     _ => continue,
                 };
-                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy)) =
-                    (at.parse(), start.parse(), end.parse(), ox.parse(), oy.parse())
-                {
+                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy)) = (
+                    at.parse(),
+                    start.parse(),
+                    end.parse(),
+                    ox.parse(),
+                    oy.parse(),
+                ) {
                     stuck.push(StuckMeasurement {
                         axis: ax,
                         at,

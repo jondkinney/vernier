@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use tungstenite::{accept, Message};
+use tungstenite::{Message, accept};
 
 /// Cached zoom value plus the wall-clock instant it landed. Reading
 /// code rejects stale entries so a disconnected plugin doesn't keep
@@ -136,8 +136,8 @@ pub fn manifest_path() -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     {
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../figma-plugin/manifest.json");
+        let dev =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../figma-plugin/manifest.json");
         if dev.exists() {
             return canonicalize(dev);
         }

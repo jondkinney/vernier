@@ -145,7 +145,10 @@ fn run_pipewire(
     }
 
     let _ = ready_tx.send(Ok(()));
-    log::info!("pipewire: main loop running with {} stream(s)", streams_meta.len());
+    log::info!(
+        "pipewire: main loop running with {} stream(s)",
+        streams_meta.len()
+    );
 
     mainloop.run();
     Ok(())
@@ -266,7 +269,7 @@ fn create_stream(
                         mmap_len,
                         libc::PROT_READ,
                         libc::MAP_PRIVATE,
-                        dfd as i32,
+                        dfd,
                         0,
                     )
                 };
@@ -349,7 +352,7 @@ fn build_buffers_pod() -> Result<Vec<u8>> {
     let prop = Property {
         key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
         flags: PropertyFlags::empty(),
-        value: Value::Int(mem_types as i32),
+        value: Value::Int(mem_types),
     };
     let obj = Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
@@ -422,18 +425,19 @@ pub(crate) fn open_session_blocking() -> Result<SessionState> {
         if let Err(e) = save_token(token) {
             log::warn!("screencast: could not persist restore token: {e}");
         } else {
-            log::info!("screencast: persisted restore token at {}", token_path_display());
+            log::info!(
+                "screencast: persisted restore token at {}",
+                token_path_display()
+            );
         }
     }
     Ok(result)
 }
 
 async fn open_session_async(prev_token: Option<String>) -> Result<SessionState> {
-    let proxy = Screencast::new()
-        .await
-        .map_err(|e| PlatformError::Portal {
-            reason: format!("create screencast proxy: {e}"),
-        })?;
+    let proxy = Screencast::new().await.map_err(|e| PlatformError::Portal {
+        reason: format!("create screencast proxy: {e}"),
+    })?;
 
     let session = proxy
         .create_session(Default::default())

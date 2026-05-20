@@ -130,16 +130,13 @@ fn reduced(width: u32, height: u32) -> Ratio {
 
 fn closest_common(width: u32, height: u32) -> Option<CommonRatio> {
     let target = width as f32 / height as f32;
-    CommonRatio::ALL
-        .iter()
-        .copied()
-        .min_by(|a, b| {
-            let (an, ad) = a.ratio();
-            let (bn, bd) = b.ratio();
-            let aerr = ((an as f32 / ad as f32) - target).abs();
-            let berr = ((bn as f32 / bd as f32) - target).abs();
-            aerr.partial_cmp(&berr).unwrap_or(std::cmp::Ordering::Equal)
-        })
+    CommonRatio::ALL.iter().copied().min_by(|a, b| {
+        let (an, ad) = a.ratio();
+        let (bn, bd) = b.ratio();
+        let aerr = ((an as f32 / ad as f32) - target).abs();
+        let berr = ((bn as f32 / bd as f32) - target).abs();
+        aerr.partial_cmp(&berr).unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 fn nearest_common(width: u32, height: u32, tolerance: f32) -> Option<CommonRatio> {

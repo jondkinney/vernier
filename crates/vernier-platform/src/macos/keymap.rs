@@ -17,10 +17,7 @@ pub(crate) mod carbon_mods {
     pub const CONTROL: u32 = 1 << 12; // controlKey
 }
 
-pub(crate) fn accelerator_to_carbon(
-    modifiers: Modifiers,
-    key: Key,
-) -> Option<(u32, u32)> {
+pub(crate) fn accelerator_to_carbon(modifiers: Modifiers, key: Key) -> Option<(u32, u32)> {
     let mut mods = 0u32;
     if modifiers.contains(Modifiers::SHIFT) {
         mods |= carbon_mods::SHIFT;

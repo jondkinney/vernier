@@ -11,20 +11,20 @@ pub mod handoff;
 pub mod measurement;
 pub mod settings;
 
-pub use aspect::{classify as classify_aspect, CommonRatio, Mode as AspectMode, Ratio};
+pub use aspect::{CommonRatio, Mode as AspectMode, Ratio, classify as classify_aspect};
 pub use color::Rgba;
 pub use edge::{
-    detect_edges, shrink_to_content, shrink_to_content_with_bg, Direction, EdgeCandidate,
-    EdgeQuad, Tolerance,
+    Direction, EdgeCandidate, EdgeQuad, Tolerance, detect_edges, shrink_to_content,
+    shrink_to_content_with_bg,
 };
 pub use frame::FrameView;
 pub use geometry::{Px, PxRect};
 pub use handoff::{
-    find_installed_apps as find_installed_handoff_apps, lookup_for_binary, render_args,
-    resolve_icon, HandoffApp, KNOWN_HANDOFF_APPS,
+    HandoffApp, KNOWN_HANDOFF_APPS, find_installed_apps as find_installed_handoff_apps,
+    lookup_for_binary, render_args, resolve_icon,
 };
 pub use measurement::{
-    axis_biased_snap, best_snap, Axis, Measurement, Mode as InteractionMode, SnapPoint,
+    Axis, Measurement, Mode as InteractionMode, SnapPoint, axis_biased_snap, best_snap,
 };
 pub use settings::{
     AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, GeneralSettings, IntegrationSettings,
