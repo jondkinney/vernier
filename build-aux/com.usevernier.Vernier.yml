@@ -79,6 +79,17 @@ modules:
       - install -Dm0755 target/release/vernier /app/bin/vernier
       - install -Dm0644 assets/icons/hicolor/scalable/apps/vernier.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       - install -Dm0644 packaging/vernier.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      # The shipped desktop file uses `Icon=vernier` and `Exec=vernier prefs`
+      # because that's how it's consumed in non-Flatpak contexts
+      # (the AUR tarballs install the binary at /usr/bin/vernier
+      # and the icon as vernier.svg). Inside the Flatpak sandbox,
+      # the icon is installed as ${FLATPAK_ID}.svg and the binary
+      # at /app/bin/vernier, so the desktop file's Icon= and Exec=
+      # are rewritten here at install time to match — without this,
+      # the icon shows a generic placeholder in GNOME Software /
+      # KDE Discover and clicks may fail to launch.
+      - sed -i 's|^Icon=vernier$|Icon=com.usevernier.Vernier|' ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - sed -i 's|^Exec=vernier |Exec=/app/bin/vernier |' ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       # AppStream metainfo — required by Flathub, also picked up by
       # GNOME Software / KDE Discover for sideloaded bundles.
       - install -Dm0644 build-aux/com.usevernier.Vernier.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
