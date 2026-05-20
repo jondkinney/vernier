@@ -104,7 +104,7 @@ pub const KNOWN_HANDOFF_APPS_MACOS: &[&str] = &[
 pub fn find_installed_apps() -> Vec<HandoffApp> {
     #[cfg(target_os = "macos")]
     {
-        return find_installed_apps_macos();
+        find_installed_apps_macos()
     }
     #[cfg(not(target_os = "macos"))]
     {
