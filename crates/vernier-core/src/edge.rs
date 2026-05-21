@@ -157,22 +157,20 @@ pub fn shrink_to_content(
     // original draw-from-cursor-out behavior.
     let bg_x = x0.min(x1).max(0).min(frame.width as i32 - 1);
     let bg_y = y0.min(y1).max(0).min(frame.height as i32 - 1);
-    shrink_to_content_with_bg(frame, x0, y0, x1, y1, bg_x, bg_y, tolerance)
+    shrink_to_content_with_bg(frame, x0, y0, x1, y1, Px::new(bg_x, bg_y), tolerance)
 }
 
 /// Same as [`shrink_to_content`] but lets the caller pick the bg
 /// reference pixel explicitly. Useful for resize, where the rect's
 /// own top-left can land inside content and the default sample would
 /// collapse the algorithm.
-#[allow(clippy::too_many_arguments)]
 pub fn shrink_to_content_with_bg(
     frame: &FrameView,
     x0: i32,
     y0: i32,
     x1: i32,
     y1: i32,
-    bg_x: i32,
-    bg_y: i32,
+    bg: Px,
     tolerance: Tolerance,
 ) -> (i32, i32, i32, i32) {
     let (rx0, rx1) = (x0.min(x1), x0.max(x1));
@@ -186,8 +184,8 @@ pub fn shrink_to_content_with_bg(
     if cx1 <= cx0 || cy1 <= cy0 {
         return (x0, y0, x1, y1);
     }
-    let bx = bg_x.max(0).min(fw - 1);
-    let by = bg_y.max(0).min(fh - 1);
+    let bx = bg.x.max(0).min(fw - 1);
+    let by = bg.y.max(0).min(fh - 1);
     let bg = match frame.pixel(bx as u32, by as u32) {
         Some(p) => p,
         None => return (x0, y0, x1, y1),

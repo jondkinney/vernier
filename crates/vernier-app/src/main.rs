@@ -666,18 +666,22 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 toggle_measurement(
-                    &mut mode,
-                    &mut overlay,
-                    &platform,
-                    primary.id,
-                    &mut frozen_frame,
-                    &mut capture_worker,
-                    &held_rects,
-                    &guides,
-                    &stuck_measurements,
+                    &mut MeasureSession {
+                        mode: &mut mode,
+                        overlay: &mut overlay,
+                        platform: &platform,
+                        monitor: primary.id,
+                        frozen_frame: &mut frozen_frame,
+                        capture_worker: &mut capture_worker,
+                        prefs_hotkey: &mut prefs_hotkey,
+                    },
+                    MeasurementView {
+                        held_rects: &held_rects,
+                        guides: &guides,
+                        stuck_measurements: &stuck_measurements,
+                    },
                     color_alternate,
                     prefs_hotkey_accel,
-                    &mut prefs_hotkey,
                 );
             }
             MainEvent::Platform(PlatformEvent::TrayMenuActivated { id }) if id == "open_prefs" => {
@@ -711,18 +715,22 @@ fn run_daemon() -> Result<()> {
                     // cleared above, toggle_measurement takes the
                     // clean-hide branch and the overlay disappears.
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut capture_worker,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                        },
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
                         color_alternate,
                         prefs_hotkey_accel,
-                        &mut prefs_hotkey,
                     );
                 } else {
                     // Already idle but the overlay may still be in
@@ -741,18 +749,22 @@ fn run_daemon() -> Result<()> {
                 pending_guide = None;
                 pending_guide_shift_acked = false;
                 toggle_measurement(
-                    &mut mode,
-                    &mut overlay,
-                    &platform,
-                    primary.id,
-                    &mut frozen_frame,
-                    &mut capture_worker,
-                    &held_rects,
-                    &guides,
-                    &stuck_measurements,
+                    &mut MeasureSession {
+                        mode: &mut mode,
+                        overlay: &mut overlay,
+                        platform: &platform,
+                        monitor: primary.id,
+                        frozen_frame: &mut frozen_frame,
+                        capture_worker: &mut capture_worker,
+                        prefs_hotkey: &mut prefs_hotkey,
+                    },
+                    MeasurementView {
+                        held_rects: &held_rects,
+                        guides: &guides,
+                        stuck_measurements: &stuck_measurements,
+                    },
                     color_alternate,
                     prefs_hotkey_accel,
-                    &mut prefs_hotkey,
                 );
             }
             MainEvent::Platform(PlatformEvent::TrayIconLeftClicked { .. }) => {
@@ -813,25 +825,33 @@ fn run_daemon() -> Result<()> {
                         refresh_frame_if_live(capture_worker.as_ref(), &mut frozen_frame);
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                     continue;
@@ -912,18 +932,24 @@ fn run_daemon() -> Result<()> {
                     // pointer" boundary.
                     let want = want_system_pointer(
                         cursor_px,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
-                        pending_guide,
-                        dragging_guide,
-                        resizing,
-                        active_handle,
-                        context_menu.is_some(),
-                        alt_held,
-                        stuck_pill_drag_committed,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
+                        ScreenSize {
+                            w: primary.bounds.w as i32,
+                            h: primary.bounds.h as i32,
+                        },
+                        PointerGate {
+                            pending_guide,
+                            dragging_guide,
+                            resizing,
+                            resize_handle: active_handle,
+                            menu_open: context_menu.is_some(),
+                            alt_held,
+                            stuck_drag_committed: stuck_pill_drag_committed,
+                        },
                     );
                     if want != system_pointer_visible {
                         overlay.set_system_pointer_visible(want);
@@ -936,25 +962,33 @@ fn run_daemon() -> Result<()> {
                     }
                     let toast = current_toast(&active_toast, toast_until);
                     refresh_hud(
-                        &mode,
                         &mut overlay,
-                        frozen_frame.as_ref(),
+                        &HudScene {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            measurements: MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            pending_guide,
+                            toast,
+                            tolerance: current_tol_value(tol_level),
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
+                            resize_handle: active_handle,
+                            context_menu: context_menu.as_ref(),
+                        },
                         x,
                         y,
-                        current_tol_value(tol_level),
-                        toast,
-                        &guides,
-                        pending_guide,
-                        &stuck_measurements,
-                        &held_rects,
-                        color_alternate,
-                        align_mode,
-                        alt_held,
-                        stuck_pill_drag_committed,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
-                        active_handle,
-                        context_menu.as_ref(),
                     );
                 }
             }
@@ -1017,25 +1051,33 @@ fn run_daemon() -> Result<()> {
                     last_hud_redraw = Instant::now();
                     let toast = current_toast(&active_toast, toast_until);
                     refresh_hud(
-                        &mode,
                         &mut overlay,
-                        frozen_frame.as_ref(),
+                        &HudScene {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            measurements: MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            pending_guide,
+                            toast,
+                            tolerance: current_tol_value(tol_level),
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
+                            resize_handle: None,
+                            context_menu: context_menu.as_ref(),
+                        },
                         x,
                         y,
-                        current_tol_value(tol_level),
-                        toast,
-                        &guides,
-                        pending_guide,
-                        &stuck_measurements,
-                        &held_rects,
-                        color_alternate,
-                        align_mode,
-                        alt_held,
-                        stuck_pill_drag_committed,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
-                        None,
-                        context_menu.as_ref(),
                     );
                     continue;
                 }
@@ -1111,41 +1153,49 @@ fn run_daemon() -> Result<()> {
                             }
                             MenuAction::OpenScreenshotTool => {
                                 do_take_normal_screenshot(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &mut held_rects,
-                                    &mut guides,
-                                    &mut stuck_measurements,
-                                    &mut nudge_selection,
-                                    &mut last_selected_guide,
-                                    &mut pending_guide,
-                                    &mut pending_guide_shift_acked,
-                                    &mut active_toast,
-                                    &mut toast_until,
+                                    &mut MeasureSession {
+                                        mode: &mut mode,
+                                        overlay: &mut overlay,
+                                        platform: &platform,
+                                        monitor: primary.id,
+                                        frozen_frame: &mut frozen_frame,
+                                        capture_worker: &mut capture_worker,
+                                        prefs_hotkey: &mut prefs_hotkey,
+                                    },
+                                    &mut SessionContent {
+                                        held_rects: &mut held_rects,
+                                        guides: &mut guides,
+                                        stuck_measurements: &mut stuck_measurements,
+                                        nudge_selection: &mut nudge_selection,
+                                        last_selected_guide: &mut last_selected_guide,
+                                        pending_guide: &mut pending_guide,
+                                        pending_guide_shift_acked: &mut pending_guide_shift_acked,
+                                        active_toast: &mut active_toast,
+                                        toast_until: &mut toast_until,
+                                    },
                                     color_alternate,
                                     prefs_hotkey_accel,
-                                    &mut prefs_hotkey,
                                 );
                             }
                             MenuAction::EnterBackgroundMode => {
                                 log::info!("entering background mode (toggle off)");
                                 toggle_measurement(
-                                    &mut mode,
-                                    &mut overlay,
-                                    &platform,
-                                    primary.id,
-                                    &mut frozen_frame,
-                                    &mut capture_worker,
-                                    &held_rects,
-                                    &guides,
-                                    &stuck_measurements,
+                                    &mut MeasureSession {
+                                        mode: &mut mode,
+                                        overlay: &mut overlay,
+                                        platform: &platform,
+                                        monitor: primary.id,
+                                        frozen_frame: &mut frozen_frame,
+                                        capture_worker: &mut capture_worker,
+                                        prefs_hotkey: &mut prefs_hotkey,
+                                    },
+                                    MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
                                     color_alternate,
                                     prefs_hotkey_accel,
-                                    &mut prefs_hotkey,
                                 );
                             }
                             MenuAction::RestoreLastSession => {
@@ -1198,18 +1248,22 @@ fn run_daemon() -> Result<()> {
                                 last_selected_guide = None;
                                 if !matches!(mode, InteractionMode::Idle) {
                                     toggle_measurement(
-                                        &mut mode,
-                                        &mut overlay,
-                                        &platform,
-                                        primary.id,
-                                        &mut frozen_frame,
-                                        &mut capture_worker,
-                                        &held_rects,
-                                        &guides,
-                                        &stuck_measurements,
+                                        &mut MeasureSession {
+                                            mode: &mut mode,
+                                            overlay: &mut overlay,
+                                            platform: &platform,
+                                            monitor: primary.id,
+                                            frozen_frame: &mut frozen_frame,
+                                            capture_worker: &mut capture_worker,
+                                            prefs_hotkey: &mut prefs_hotkey,
+                                        },
+                                        MeasurementView {
+                                            held_rects: &held_rects,
+                                            guides: &guides,
+                                            stuck_measurements: &stuck_measurements,
+                                        },
                                         color_alternate,
                                         prefs_hotkey_accel,
-                                        &mut prefs_hotkey,
                                     );
                                 }
                                 ensure_prefs_window(&mut prefs_child);
@@ -1232,25 +1286,33 @@ fn run_daemon() -> Result<()> {
                     last_hud_redraw = Instant::now();
                     let toast = current_toast(&active_toast, toast_until);
                     refresh_hud(
-                        &mode,
                         &mut overlay,
-                        frozen_frame.as_ref(),
+                        &HudScene {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            measurements: MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            pending_guide,
+                            toast,
+                            tolerance: current_tol_value(tol_level),
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
+                            resize_handle: None,
+                            context_menu: context_menu.as_ref(),
+                        },
                         x,
                         y,
-                        current_tol_value(tol_level),
-                        toast,
-                        &guides,
-                        pending_guide,
-                        &stuck_measurements,
-                        &held_rects,
-                        color_alternate,
-                        align_mode,
-                        alt_held,
-                        stuck_pill_drag_committed,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
-                        None,
-                        context_menu.as_ref(),
                     );
                     continue;
                 }
@@ -1289,25 +1351,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                         continue;
                     }
@@ -1337,25 +1407,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                         continue;
                     }
@@ -1434,25 +1512,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                         continue;
                     }
@@ -1478,25 +1564,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -1510,25 +1604,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -1562,25 +1664,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -1628,25 +1738,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                             continue;
                         }
@@ -1655,16 +1773,21 @@ fn run_daemon() -> Result<()> {
                         &mut mode,
                         &mut overlay,
                         pressed,
-                        x,
-                        y,
-                        frozen_frame.as_ref(),
-                        current_tol_value(tol_level),
-                        &mut guides,
-                        &mut stuck_measurements,
-                        &mut held_rects,
-                        &mut nudge_selection,
-                        color_alternate,
-                        alt_held,
+                        (x, y),
+                        CaptureFrame {
+                            frozen_frame: frozen_frame.as_ref(),
+                            tolerance: current_tol_value(tol_level),
+                        },
+                        &mut MeasurementEdit {
+                            guides: &mut guides,
+                            stuck_measurements: &mut stuck_measurements,
+                            held_rects: &mut held_rects,
+                            nudge_selection: &mut nudge_selection,
+                        },
+                        PointerButtonFlags {
+                            color_alternate,
+                            alt_held,
+                        },
                     );
                     // Press / release can change the cursor-over-rect
                     // state without a subsequent PointerMove (e.g. drag
@@ -1689,18 +1812,24 @@ fn run_daemon() -> Result<()> {
                         });
                         let want = want_system_pointer(
                             cursor_px,
-                            &held_rects,
-                            &guides,
-                            &stuck_measurements,
-                            pending_guide,
-                            dragging_guide,
-                            resizing,
-                            active_handle,
-                            context_menu.is_some(),
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
+                            MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            PointerGate {
+                                pending_guide,
+                                dragging_guide,
+                                resizing,
+                                resize_handle: active_handle,
+                                menu_open: context_menu.is_some(),
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
                         );
                         if want != system_pointer_visible {
                             overlay.set_system_pointer_visible(want);
@@ -1771,18 +1900,22 @@ fn run_daemon() -> Result<()> {
                             active_toast = None;
                             toast_until = None;
                             toggle_measurement(
-                                &mut mode,
-                                &mut overlay,
-                                &platform,
-                                primary.id,
-                                &mut frozen_frame,
-                                &mut capture_worker,
-                                &held_rects,
-                                &guides,
-                                &stuck_measurements,
+                                &mut MeasureSession {
+                                    mode: &mut mode,
+                                    overlay: &mut overlay,
+                                    platform: &platform,
+                                    monitor: primary.id,
+                                    frozen_frame: &mut frozen_frame,
+                                    capture_worker: &mut capture_worker,
+                                    prefs_hotkey: &mut prefs_hotkey,
+                                },
+                                MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
                                 color_alternate,
                                 prefs_hotkey_accel,
-                                &mut prefs_hotkey,
                             );
                         } else {
                             // Local-save path: stay in measure mode so
@@ -1814,25 +1947,33 @@ fn run_daemon() -> Result<()> {
                             // pill still over the rect) before the
                             // toast version lands.
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast: toast_ref,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast_ref,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                             overlay.show();
                         }
@@ -1844,25 +1985,33 @@ fn run_daemon() -> Result<()> {
                         // the next redraw.
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 }
@@ -1960,18 +2109,24 @@ fn run_daemon() -> Result<()> {
                                 });
                                 let want = want_system_pointer(
                                     cursor_px,
-                                    &held_rects,
-                                    &guides,
-                                    &stuck_measurements,
-                                    pending_guide,
-                                    dragging_guide,
-                                    resizing,
-                                    active_handle,
-                                    context_menu.is_some(),
-                                    alt_held,
-                                    stuck_pill_drag_committed,
-                                    primary.bounds.w as i32,
-                                    primary.bounds.h as i32,
+                                    MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    PointerGate {
+                                        pending_guide,
+                                        dragging_guide,
+                                        resizing,
+                                        resize_handle: active_handle,
+                                        menu_open: context_menu.is_some(),
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
                                 );
                                 if want != system_pointer_visible {
                                     overlay.set_system_pointer_visible(want);
@@ -1987,25 +2142,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 px_x,
                                 px_y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                         }
                     }
@@ -2050,25 +2213,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 x,
                                 y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                         }
                     }
@@ -2086,18 +2257,22 @@ fn run_daemon() -> Result<()> {
                         pending_guide = None;
                         pending_guide_shift_acked = false;
                         toggle_measurement(
-                            &mut mode,
-                            &mut overlay,
-                            &platform,
-                            primary.id,
-                            &mut frozen_frame,
-                            &mut capture_worker,
-                            &held_rects,
-                            &guides,
-                            &stuck_measurements,
+                            &mut MeasureSession {
+                                mode: &mut mode,
+                                overlay: &mut overlay,
+                                platform: &platform,
+                                monitor: primary.id,
+                                frozen_frame: &mut frozen_frame,
+                                capture_worker: &mut capture_worker,
+                                prefs_hotkey: &mut prefs_hotkey,
+                            },
+                            MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
                             color_alternate,
                             prefs_hotkey_accel,
-                            &mut prefs_hotkey,
                         );
                     }
                     ensure_prefs_window(&mut prefs_child);
@@ -2116,25 +2291,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.clear_and_exit
@@ -2166,18 +2349,22 @@ fn run_daemon() -> Result<()> {
                     active_toast = None;
                     toast_until = None;
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut capture_worker,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                        },
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
                         color_alternate,
                         prefs_hotkey_accel,
-                        &mut prefs_hotkey,
                     );
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.clear_and_hide
                 {
@@ -2199,18 +2386,22 @@ fn run_daemon() -> Result<()> {
                     active_toast = None;
                     toast_until = None;
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut capture_worker,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                        },
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
                         color_alternate,
                         prefs_hotkey_accel,
-                        &mut prefs_hotkey,
                     );
                 } else if pressed_accel.is_some()
                     && (pressed_accel == shortcut_accels.guide_horizontal
@@ -2239,25 +2430,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.color_toggle {
@@ -2275,25 +2474,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some()
@@ -2337,25 +2544,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.tolerance_up {
@@ -2379,25 +2594,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.tolerance_down
@@ -2422,25 +2645,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some()
@@ -2457,25 +2688,33 @@ fn run_daemon() -> Result<()> {
                                 last_hud_redraw = Instant::now();
                                 let toast = current_toast(&active_toast, toast_until);
                                 refresh_hud(
-                                    &mode,
                                     &mut overlay,
-                                    frozen_frame.as_ref(),
+                                    &HudScene {
+                                        mode: &mode,
+                                        frozen_frame: frozen_frame.as_ref(),
+                                        measurements: MeasurementView {
+                                            held_rects: &held_rects,
+                                            guides: &guides,
+                                            stuck_measurements: &stuck_measurements,
+                                        },
+                                        pending_guide,
+                                        toast,
+                                        tolerance: current_tol_value(tol_level),
+                                        screen: ScreenSize {
+                                            w: primary.bounds.w as i32,
+                                            h: primary.bounds.h as i32,
+                                        },
+                                        flags: HudFlags {
+                                            color_alternate,
+                                            align_mode,
+                                            alt_held,
+                                            stuck_drag_committed: stuck_pill_drag_committed,
+                                        },
+                                        resize_handle: None,
+                                        context_menu: context_menu.as_ref(),
+                                    },
                                     x,
                                     y,
-                                    current_tol_value(tol_level),
-                                    toast,
-                                    &guides,
-                                    pending_guide,
-                                    &stuck_measurements,
-                                    &held_rects,
-                                    color_alternate,
-                                    align_mode,
-                                    alt_held,
-                                    stuck_pill_drag_committed,
-                                    primary.bounds.w as i32,
-                                    primary.bounds.h as i32,
-                                    None,
-                                    context_menu.as_ref(),
                                 );
                             }
                         }
@@ -2489,24 +2728,28 @@ fn run_daemon() -> Result<()> {
                     // spawn as the right-click menu's
                     // "Take Normal Screenshot" row.
                     do_take_normal_screenshot(
-                        &mut mode,
-                        &mut overlay,
-                        &platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut capture_worker,
-                        &mut held_rects,
-                        &mut guides,
-                        &mut stuck_measurements,
-                        &mut nudge_selection,
-                        &mut last_selected_guide,
-                        &mut pending_guide,
-                        &mut pending_guide_shift_acked,
-                        &mut active_toast,
-                        &mut toast_until,
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                        },
+                        &mut SessionContent {
+                            held_rects: &mut held_rects,
+                            guides: &mut guides,
+                            stuck_measurements: &mut stuck_measurements,
+                            nudge_selection: &mut nudge_selection,
+                            last_selected_guide: &mut last_selected_guide,
+                            pending_guide: &mut pending_guide,
+                            pending_guide_shift_acked: &mut pending_guide_shift_acked,
+                            active_toast: &mut active_toast,
+                            toast_until: &mut toast_until,
+                        },
                         color_alternate,
                         prefs_hotkey_accel,
-                        &mut prefs_hotkey,
                     );
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.restore {
                     // Configured restore-session shortcut (default
@@ -2543,25 +2786,33 @@ fn run_daemon() -> Result<()> {
                         last_hud_redraw = Instant::now();
                         let toast = current_toast(&active_toast, toast_until);
                         refresh_hud(
-                            &mode,
                             &mut overlay,
-                            frozen_frame.as_ref(),
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
                             x,
                             y,
-                            current_tol_value(tol_level),
-                            toast,
-                            &guides,
-                            pending_guide,
-                            &stuck_measurements,
-                            &held_rects,
-                            color_alternate,
-                            align_mode,
-                            alt_held,
-                            stuck_pill_drag_committed,
-                            primary.bounds.w as i32,
-                            primary.bounds.h as i32,
-                            None,
-                            context_menu.as_ref(),
                         );
                     }
                 } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.capture {
@@ -2612,25 +2863,33 @@ fn run_daemon() -> Result<()> {
                                 last_hud_redraw = Instant::now();
                                 let toast = current_toast(&active_toast, toast_until);
                                 refresh_hud(
-                                    &mode,
                                     &mut overlay,
-                                    frozen_frame.as_ref(),
+                                    &HudScene {
+                                        mode: &mode,
+                                        frozen_frame: frozen_frame.as_ref(),
+                                        measurements: MeasurementView {
+                                            held_rects: &held_rects,
+                                            guides: &guides,
+                                            stuck_measurements: &stuck_measurements,
+                                        },
+                                        pending_guide,
+                                        toast,
+                                        tolerance: current_tol_value(tol_level),
+                                        screen: ScreenSize {
+                                            w: primary.bounds.w as i32,
+                                            h: primary.bounds.h as i32,
+                                        },
+                                        flags: HudFlags {
+                                            color_alternate,
+                                            align_mode,
+                                            alt_held,
+                                            stuck_drag_committed: stuck_pill_drag_committed,
+                                        },
+                                        resize_handle: None,
+                                        context_menu: context_menu.as_ref(),
+                                    },
                                     x,
                                     y,
-                                    current_tol_value(tol_level),
-                                    toast,
-                                    &guides,
-                                    pending_guide,
-                                    &stuck_measurements,
-                                    &held_rects,
-                                    color_alternate,
-                                    align_mode,
-                                    alt_held,
-                                    stuck_pill_drag_committed,
-                                    primary.bounds.w as i32,
-                                    primary.bounds.h as i32,
-                                    None,
-                                    context_menu.as_ref(),
                                 );
                             }
                         }
@@ -2685,25 +2944,33 @@ fn run_daemon() -> Result<()> {
                                     last_hud_redraw = Instant::now();
                                     let toast = current_toast(&active_toast, toast_until);
                                     refresh_hud(
-                                        &mode,
                                         &mut overlay,
-                                        frozen_frame.as_ref(),
+                                        &HudScene {
+                                            mode: &mode,
+                                            frozen_frame: frozen_frame.as_ref(),
+                                            measurements: MeasurementView {
+                                                held_rects: &held_rects,
+                                                guides: &guides,
+                                                stuck_measurements: &stuck_measurements,
+                                            },
+                                            pending_guide,
+                                            toast,
+                                            tolerance: current_tol_value(tol_level),
+                                            screen: ScreenSize {
+                                                w: primary.bounds.w as i32,
+                                                h: primary.bounds.h as i32,
+                                            },
+                                            flags: HudFlags {
+                                                color_alternate,
+                                                align_mode,
+                                                alt_held,
+                                                stuck_drag_committed: stuck_pill_drag_committed,
+                                            },
+                                            resize_handle: None,
+                                            context_menu: context_menu.as_ref(),
+                                        },
                                         px_x,
                                         px_y,
-                                        current_tol_value(tol_level),
-                                        toast,
-                                        &guides,
-                                        pending_guide,
-                                        &stuck_measurements,
-                                        &held_rects,
-                                        color_alternate,
-                                        align_mode,
-                                        alt_held,
-                                        stuck_pill_drag_committed,
-                                        primary.bounds.w as i32,
-                                        primary.bounds.h as i32,
-                                        None,
-                                        context_menu.as_ref(),
                                     );
                                 }
                                 // Spawn (or restart) the repeat timer
@@ -2767,28 +3034,36 @@ fn run_daemon() -> Result<()> {
                         });
                     }
                     apply_nudge_step(
-                        dir,
-                        idx,
-                        shift_held,
-                        alt_held,
-                        align_mode,
-                        color_alternate,
-                        last_pointer_xy,
+                        NudgeStep {
+                            dir,
+                            idx,
+                            shift_held,
+                        },
                         &mut held_rects,
-                        &mode,
                         &mut overlay,
-                        frozen_frame.as_ref(),
-                        current_tol_value(tol_level),
-                        &active_toast,
-                        toast_until,
-                        &guides,
-                        pending_guide,
-                        stuck_pill_drag_committed,
-                        &stuck_measurements,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
-                        context_menu.as_ref(),
                         &mut last_hud_redraw,
+                        &NudgeRenderCtx {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                            pending_guide,
+                            last_pointer_xy,
+                            active_toast: &active_toast,
+                            toast_until,
+                            tolerance: current_tol_value(tol_level),
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
+                            context_menu: context_menu.as_ref(),
+                        },
                     );
                     // Start (or restart) the auto-repeat timer for
                     // this direction. Bumping the generation
@@ -2828,18 +3103,22 @@ fn run_daemon() -> Result<()> {
             MainEvent::Platform(other) => log::debug!("platform event: {other:?}"),
             MainEvent::Ipc(IpcCmd::Toggle) => {
                 toggle_measurement(
-                    &mut mode,
-                    &mut overlay,
-                    &platform,
-                    primary.id,
-                    &mut frozen_frame,
-                    &mut capture_worker,
-                    &held_rects,
-                    &guides,
-                    &stuck_measurements,
+                    &mut MeasureSession {
+                        mode: &mut mode,
+                        overlay: &mut overlay,
+                        platform: &platform,
+                        monitor: primary.id,
+                        frozen_frame: &mut frozen_frame,
+                        capture_worker: &mut capture_worker,
+                        prefs_hotkey: &mut prefs_hotkey,
+                    },
+                    MeasurementView {
+                        held_rects: &held_rects,
+                        guides: &guides,
+                        stuck_measurements: &stuck_measurements,
+                    },
                     color_alternate,
                     prefs_hotkey_accel,
-                    &mut prefs_hotkey,
                 );
             }
             MainEvent::Ipc(IpcCmd::Quit) => {
@@ -2981,25 +3260,33 @@ fn run_daemon() -> Result<()> {
                                 last_hud_redraw = Instant::now();
                                 let toast = current_toast(&active_toast, toast_until);
                                 refresh_hud(
-                                    &mode,
                                     &mut overlay,
-                                    frozen_frame.as_ref(),
+                                    &HudScene {
+                                        mode: &mode,
+                                        frozen_frame: frozen_frame.as_ref(),
+                                        measurements: MeasurementView {
+                                            held_rects: &held_rects,
+                                            guides: &guides,
+                                            stuck_measurements: &stuck_measurements,
+                                        },
+                                        pending_guide,
+                                        toast,
+                                        tolerance: current_tol_value(tol_level),
+                                        screen: ScreenSize {
+                                            w: primary.bounds.w as i32,
+                                            h: primary.bounds.h as i32,
+                                        },
+                                        flags: HudFlags {
+                                            color_alternate,
+                                            align_mode,
+                                            alt_held,
+                                            stuck_drag_committed: stuck_pill_drag_committed,
+                                        },
+                                        resize_handle: None,
+                                        context_menu: context_menu.as_ref(),
+                                    },
                                     x,
                                     y,
-                                    current_tol_value(tol_level),
-                                    toast,
-                                    &guides,
-                                    pending_guide,
-                                    &stuck_measurements,
-                                    &held_rects,
-                                    color_alternate,
-                                    align_mode,
-                                    alt_held,
-                                    stuck_pill_drag_committed,
-                                    primary.bounds.w as i32,
-                                    primary.bounds.h as i32,
-                                    None,
-                                    context_menu.as_ref(),
                                 );
                             }
                         }
@@ -3025,41 +3312,53 @@ fn run_daemon() -> Result<()> {
                 toast_until = None;
                 if exit_measurement {
                     toggle_measurement(
-                        &mut mode,
-                        &mut overlay,
-                        &platform,
-                        primary.id,
-                        &mut frozen_frame,
-                        &mut capture_worker,
-                        &held_rects,
-                        &guides,
-                        &stuck_measurements,
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                        },
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
                         color_alternate,
                         prefs_hotkey_accel,
-                        &mut prefs_hotkey,
                     );
                 } else if let Some((x, y)) = last_pointer_xy {
                     last_hud_redraw = Instant::now();
                     refresh_hud(
-                        &mode,
                         &mut overlay,
-                        frozen_frame.as_ref(),
+                        &HudScene {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            measurements: MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            pending_guide,
+                            toast: None,
+                            tolerance: current_tol_value(tol_level),
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: stuck_pill_drag_committed,
+                            },
+                            resize_handle: None,
+                            context_menu: context_menu.as_ref(),
+                        },
                         x,
                         y,
-                        current_tol_value(tol_level),
-                        None,
-                        &guides,
-                        pending_guide,
-                        &stuck_measurements,
-                        &held_rects,
-                        color_alternate,
-                        align_mode,
-                        alt_held,
-                        stuck_pill_drag_committed,
-                        primary.bounds.w as i32,
-                        primary.bounds.h as i32,
-                        None,
-                        context_menu.as_ref(),
                     );
                 }
             }
@@ -3083,25 +3382,33 @@ fn run_daemon() -> Result<()> {
                             last_hud_redraw = Instant::now();
                             let toast = current_toast(&active_toast, toast_until);
                             refresh_hud(
-                                &mode,
                                 &mut overlay,
-                                frozen_frame.as_ref(),
+                                &HudScene {
+                                    mode: &mode,
+                                    frozen_frame: frozen_frame.as_ref(),
+                                    measurements: MeasurementView {
+                                        held_rects: &held_rects,
+                                        guides: &guides,
+                                        stuck_measurements: &stuck_measurements,
+                                    },
+                                    pending_guide,
+                                    toast,
+                                    tolerance: current_tol_value(tol_level),
+                                    screen: ScreenSize {
+                                        w: primary.bounds.w as i32,
+                                        h: primary.bounds.h as i32,
+                                    },
+                                    flags: HudFlags {
+                                        color_alternate,
+                                        align_mode,
+                                        alt_held,
+                                        stuck_drag_committed: stuck_pill_drag_committed,
+                                    },
+                                    resize_handle: None,
+                                    context_menu: context_menu.as_ref(),
+                                },
                                 px_x,
                                 px_y,
-                                current_tol_value(tol_level),
-                                toast,
-                                &guides,
-                                pending_guide,
-                                &stuck_measurements,
-                                &held_rects,
-                                color_alternate,
-                                align_mode,
-                                alt_held,
-                                stuck_pill_drag_committed,
-                                primary.bounds.w as i32,
-                                primary.bounds.h as i32,
-                                None,
-                                context_menu.as_ref(),
                             );
                         }
                     }
@@ -3113,28 +3420,36 @@ fn run_daemon() -> Result<()> {
                     continue;
                 }
                 apply_nudge_step(
-                    dir,
-                    sel.rect_idx,
-                    shift_held,
-                    alt_held,
-                    align_mode,
-                    color_alternate,
-                    last_pointer_xy,
+                    NudgeStep {
+                        dir,
+                        idx: sel.rect_idx,
+                        shift_held,
+                    },
                     &mut held_rects,
-                    &mode,
                     &mut overlay,
-                    frozen_frame.as_ref(),
-                    current_tol_value(tol_level),
-                    &active_toast,
-                    toast_until,
-                    &guides,
-                    pending_guide,
-                    stuck_pill_drag_committed,
-                    &stuck_measurements,
-                    primary.bounds.w as i32,
-                    primary.bounds.h as i32,
-                    context_menu.as_ref(),
                     &mut last_hud_redraw,
+                    &NudgeRenderCtx {
+                        mode: &mode,
+                        frozen_frame: frozen_frame.as_ref(),
+                        guides: &guides,
+                        stuck_measurements: &stuck_measurements,
+                        pending_guide,
+                        last_pointer_xy,
+                        active_toast: &active_toast,
+                        toast_until,
+                        tolerance: current_tol_value(tol_level),
+                        screen: ScreenSize {
+                            w: primary.bounds.w as i32,
+                            h: primary.bounds.h as i32,
+                        },
+                        flags: HudFlags {
+                            color_alternate,
+                            align_mode,
+                            alt_held,
+                            stuck_drag_committed: stuck_pill_drag_committed,
+                        },
+                        context_menu: context_menu.as_ref(),
+                    },
                 );
             }
         }
@@ -4254,35 +4569,168 @@ fn apply_guide_nudge(guides: &mut [Guide], idx: usize, dir: NudgeDir, step: i32)
     }
 }
 
+/// Primary monitor pixel dimensions, passed as one value instead of a
+/// loose `(screen_w, screen_h)` pair.
+#[derive(Debug, Clone, Copy)]
+struct ScreenSize {
+    w: i32,
+    h: i32,
+}
+
+/// Read-only borrow of the three persisted measurement collections —
+/// held rects, guides, and stuck measurements. Used by the HUD render
+/// and pointer hit-test paths that only need to look at this state.
+#[derive(Clone, Copy)]
+struct MeasurementView<'a> {
+    held_rects: &'a [HeldRect],
+    guides: &'a [Guide],
+    stuck_measurements: &'a [StuckMeasurement],
+}
+
+/// Small interaction-state flags that toggle HUD appearance without
+/// changing the underlying measurement geometry.
+#[derive(Debug, Clone, Copy)]
+struct HudFlags {
+    color_alternate: bool,
+    align_mode: bool,
+    alt_held: bool,
+    stuck_drag_committed: bool,
+}
+
+/// Everything (besides the overlay handle and the live cursor `x`/`y`)
+/// that `refresh_hud` reads to build a HUD: the current mode, the
+/// frozen capture, the persisted measurements, and the assorted
+/// interaction flags.
+#[derive(Clone, Copy)]
+struct HudScene<'a> {
+    mode: &'a InteractionMode,
+    frozen_frame: Option<&'a NativeFrame>,
+    measurements: MeasurementView<'a>,
+    pending_guide: Option<GuideAxis>,
+    toast: Option<&'a HudToast>,
+    tolerance: u32,
+    screen: ScreenSize,
+    flags: HudFlags,
+    resize_handle: Option<ResizeHandle>,
+    context_menu: Option<&'a ContextMenuState>,
+}
+
+/// Mutable overlay + capture session state shared by the measure-mode
+/// toggle and the external-screenshot path: the interaction mode, the
+/// overlay handle, the capture backend, and the optionally-claimed
+/// preferences hotkey.
+struct MeasureSession<'a> {
+    mode: &'a mut InteractionMode,
+    overlay: &'a mut vernier_platform::OverlayHandle,
+    platform: &'a Arc<dyn Platform>,
+    monitor: MonitorId,
+    frozen_frame: &'a mut Option<NativeFrame>,
+    capture_worker: &'a mut Option<CaptureWorker>,
+    prefs_hotkey: &'a mut Option<HotkeyId>,
+}
+
+/// Mutable persisted + transient session content cleared by the
+/// external-screenshot path: the three measurement collections plus
+/// the in-flight selection / pending-guide / toast bookkeeping.
+struct SessionContent<'a> {
+    held_rects: &'a mut Vec<HeldRect>,
+    guides: &'a mut Vec<Guide>,
+    stuck_measurements: &'a mut Vec<StuckMeasurement>,
+    nudge_selection: &'a mut Option<NudgeSelection>,
+    last_selected_guide: &'a mut Option<usize>,
+    pending_guide: &'a mut Option<GuideAxis>,
+    pending_guide_shift_acked: &'a mut bool,
+    active_toast: &'a mut Option<HudToast>,
+    toast_until: &'a mut Option<Instant>,
+}
+
+/// The drag / resize / menu gating state that decides whether the
+/// system theme pointer should be shown over the overlay.
+#[derive(Debug, Clone, Copy)]
+struct PointerGate {
+    pending_guide: Option<GuideAxis>,
+    dragging_guide: Option<usize>,
+    resizing: Option<ResizeOp>,
+    resize_handle: Option<ResizeHandle>,
+    menu_open: bool,
+    alt_held: bool,
+    stuck_drag_committed: bool,
+}
+
+/// Identifies one nudge increment: which direction, which held rect,
+/// and whether Shift's 10 px multiplier is active.
+#[derive(Debug, Clone, Copy)]
+struct NudgeStep {
+    dir: NudgeDir,
+    idx: usize,
+    shift_held: bool,
+}
+
+/// Read-only HUD render inputs for `apply_nudge_step`. Mirrors the
+/// data in `HudScene` but without `held_rects` (the nudge mutates
+/// that collection, so it is passed separately and re-borrowed once
+/// the move is applied) and adds the live-cursor / toast bookkeeping
+/// the nudge path needs to rebuild the scene.
+struct NudgeRenderCtx<'a> {
+    mode: &'a InteractionMode,
+    frozen_frame: Option<&'a NativeFrame>,
+    guides: &'a [Guide],
+    stuck_measurements: &'a [StuckMeasurement],
+    pending_guide: Option<GuideAxis>,
+    last_pointer_xy: Option<(f64, f64)>,
+    active_toast: &'a Option<HudToast>,
+    toast_until: Option<Instant>,
+    tolerance: u32,
+    screen: ScreenSize,
+    flags: HudFlags,
+    context_menu: Option<&'a ContextMenuState>,
+}
+
+/// The frozen capture plus the edge-detection tolerance — the two
+/// inputs the pointer-button path needs to run edge detection and
+/// snap-shrink against the captured frame.
+#[derive(Clone, Copy)]
+struct CaptureFrame<'a> {
+    frozen_frame: Option<&'a NativeFrame>,
+    tolerance: u32,
+}
+
+/// Mutable borrow of the persisted measurement collections plus the
+/// sticky nudge selection — the state `handle_pointer_button` edits
+/// in place (pushing/removing held rects, clearing the selection).
+/// The mutable counterpart of the read-only [`MeasurementView`].
+struct MeasurementEdit<'a> {
+    guides: &'a mut [Guide],
+    stuck_measurements: &'a mut [StuckMeasurement],
+    held_rects: &'a mut Vec<HeldRect>,
+    nudge_selection: &'a mut Option<NudgeSelection>,
+}
+
+/// Small appearance flags read by the pointer-button path: the
+/// alternate color scheme and whether Alt is held (Alt disables guide
+/// snapping).
+#[derive(Debug, Clone, Copy)]
+struct PointerButtonFlags {
+    color_alternate: bool,
+    alt_held: bool,
+}
+
 /// One nudge increment: shift the held rect at `idx` 1 px in the
 /// given direction (10 px when Shift is held) and repaint the HUD.
 /// Used both for the initial press and for the follow-up
 /// `NudgeTick` events the repeat timer sends.
-#[allow(clippy::too_many_arguments)]
 fn apply_nudge_step(
-    dir: NudgeDir,
-    idx: usize,
-    shift_held: bool,
-    alt_held: bool,
-    align_mode: bool,
-    color_alternate: bool,
-    last_pointer_xy: Option<(f64, f64)>,
+    nudge: NudgeStep,
     held_rects: &mut [HeldRect],
-    mode: &InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
-    frozen_frame: Option<&NativeFrame>,
-    tol_value: u32,
-    active_toast: &Option<HudToast>,
-    toast_until: Option<Instant>,
-    guides: &[Guide],
-    pending_guide: Option<GuideAxis>,
-    stuck_pill_drag_committed: bool,
-    stuck_measurements: &[StuckMeasurement],
-    screen_w: i32,
-    screen_h: i32,
-    context_menu: Option<&ContextMenuState>,
     last_hud_redraw: &mut Instant,
+    ctx: &NudgeRenderCtx,
 ) {
+    let NudgeStep {
+        dir,
+        idx,
+        shift_held,
+    } = nudge;
     if idx >= held_rects.len() {
         return;
     }
@@ -4307,30 +4755,26 @@ fn apply_nudge_step(
     if last_hud_redraw.elapsed() < HUD_REDRAW_INTERVAL {
         return;
     }
-    if let Some((x, y)) = last_pointer_xy {
+    if let Some((x, y)) = ctx.last_pointer_xy {
         *last_hud_redraw = Instant::now();
-        let toast = current_toast(active_toast, toast_until);
-        refresh_hud(
-            mode,
-            overlay,
-            frozen_frame,
-            x,
-            y,
-            tol_value,
+        let toast = current_toast(ctx.active_toast, ctx.toast_until);
+        let scene = HudScene {
+            mode: ctx.mode,
+            frozen_frame: ctx.frozen_frame,
+            measurements: MeasurementView {
+                held_rects,
+                guides: ctx.guides,
+                stuck_measurements: ctx.stuck_measurements,
+            },
+            pending_guide: ctx.pending_guide,
             toast,
-            guides,
-            pending_guide,
-            stuck_measurements,
-            held_rects,
-            color_alternate,
-            align_mode,
-            alt_held,
-            stuck_pill_drag_committed,
-            screen_w,
-            screen_h,
-            None,
-            context_menu,
-        );
+            tolerance: ctx.tolerance,
+            screen: ctx.screen,
+            flags: ctx.flags,
+            resize_handle: None,
+            context_menu: ctx.context_menu,
+        };
+        refresh_hud(overlay, &scene, x, y);
     }
 }
 
@@ -5226,57 +5670,42 @@ fn finish_held_screenshot(
 /// `external_screenshot_command` detached on a 250ms timer (so the
 /// overlay-hide commit lands first) and a watchdog that SIGKILLs
 /// `hyprpicker` once `slurp` closes.
-#[allow(clippy::too_many_arguments)]
 fn do_take_normal_screenshot(
-    mode: &mut InteractionMode,
-    overlay: &mut vernier_platform::OverlayHandle,
-    platform: &Arc<dyn Platform>,
-    monitor: MonitorId,
-    frozen_frame: &mut Option<NativeFrame>,
-    capture_worker: &mut Option<CaptureWorker>,
-    held_rects: &mut Vec<HeldRect>,
-    guides: &mut Vec<Guide>,
-    stuck_measurements: &mut Vec<StuckMeasurement>,
-    nudge_selection: &mut Option<NudgeSelection>,
-    last_selected_guide: &mut Option<usize>,
-    pending_guide: &mut Option<GuideAxis>,
-    pending_guide_shift_acked: &mut bool,
-    active_toast: &mut Option<HudToast>,
-    toast_until: &mut Option<Instant>,
+    session: &mut MeasureSession,
+    content: &mut SessionContent,
     color_alternate: bool,
-    prefs_hotkey_accel: Option<Accelerator>,
-    prefs_hotkey: &mut Option<HotkeyId>,
+    prefs_accel: Option<Accelerator>,
 ) {
     let cmd = current_settings()
         .screenshots
         .external_screenshot_command
         .clone();
     log::info!("external screenshot: running clear-and-hide, then spawning {cmd:?}");
-    if let Err(e) = save_session(held_rects, guides, stuck_measurements) {
+    if let Err(e) = save_session(
+        content.held_rects,
+        content.guides,
+        content.stuck_measurements,
+    ) {
         log::warn!("save session: {e:#}");
     }
-    held_rects.clear();
-    *nudge_selection = None;
-    *last_selected_guide = None;
-    guides.clear();
-    stuck_measurements.clear();
-    *pending_guide = None;
-    *pending_guide_shift_acked = false;
-    *active_toast = None;
-    *toast_until = None;
+    content.held_rects.clear();
+    *content.nudge_selection = None;
+    *content.last_selected_guide = None;
+    content.guides.clear();
+    content.stuck_measurements.clear();
+    *content.pending_guide = None;
+    *content.pending_guide_shift_acked = false;
+    *content.active_toast = None;
+    *content.toast_until = None;
     toggle_measurement(
-        mode,
-        overlay,
-        platform,
-        monitor,
-        frozen_frame,
-        capture_worker,
-        held_rects,
-        guides,
-        stuck_measurements,
+        session,
+        MeasurementView {
+            held_rects: content.held_rects,
+            guides: content.guides,
+            stuck_measurements: content.stuck_measurements,
+        },
         color_alternate,
-        prefs_hotkey_accel,
-        prefs_hotkey,
+        prefs_accel,
     );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let _ = std::process::Command::new("setsid")
@@ -5360,21 +5789,24 @@ fn omarchy_font_present() -> bool {
         .unwrap_or(false)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn toggle_measurement(
-    mode: &mut InteractionMode,
-    overlay: &mut vernier_platform::OverlayHandle,
-    platform: &Arc<dyn Platform>,
-    monitor: MonitorId,
-    frozen_frame: &mut Option<NativeFrame>,
-    capture_worker: &mut Option<CaptureWorker>,
-    held_rects: &[HeldRect],
-    guides: &[Guide],
-    stuck_measurements: &[StuckMeasurement],
+    session: &mut MeasureSession,
+    content: MeasurementView,
     color_alternate: bool,
     prefs_accel: Option<Accelerator>,
-    prefs_hotkey: &mut Option<HotkeyId>,
 ) {
+    let monitor = session.monitor;
+    let platform = session.platform;
+    let mode = &mut *session.mode;
+    let overlay = &mut *session.overlay;
+    let frozen_frame = &mut *session.frozen_frame;
+    let capture_worker = &mut *session.capture_worker;
+    let prefs_hotkey = &mut *session.prefs_hotkey;
+    let MeasurementView {
+        held_rects,
+        guides,
+        stuck_measurements,
+    } = content;
     let fg = hud_foreground(color_alternate);
     if matches!(mode, InteractionMode::Idle) {
         // Going ON — recapture the screen for edge detection, restore
@@ -5527,28 +5959,33 @@ fn update_cursor_in_mode(mode: &mut InteractionMode, cursor_px: Px) {
 /// In Hover mode this also runs live edge detection at the cursor
 /// pixel, producing the four cardinal snap candidates that drive the
 /// extending HUD lines.
-#[allow(clippy::too_many_arguments)]
-fn refresh_hud(
-    mode: &InteractionMode,
-    overlay: &mut vernier_platform::OverlayHandle,
-    frozen_frame: Option<&NativeFrame>,
-    x: f64,
-    y: f64,
-    tolerance: u32,
-    toast: Option<&HudToast>,
-    guides: &[Guide],
-    pending_guide: Option<GuideAxis>,
-    stuck_measurements: &[StuckMeasurement],
-    held_rects: &[HeldRect],
-    color_alternate: bool,
-    align_mode: bool,
-    alt_held: bool,
-    stuck_drag_committed: bool,
-    screen_w: i32,
-    screen_h: i32,
-    resize_handle: Option<ResizeHandle>,
-    context_menu: Option<&ContextMenuState>,
-) {
+fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, x: f64, y: f64) {
+    let HudScene {
+        mode,
+        frozen_frame,
+        measurements:
+            MeasurementView {
+                held_rects,
+                guides,
+                stuck_measurements,
+            },
+        pending_guide,
+        toast,
+        tolerance,
+        screen: ScreenSize {
+            w: screen_w,
+            h: screen_h,
+        },
+        flags:
+            HudFlags {
+                color_alternate,
+                align_mode,
+                alt_held,
+                stuck_drag_committed,
+            },
+        resize_handle,
+        context_menu,
+    } = *scene;
     let fg = hud_foreground(color_alternate);
 
     // While the context menu is open, freeze the live measurement at
@@ -6344,7 +6781,7 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// overlay — i.e. the user is hovering a clickable element (X badge,
 /// pill, rect interior) and we're NOT in a state that demands a
 /// custom cursor (guide line drag, rect resize, guide placement).
-#[allow(clippy::too_many_arguments)]
+///
 /// Whether the compositor should draw its theme pointer over the
 /// overlay. Returns `true` when the cursor sits on an interactive
 /// affordance (held rect, guide badge, stuck pill, menu) and `false`
@@ -6354,19 +6791,28 @@ fn handle_to_cursor_kind(handle: ResizeHandle) -> CursorKind {
 /// Vernier's own crosshair).
 fn want_system_pointer(
     cursor_px: Px,
-    held_rects: &[HeldRect],
-    guides: &[Guide],
-    stuck_measurements: &[StuckMeasurement],
-    pending_guide: Option<GuideAxis>,
-    dragging_guide: Option<usize>,
-    resizing: Option<ResizeOp>,
-    resize_handle: Option<ResizeHandle>,
-    menu_open: bool,
-    alt_held: bool,
-    stuck_drag_committed: bool,
-    screen_w: i32,
-    screen_h: i32,
+    measurements: MeasurementView,
+    screen: ScreenSize,
+    gate: PointerGate,
 ) -> bool {
+    let MeasurementView {
+        held_rects,
+        guides,
+        stuck_measurements,
+    } = measurements;
+    let ScreenSize {
+        w: screen_w,
+        h: screen_h,
+    } = screen;
+    let PointerGate {
+        pending_guide,
+        dragging_guide,
+        resizing,
+        resize_handle,
+        menu_open,
+        alt_held,
+        stuck_drag_committed,
+    } = gate;
     // Holding ALT hides everything cursor-related so the user can
     // read the pixels under their cursor. The menu still gets the
     // pointer (the row hover otherwise becomes invisible).
@@ -6553,25 +6999,33 @@ fn convert_edges_to_surface(edges: &EdgeQuad, scale_x: f64, scale_y: f64) -> [Op
     out
 }
 
-// held_rects is kept as &mut Vec because the function calls .push()/
-// .remove() on it (creating new held rects, removing on close). The
-// other two collections are mutated in place only, so they take slices.
-#[allow(clippy::ptr_arg, clippy::too_many_arguments)]
+// content.held_rects is kept as &mut Vec because the function calls
+// .push()/.remove() on it (creating new held rects, removing on
+// close). The other two collections are mutated in place only, so
+// they take slices.
+#[allow(clippy::ptr_arg)]
 fn handle_pointer_button(
     mode: &mut InteractionMode,
     overlay: &mut vernier_platform::OverlayHandle,
     pressed: bool,
-    x: f64,
-    y: f64,
-    frozen_frame: Option<&vernier_platform::NativeFrame>,
-    tolerance: u32,
-    guides: &mut [Guide],
-    stuck_measurements: &mut [StuckMeasurement],
-    held_rects: &mut Vec<HeldRect>,
-    nudge_selection: &mut Option<NudgeSelection>,
-    color_alternate: bool,
-    alt_held: bool,
+    cursor: (f64, f64),
+    frame: CaptureFrame,
+    content: &mut MeasurementEdit,
+    flags: PointerButtonFlags,
 ) -> ButtonOutcome {
+    let (x, y) = cursor;
+    let CaptureFrame {
+        frozen_frame,
+        tolerance,
+    } = frame;
+    let guides: &mut [Guide] = &mut *content.guides;
+    let stuck_measurements: &mut [StuckMeasurement] = &mut *content.stuck_measurements;
+    let held_rects: &mut Vec<HeldRect> = &mut *content.held_rects;
+    let nudge_selection: &mut Option<NudgeSelection> = &mut *content.nudge_selection;
+    let PointerButtonFlags {
+        color_alternate,
+        alt_held,
+    } = flags;
     let fg = hud_foreground(color_alternate);
     let cursor_px = Px::new(x as i32, y as i32);
     if pressed {
@@ -6822,8 +7276,15 @@ fn snap_shrink_resize(
         Left => (fx1 + pad_x, mid_fy),
         Right => (fx0 - pad_x, mid_fy),
     };
-    let (sx0, sy0, sx1, sy1) =
-        shrink_to_content_with_bg(&view, fx0, fy0, fx1, fy1, bg_x, bg_y, Tolerance(tolerance));
+    let (sx0, sy0, sx1, sy1) = shrink_to_content_with_bg(
+        &view,
+        fx0,
+        fy0,
+        fx1,
+        fy1,
+        Px::new(bg_x, bg_y),
+        Tolerance(tolerance),
+    );
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
     let snapped_lo_x = match handle {
