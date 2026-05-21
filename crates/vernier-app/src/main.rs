@@ -31,6 +31,15 @@ use capture_worker::CaptureWorker;
 // held an arrow key long enough for nudge auto-repeat to accumulate.
 const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
+// How long the `R` refresh-capture blinks the overlay transparent
+// before recapturing. On Wayland the overlay is part of the
+// compositor's screencast, so it has to be off-screen long enough for
+// one clean compositor frame to land — otherwise the recapture
+// photographs our own frozen frame. A fixed settle is fine for a
+// shutter-style action; covers commit + recomposite + screencast
+// delivery with margin.
+const FREEZE_RECAPTURE_SETTLE: Duration = Duration::from_millis(120);
+
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
 struct Cli {
@@ -2678,12 +2687,42 @@ fn run_daemon() -> Result<()> {
                     && pressed_accel == shortcut_accels.refresh_capture
                 {
                     // Configured refresh-capture shortcut (default
-                    // `R`) — recapture the screen so subsequent
-                    // edge detection sees the current content.
+                    // `R`) — recapture the screen so edge detection
+                    // and the freeze-screen visual both see current
+                    // content.
+                    //
+                    // On Wayland the overlay is part of the
+                    // compositor's screencast, so capturing with it up
+                    // would photograph our own frozen frame + HUD.
+                    // Blink it transparent, let one clean compositor
+                    // frame land, then capture. macOS captures below
+                    // the overlay window and skips the blink.
+                    #[cfg(target_os = "macos")]
+                    let blink = false;
+                    #[cfg(not(target_os = "macos"))]
+                    let blink = effective_freeze_screen();
+                    let was_visible = overlay.is_visible();
+                    if blink {
+                        overlay.hide();
+                        std::thread::sleep(FREEZE_RECAPTURE_SETTLE);
+                    }
                     match platform.capture_screen_native(primary.id) {
                         Ok(f) => {
                             log::info!("frame refreshed");
                             frozen_frame = Some(f);
+                            // Refresh the freeze-screen visual from
+                            // the same clean (post-blink) capture.
+                            if effective_freeze_screen() {
+                                if let Ok(packed) = platform.capture_screen(primary.id) {
+                                    overlay.set_background_frame(Some(packed));
+                                }
+                            }
+                            // Re-show after the new background is
+                            // queued, so the overlay never flashes the
+                            // stale freeze frame.
+                            if blink && was_visible {
+                                overlay.show();
+                            }
                             if let Some((x, y)) = last_pointer_xy {
                                 last_hud_redraw = Instant::now();
                                 let toast = current_toast(&active_toast, toast_until);
@@ -2718,7 +2757,15 @@ fn run_daemon() -> Result<()> {
                                 );
                             }
                         }
-                        Err(e) => log::warn!("refresh capture failed: {e}"),
+                        Err(e) => {
+                            // Capture failed — keep the old freeze
+                            // frame, but still re-show the overlay so
+                            // the blink doesn't leave it hidden.
+                            if blink && was_visible {
+                                overlay.show();
+                            }
+                            log::warn!("refresh capture failed: {e}");
+                        }
                     }
                 } else if pressed_accel.is_some()
                     && pressed_accel == shortcut_accels.take_normal_screenshot
