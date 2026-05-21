@@ -325,6 +325,12 @@ enum Cmd {
     // other `Cmd` variant sitting in the calloop channel. `Option<Box>`
     // keeps the `None` case a null pointer with no allocation.
     OverlaySetHud(OverlayKey, Option<Box<Hud>>),
+    /// Paint a captured frame as the overlay's opaque background —
+    /// measure mode's freeze-screen visual. `None` clears it. Boxed
+    /// for the same reason as `OverlaySetHud`: a `Frame` holds a full
+    /// screen of pixels (tens of MB), so inlining it would bloat every
+    /// variant sitting in the channel.
+    OverlaySetBackgroundFrame(OverlayKey, Option<Box<Frame>>),
     OverlayDestroy(OverlayKey),
     /// Toggle the system pointer cursor on top of the overlay. When
     /// hidden the surface keeps the empty system cursor (we draw our
@@ -389,6 +395,12 @@ impl OverlayOps for WaylandOverlay {
         let _ = self
             .cmd_tx
             .send(Cmd::OverlaySetHud(self.key, hud.map(Box::new)));
+    }
+    fn set_background_frame(&mut self, frame: Option<Frame>) {
+        let _ = self.cmd_tx.send(Cmd::OverlaySetBackgroundFrame(
+            self.key,
+            frame.map(Box::new),
+        ));
     }
     fn set_system_pointer_visible(&mut self, visible: bool) {
         let kind = if visible {
@@ -497,6 +509,11 @@ struct OverlayInst {
     input_capturing: bool,
     /// Optional HUD to draw on top of the background tint.
     hud: Option<Hud>,
+    /// Captured frame painted as an opaque base layer beneath the HUD
+    /// — measure mode's freeze-screen visual. `None` ⇒ transparent, so
+    /// live content shows through (the pre-existing behavior). Baked
+    /// into `combined_bg_static_pixmap` when the cache is rebuilt.
+    background_frame: Option<Frame>,
     /// True after we've requested a `wl_surface.frame()` callback and
     /// committed; cleared when the compositor signals `Done`. While
     /// set, additional `draw_overlay` calls flip `redraw_pending`
@@ -670,6 +687,18 @@ impl WaylandState {
                     }
                 }
             }
+            Cmd::OverlaySetBackgroundFrame(key, frame) => {
+                if let Some(inst) = self.overlays.get_mut(&key) {
+                    inst.background_frame = frame.map(|f| *f);
+                    // The frozen frame is baked into the cached
+                    // bg+static pixmap; force a rebuild next draw.
+                    inst.combined_cache_key = None;
+                    let visible = inst.visible_intent;
+                    if visible {
+                        self.draw_overlay(key);
+                    }
+                }
+            }
             Cmd::OverlayDestroy(key) => {
                 if let Some(inst) = self.overlays.remove(&key) {
                     let _ = self
@@ -793,6 +822,7 @@ impl WaylandState {
                 visible_atomic: visible_atomic.clone(),
                 input_capturing: false,
                 hud: None,
+                background_frame: None,
                 frame_pending: false,
                 redraw_pending: false,
                 combined_bg_static_pixmap: Vec::new(),
@@ -967,12 +997,35 @@ impl WaylandState {
             // tweaks, freeze toggle. The hot path (cursor moves)
             // hits the cache and skips this entire block.
             if Some(new_key) != inst.combined_cache_key {
-                let bg = rgba8888_premul(hud.background);
-                if bg == [0, 0, 0, 0] {
-                    inst.combined_bg_static_pixmap.fill(0);
-                } else {
-                    for chunk in inst.combined_bg_static_pixmap.chunks_exact_mut(4) {
-                        chunk.copy_from_slice(&bg);
+                // Base layer: the frozen-screen frame if measure mode
+                // set one (and it matches our buffer dims), otherwise
+                // the flat HUD background tint (pre-existing behavior).
+                let painted_freeze_frame = match inst.background_frame.as_ref() {
+                    Some(f) if f.pixels.len() == inst.combined_bg_static_pixmap.len() => {
+                        blit_frame_as_opaque_base(&mut inst.combined_bg_static_pixmap, f);
+                        true
+                    }
+                    Some(f) => {
+                        log::warn!(
+                            "freeze background {}×{} doesn't match overlay buffer \
+                             {}×{} — painting tint instead",
+                            f.width,
+                            f.height,
+                            buf_w,
+                            buf_h,
+                        );
+                        false
+                    }
+                    None => false,
+                };
+                if !painted_freeze_frame {
+                    let bg = rgba8888_premul(hud.background);
+                    if bg == [0, 0, 0, 0] {
+                        inst.combined_bg_static_pixmap.fill(0);
+                    } else {
+                        for chunk in inst.combined_bg_static_pixmap.chunks_exact_mut(4) {
+                            chunk.copy_from_slice(&bg);
+                        }
                     }
                 }
                 render_static_onto(
@@ -1600,6 +1653,22 @@ fn to_rgba8(
         }
     }
     dst
+}
+
+/// Blit a captured [`Frame`] (tightly-packed straight RGBA) into the
+/// overlay's premultiplied SHM pixmap as an opaque base layer. The
+/// source alpha is discarded: a freeze-screen background is opaque by
+/// definition, and forcing `A = 255` makes premultiplied identical to
+/// straight, so the RGB bytes carry over unchanged — and it can't be
+/// tripped up by a compositor whose screencast leaves alpha at 0. The
+/// caller guarantees `dst.len() == frame.pixels.len()`.
+fn blit_frame_as_opaque_base(dst: &mut [u8], frame: &Frame) {
+    for (d, s) in dst.chunks_exact_mut(4).zip(frame.pixels.chunks_exact(4)) {
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+        d[3] = 0xFF;
+    }
 }
 
 // HUD rasterization lives in `crate::hud_render`. The Wayland backend
