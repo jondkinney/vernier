@@ -115,7 +115,7 @@ pub(crate) fn register(accelerator: Accelerator, label: &str) -> Result<HotkeyId
                     signature: FOUR_CC_VRNR,
                     id: new_id.0 as u32,
                 },
-                unsafe { GetApplicationEventTarget() },
+                GetApplicationEventTarget(),
                 0,
                 &mut carbon_ref,
             )

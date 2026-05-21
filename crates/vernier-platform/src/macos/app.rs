@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
 
 use super::install_main_state;
@@ -90,7 +90,7 @@ where
     // the race where a status item created from the worker thread
     // arrives at AppKit before NSApp has finished bringing up
     // its menu-bar plumbing.
-    unsafe { app.finishLaunching() };
+    app.finishLaunching();
     log::info!("macos: NSApp finished launching, activation=Accessory");
 
     // Install our NSApplicationDelegate so the standard macOS
@@ -131,7 +131,7 @@ where
 
     // Run forever. AppKit pumps events here. When `terminate_nsapp`
     // fires, `run` returns and we exit the process.
-    unsafe { app.run() };
+    app.run();
     std::process::exit(0)
 }
 
@@ -154,7 +154,7 @@ fn terminate_nsapp() {
         let Some(SendableApp(app)) = NSAPP.get() else {
             return;
         };
-        unsafe { app.stop(None) };
+        app.stop(None);
         wake_main_event_loop();
     });
 }
@@ -170,21 +170,19 @@ fn wake_main_event_loop() {
         return;
     };
     let _ = MainThreadMarker::new().expect("main");
-    unsafe {
-        let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-            NSEventType::ApplicationDefined,
-            NSPoint { x: 0.0, y: 0.0 },
-            NSEventModifierFlags(0),
-            0.0,
-            0,
-            None,
-            0,
-            0,
-            0,
-        );
-        if let Some(event) = event {
-            app.postEvent_atStart(&event, true);
-        }
+    let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint { x: 0.0, y: 0.0 },
+        NSEventModifierFlags(0),
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    );
+    if let Some(event) = event {
+        app.postEvent_atStart(&event, true);
     }
 }
 
@@ -269,7 +267,10 @@ impl VernierAppDelegate {
 /// Strong-ref holder for the delegate. NSApp's `setDelegate:` only
 /// installs a weak reference, so the delegate would dealloc the
 /// instant `bootstrap_main`'s local goes out of scope without this.
-struct SendableDelegate(Retained<VernierAppDelegate>);
+//
+// The field is never read — its only job is to keep the retain count
+// non-zero for the process lifetime.
+struct SendableDelegate(#[allow(dead_code)] Retained<VernierAppDelegate>);
 // Safety: VernierAppDelegate is a MainThreadOnly NSObject subclass.
 // We never read/write it off-main; this storage exists purely to
 // keep the retain count alive for the process lifetime.

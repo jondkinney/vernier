@@ -44,10 +44,10 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 /// thread-safe and the NSImage `drawInRect:` path used here works
 /// from background threads in practice for off-screen bitmap targets.
 pub fn extract_macos_app_icon_rgba(bundle_path: &Path, size: u32) -> Option<Vec<u8>> {
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+    let workspace = NSWorkspace::sharedWorkspace();
     let path_str = bundle_path.to_string_lossy();
     let ns_path = NSString::from_str(&path_str);
-    let icon: objc2::rc::Retained<NSImage> = unsafe { workspace.iconForFile(&ns_path) };
+    let icon: objc2::rc::Retained<NSImage> = workspace.iconForFile(&ns_path);
     // NSImage.size defaults to the icon's natural rep size; force
     // our target so drawInRect rasterizes at the size we want
     // instead of scaling whatever the bitmap representation happens
@@ -56,7 +56,7 @@ pub fn extract_macos_app_icon_rgba(bundle_path: &Path, size: u32) -> Option<Vec<
         width: size as f64,
         height: size as f64,
     };
-    unsafe { icon.setSize(target) };
+    icon.setSize(target);
 
     // RGBA8 non-premultiplied bitmap. Bytes-per-row = width * 4 (no
     // alignment padding), bits-per-pixel = 32, hasAlpha = true. The
@@ -85,9 +85,9 @@ pub fn extract_macos_app_icon_rgba(bundle_path: &Path, size: u32) -> Option<Vec<
             32,
         )?
     };
-    let ctx = unsafe { NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap) }?;
-    unsafe { NSGraphicsContext::saveGraphicsState_class() };
-    unsafe { NSGraphicsContext::setCurrentContext(Some(&ctx)) };
+    let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&ctx));
     let rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size: target,
@@ -105,22 +105,20 @@ pub fn extract_macos_app_icon_rgba(bundle_path: &Path, size: u32) -> Option<Vec<
             height: 0.0,
         },
     };
-    unsafe {
-        icon.drawInRect_fromRect_operation_fraction(rect, zero, NSCompositingOperation::Copy, 1.0);
-    }
+    icon.drawInRect_fromRect_operation_fraction(rect, zero, NSCompositingOperation::Copy, 1.0);
     // Force pending Core Graphics commands to flush before reading
     // pixels. Without this, on some macOS versions the bitmapData
     // pointer can momentarily return the pre-draw pixels.
-    unsafe { ctx.flushGraphics() };
-    unsafe { NSGraphicsContext::restoreGraphicsState_class() };
+    ctx.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
 
-    let row_bytes = unsafe { bitmap.bytesPerRow() } as usize;
+    let row_bytes = bitmap.bytesPerRow() as usize;
     let expected_row = (size as usize) * 4;
     if row_bytes != expected_row {
         return None;
     }
     let total = expected_row * (size as usize);
-    let data_ptr = unsafe { bitmap.bitmapData() };
+    let data_ptr = bitmap.bitmapData();
     if data_ptr.is_null() {
         return None;
     }

@@ -7,14 +7,12 @@
 //! activation back through a per-item id stored in the menu
 //! item's `representedObject`.
 
-use std::cell::RefCell;
-
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, Sel};
-use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::NSObject;
+use objc2::{MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem};
-use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
+use objc2_foundation::{MainThreadMarker, NSSize, NSString};
 
 use crate::{PlatformError, PlatformEvent, Result, TrayHandle, TrayMenu, TrayMenuItem, TrayOps};
 
@@ -36,7 +34,7 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
 
         let bar = NSStatusBar::systemStatusBar();
         // NSStatusItem.variableLength == -1.0.
-        let status_item = unsafe { bar.statusItemWithLength(-1.0) };
+        let status_item = bar.statusItemWithLength(-1.0);
         log::info!("macos tray: status item created");
 
         let button = status_item
@@ -55,21 +53,20 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
         const TRAY_GLYPH_PT: f64 = 18.0;
         if let Some(img) = render_tray_template_image(TRAY_GLYPH_PT) {
             log::info!("macos tray: using custom V glyph");
-            unsafe { img.setTemplate(true) };
+            img.setTemplate(true);
             button.setImage(Some(&img));
         } else {
             let symbol_name = NSString::from_str("ruler");
             let accessibility = NSString::from_str("Vernier");
-            let symbol_image: Option<Retained<NSImage>> = unsafe {
+            let symbol_image: Option<Retained<NSImage>> =
                 NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     &symbol_name,
                     Some(&accessibility),
-                )
-            };
+                );
             match symbol_image {
                 Some(img) => {
                     log::info!("macos tray: custom glyph failed, using SF Symbol 'ruler'");
-                    unsafe { img.setTemplate(true) };
+                    img.setTemplate(true);
                     button.setImage(Some(&img));
                 }
                 None => {
@@ -87,7 +84,7 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
         unsafe {
             button.setTarget(Some(&*target));
             button.setAction(Some(sel!(onStatusClick:)));
-        };
+        }
 
         let ns_menu = build_menu(&menu, &target, mtm);
         status_item.setMenu(Some(&ns_menu));
@@ -113,7 +110,7 @@ pub(crate) fn create(menu: TrayMenu) -> Result<TrayHandle> {
 }
 
 fn build_menu(menu: &TrayMenu, target: &TrayTarget, mtm: MainThreadMarker) -> Retained<NSMenu> {
-    let ns_menu = unsafe { NSMenu::new(mtm) };
+    let ns_menu = NSMenu::new(mtm);
     for item in &menu.items {
         append_item(&ns_menu, item, target, mtm);
     }
@@ -123,53 +120,51 @@ fn build_menu(menu: &TrayMenu, target: &TrayTarget, mtm: MainThreadMarker) -> Re
 fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: MainThreadMarker) {
     match item {
         TrayMenuItem::Separator => {
-            let sep = unsafe { NSMenuItem::separatorItem(mtm) };
-            unsafe { parent.addItem(&sep) };
+            let sep = NSMenuItem::separatorItem(mtm);
+            parent.addItem(&sep);
         }
         TrayMenuItem::Action {
             id, label, enabled, ..
         } => {
-            let mi = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
+            // NSMenuItem's init / setTarget / setRepresentedObject are
+            // marked unsafe in objc2-app-kit; the safety contract is
+            // standard Cocoa "main thread + retain rules", which the
+            // surrounding tray-update path already upholds.
+            unsafe {
+                let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
                     &NSString::from_str(label),
                     Some(sel!(onMenuItem:)),
                     &NSString::from_str(""),
-                )
-            };
-            unsafe {
-                mi.setTarget(Some(&*target));
+                );
+                mi.setTarget(Some(target));
                 mi.setEnabled(*enabled);
                 mi.setRepresentedObject(Some(&NSString::from_str(id)));
                 parent.addItem(&mi);
-            };
+            }
         }
         TrayMenuItem::Toggle {
             id,
             label,
             enabled,
             checked,
-        } => {
-            let mi = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(label),
-                    Some(sel!(onMenuItem:)),
-                    &NSString::from_str(""),
-                )
-            };
-            unsafe {
-                mi.setTarget(Some(&*target));
-                mi.setEnabled(*enabled);
-                mi.setState(if *checked {
-                    objc2_app_kit::NSControlStateValueOn
-                } else {
-                    objc2_app_kit::NSControlStateValueOff
-                });
-                mi.setRepresentedObject(Some(&NSString::from_str(id)));
-                parent.addItem(&mi);
-            };
-        }
+        } => unsafe {
+            let mi = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                Some(sel!(onMenuItem:)),
+                &NSString::from_str(""),
+            );
+            mi.setTarget(Some(target));
+            mi.setEnabled(*enabled);
+            mi.setState(if *checked {
+                objc2_app_kit::NSControlStateValueOn
+            } else {
+                objc2_app_kit::NSControlStateValueOff
+            });
+            mi.setRepresentedObject(Some(&NSString::from_str(id)));
+            parent.addItem(&mi);
+        },
         TrayMenuItem::Submenu {
             id: _,
             label,
@@ -183,24 +178,14 @@ fn append_item(parent: &NSMenu, item: &TrayMenuItem, target: &TrayTarget, mtm: M
                     &NSString::from_str(""),
                 )
             };
-            let submenu = unsafe { NSMenu::new(mtm) };
+            let submenu = NSMenu::new(mtm);
             for sub in items {
                 append_item(&submenu, sub, target, mtm);
             }
-            unsafe {
-                mi.setSubmenu(Some(&submenu));
-                parent.addItem(&mi);
-            }
+            mi.setSubmenu(Some(&submenu));
+            parent.addItem(&mi);
         }
     }
-}
-
-fn build_template_image(_mtm: MainThreadMarker) -> Retained<NSImage> {
-    // For v0 we use a plain text title on the status item button
-    // instead of an image, dodging the NSBitmapImageRep ceremony.
-    // Returning a 0×0 NSImage is the simplest "no icon" signal;
-    // the caller sets the button title separately.
-    NSImage::new()
 }
 
 struct MacTray {}
@@ -212,7 +197,7 @@ impl TrayOps for MacTray {
             super::with_main_state(|s| {
                 if let Some(t) = s.tray.as_ref() {
                     let new_menu = build_menu(&menu, &t.target, mtm);
-                    unsafe { t.status_item.setMenu(Some(&new_menu)) };
+                    t.status_item.setMenu(Some(&new_menu));
                 }
             });
             Ok(())
@@ -224,9 +209,9 @@ impl TrayOps for MacTray {
             super::with_main_state(|s| {
                 if let Some(t) = s.tray.as_ref() {
                     if let Some(button) =
-                        unsafe { t.status_item.button(MainThreadMarker::new().expect("main")) }
+                        t.status_item.button(MainThreadMarker::new().expect("main"))
                     {
-                        unsafe { button.setAppearsDisabled(!active) };
+                        button.setAppearsDisabled(!active);
                     }
                 }
             });
@@ -256,7 +241,7 @@ define_class!(
         #[unsafe(method(onMenuItem:))]
         fn on_menu_item(&self, sender: Option<&NSMenuItem>) {
             let Some(item) = sender else { return };
-            let Some(id) = (unsafe { item.representedObject() }) else {
+            let Some(id) = item.representedObject() else {
                 return;
             };
             let Ok(s) = id.downcast::<NSString>() else {
@@ -324,6 +309,6 @@ fn render_tray_template_image(size_pt: f64) -> Option<Retained<NSImage>> {
         width: size_pt,
         height: size_pt,
     };
-    let image = unsafe { NSImage::initWithCGImage_size(NSImage::alloc(), &cg, ns_size) };
+    let image = NSImage::initWithCGImage_size(NSImage::alloc(), &cg, ns_size);
     Some(image)
 }
