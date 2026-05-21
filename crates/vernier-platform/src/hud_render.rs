@@ -26,6 +26,118 @@ struct PillLayout {
     px_size: f32,
 }
 
+/// Axis-aligned rectangle in BUFFER pixels, used to pass a pill /
+/// glyph box as a single argument instead of four loose floats.
+#[derive(Copy, Clone)]
+struct BoxRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// Buffer dimensions in BUFFER pixels — the size of the canvas being
+/// painted. Grouped so functions don't carry `buf_w` / `buf_h` as a
+/// loose pair.
+#[derive(Copy, Clone)]
+struct BufSize {
+    w: f32,
+    h: f32,
+}
+
+/// Shared drawing context for the stroke-pass functions: the canvas
+/// size, the HiDPI scale factor, and the measurement-format settings.
+/// Bundled so each `draw_*` function takes one `&DrawCtx` rather than
+/// the same four arguments spelled out every time.
+struct DrawCtx<'a> {
+    /// Canvas dimensions in BUFFER pixels.
+    buf: BufSize,
+    /// HiDPI scale factor (surface → buffer pixels).
+    scale: u32,
+    /// Unit / rounding / aspect settings for value formatting.
+    fmt: &'a crate::HudMeasurementFormat,
+}
+
+impl DrawCtx<'_> {
+    /// Scale factor as `f32` — most geometry math wants the float.
+    fn scale_f(&self) -> f32 {
+        self.scale as f32
+    }
+}
+
+/// The measurement line a tether attaches to: its position on the
+/// fixed axis (`pos`) and its extent on the spanning axis
+/// (`lo` .. `hi`). For a Vertical measurement `pos` is the `x` and
+/// `lo` / `hi` are the `y` range; for Horizontal it's flipped.
+#[derive(Copy, Clone)]
+struct TetherLine {
+    pos: f32,
+    lo: f32,
+    hi: f32,
+}
+
+/// Foreground colors for measurement strokes — the primary color and
+/// its alternate, selected per element by a `color_alternate` flag.
+#[derive(Copy, Clone)]
+struct FgColors {
+    primary: Color,
+    alternate: Color,
+}
+
+/// Guide-line styling: the two guide colors plus the align-mode flag.
+#[derive(Copy, Clone)]
+struct GuideStyle {
+    /// Primary guide line color.
+    color: Color,
+    /// Alternate guide line color (per-guide `color_alternate`).
+    alternate: Color,
+    /// Whether align mode is active (currently advisory only).
+    align_mode: bool,
+}
+
+/// The three tiny-skia stroke recipes the stroke pass reuses: the
+/// foreground `paint`, the standard `stroke`, and the slightly heavier
+/// `tick_stroke` for tick caps.
+struct StrokeKit<'a> {
+    paint: &'a tiny_skia::Paint<'a>,
+    stroke: &'a tiny_skia::Stroke,
+    tick_stroke: &'a tiny_skia::Stroke,
+}
+
+/// A measurement rectangle to draw, plus the two flags that change
+/// how its dimension pill is rendered.
+struct AreaRect {
+    /// One corner of the rect (logical pixels).
+    a: (f64, f64),
+    /// The opposite corner (logical pixels).
+    b: (f64, f64),
+    /// When true the W×H pill shows a camera icon instead of text.
+    camera_armed: bool,
+    /// Pre-computed dim-pill bbox (logical px) for committed rects;
+    /// `None` for live drag / live held rects → default position, no
+    /// collision search.
+    precomputed_dim_bbox: Option<crate::placement::PillRect>,
+}
+
+/// Where to anchor a pill: a buffer-pixel point plus the anchoring
+/// mode that interprets it.
+#[derive(Copy, Clone)]
+struct PillAnchorAt {
+    x: f32,
+    y: f32,
+    anchor: PillAnchor,
+}
+
+/// A rasterized glyph bitmap ready to alpha-blend onto the canvas at
+/// `(x, y)`. `bitmap` is `w * h` 8-bit coverage values.
+struct GlyphBlit<'a> {
+    bitmap: &'a [u8],
+    w: u32,
+    h: u32,
+    x: f32,
+    y: f32,
+}
+
 /// Pixel size of the dimension-readout text in LOGICAL pixels. Sized
 /// to fill the pill comfortably against a 2 physical-px stroke.
 pub(crate) const TEXT_LOGICAL_PX: f32 = 12.5;
@@ -163,17 +275,13 @@ fn draw_pill_bg(pixmap: &mut tiny_skia::PixmapMut, x: f32, y: f32, w: f32, h: f3
     }
 }
 
-/// Push a glyph layout centered in the rectangle `(x, y, w, h)` at
+/// Push a glyph layout centered in the rectangle `bbox` at
 /// `text_logical_px`. The text may be larger than the box (e.g.
 /// stuck-pill hover X overflows).
-#[allow(clippy::too_many_arguments)]
 fn push_text_in_box(
     pills: &mut Vec<PillLayout>,
     text: String,
-    box_x: f32,
-    box_y: f32,
-    box_w: f32,
-    box_h: f32,
+    bbox: BoxRect,
     text_logical_px: f32,
     scale_f: f32,
 ) {
@@ -184,8 +292,8 @@ fn push_text_in_box(
         .horizontal_line_metrics(px_size)
         .map(|m| (m.ascent, -m.descent))
         .unwrap_or((px_size * 0.8, px_size * 0.2));
-    let cx = box_x + box_w * 0.5;
-    let cy = box_y + box_h * 0.5;
+    let cx = bbox.x + bbox.w * 0.5;
+    let cy = bbox.y + bbox.h * 0.5;
     pills.push(PillLayout {
         text,
         text_x: (cx - text_w * 0.5).round(),
@@ -430,35 +538,55 @@ fn render_static_strokes(
         let mut rect_paint = Paint::default();
         rect_paint.set_color_rgba8(rect_fg.r, rect_fg.g, rect_fg.b, rect_fg.a);
         rect_paint.anti_alias = false;
+        // tick_stroke is unused by draw_area_rect; pass `stroke`
+        // again so the StrokeKit is still well-formed.
+        let kit = StrokeKit {
+            paint: &rect_paint,
+            stroke: &stroke,
+            tick_stroke: &stroke,
+        };
+        let ctx = DrawCtx {
+            buf: BufSize {
+                w: buf_w as f32,
+                h: buf_h as f32,
+            },
+            scale,
+            fmt: &hud.measurement_format,
+        };
         draw_area_rect(
             &mut pixmap,
             &mut pills,
-            &rect.rect_start,
-            &rect.rect_end,
-            buf_w as f32,
-            buf_h as f32,
-            scale,
+            AreaRect {
+                a: rect.rect_start,
+                b: rect.rect_end,
+                camera_armed: rect.camera_armed,
+                precomputed_dim_bbox: dim_bbox,
+            },
             rect_fg,
-            &hud.measurement_format,
-            &stroke,
-            &rect_paint,
-            rect.camera_armed,
-            dim_bbox,
+            &kit,
+            &ctx,
         );
     }
 
     if !hud.stuck_measurements.is_empty() {
+        let ctx = DrawCtx {
+            buf: BufSize {
+                w: buf_w as f32,
+                h: buf_h as f32,
+            },
+            scale,
+            fmt: &hud.measurement_format,
+        };
         draw_stuck_measurements(
             &mut pixmap,
             &mut pills,
             &hud.stuck_measurements,
             &pill_layout.stuck_bboxes,
-            hud.primary_fg,
-            hud.alternate_fg,
-            &hud.measurement_format,
-            buf_w as f32,
-            buf_h as f32,
-            scale as f32,
+            FgColors {
+                primary: hud.primary_fg,
+                alternate: hud.alternate_fg,
+            },
+            &ctx,
         );
     }
 
@@ -473,18 +601,25 @@ fn render_static_strokes(
             HudKind::Held { cursor, .. } => Some(*cursor),
             HudKind::None => None,
         };
+        let ctx = DrawCtx {
+            buf: BufSize {
+                w: buf_w as f32,
+                h: buf_h as f32,
+            },
+            scale,
+            fmt: &hud.measurement_format,
+        };
         draw_guides(
             &mut pixmap,
             &mut pills,
             &hud.guides,
             cursor,
-            hud.align_mode,
-            hud.guide_color,
-            hud.alternative_guide_color,
-            &hud.measurement_format,
-            buf_w as f32,
-            buf_h as f32,
-            scale as f32,
+            GuideStyle {
+                color: hud.guide_color,
+                alternate: hud.alternative_guide_color,
+                align_mode: hud.align_mode,
+            },
+            &ctx,
         );
     }
 
@@ -521,23 +656,35 @@ fn render_dynamic_strokes(
 
     let mut pills: Vec<PillLayout> = Vec::new();
 
+    let ctx = DrawCtx {
+        buf: BufSize {
+            w: buf_w as f32,
+            h: buf_h as f32,
+        },
+        scale,
+        fmt: &hud.measurement_format,
+    };
+    let kit = StrokeKit {
+        paint: &paint,
+        stroke: &stroke,
+        tick_stroke: &tick_stroke,
+    };
+
     // Live drag rect — drawn before the cursor so the crosshair sits
     // on top.
     if let HudKind::Drawing { start, cursor } = &hud.kind {
         draw_area_rect(
             &mut pixmap,
             &mut pills,
-            start,
-            cursor,
-            buf_w as f32,
-            buf_h as f32,
-            scale,
+            AreaRect {
+                a: *start,
+                b: *cursor,
+                camera_armed: false,
+                precomputed_dim_bbox: None,
+            },
             fg,
-            &hud.measurement_format,
-            &stroke,
-            &paint,
-            false,
-            None,
+            &kit,
+            &ctx,
         );
     }
     if let HudKind::Held {
@@ -550,17 +697,15 @@ fn render_dynamic_strokes(
         draw_area_rect(
             &mut pixmap,
             &mut pills,
-            rect_start,
-            rect_end,
-            buf_w as f32,
-            buf_h as f32,
-            scale,
+            AreaRect {
+                a: *rect_start,
+                b: *rect_end,
+                camera_armed: *camera_armed,
+                precomputed_dim_bbox: None,
+            },
             fg,
-            &hud.measurement_format,
-            &stroke,
-            &paint,
-            *camera_armed,
-            None,
+            &kit,
+            &ctx,
         );
     }
 
@@ -577,13 +722,8 @@ fn render_dynamic_strokes(
                 &mut pills,
                 cursor,
                 edges,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                &paint,
-                &stroke,
-                &tick_stroke,
-                &hud.measurement_format,
+                &kit,
+                &ctx,
                 hud.show_cursor,
             );
         } else if hud.move_cursor_at.is_some() {
@@ -598,13 +738,8 @@ fn render_dynamic_strokes(
                 &mut pills,
                 cursor,
                 edges,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                &paint,
-                &stroke,
-                &tick_stroke,
-                &hud.measurement_format,
+                &kit,
+                &ctx,
                 hud.show_cursor,
             );
         }
@@ -629,13 +764,8 @@ fn render_dynamic_strokes(
                 &mut pills,
                 cursor,
                 edges,
-                buf_w as f32,
-                buf_h as f32,
-                scale,
-                &paint,
-                &stroke,
-                &tick_stroke,
-                &hud.measurement_format,
+                &kit,
+                &ctx,
                 hud.show_cursor,
             );
         }
@@ -713,11 +843,12 @@ fn draw_corner_indicator(
         pixmap,
         pills,
         text.to_string(),
-        buf_w - margin,
-        margin,
-        PillAnchor::AnchorTopRight,
-        buf_w,
-        buf_h,
+        PillAnchorAt {
+            x: buf_w - margin,
+            y: margin,
+            anchor: PillAnchor::AnchorTopRight,
+        },
+        BufSize { w: buf_w, h: buf_h },
         scale_f,
         TEXT_LOGICAL_PX,
     );
@@ -867,21 +998,18 @@ fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
 /// Draw frozen single-axis measurements — coral line + tick caps +
 /// pill with the pixel count. Same visual language as the live
 /// crosshair so the user reads them as "stuck" measurements.
-#[allow(clippy::too_many_arguments)]
 fn draw_stuck_measurements(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
     measurements: &[crate::StuckMeasurement],
     pill_bboxes: &[crate::placement::PillRect],
-    primary_fg: Color,
-    alternate_fg: Color,
-    fmt: &crate::HudMeasurementFormat,
-    _buf_w: f32,
-    _buf_h: f32,
-    scale_f: f32,
+    colors: FgColors,
+    ctx: &DrawCtx,
 ) {
     use crate::GuideAxis;
     use tiny_skia::*;
+    let fmt = ctx.fmt;
+    let scale_f = ctx.scale_f();
     let line_stroke = Stroke {
         width: 2.0,
         ..Default::default()
@@ -897,9 +1025,9 @@ fn draw_stuck_measurements(
         // keep whatever color they were placed in even if `X`
         // re-flips the live HUD afterward.
         let fg = if m.color_alternate {
-            alternate_fg
+            colors.alternate
         } else {
-            primary_fg
+            colors.primary
         };
         let mut paint = Paint::default();
         paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
@@ -963,13 +1091,17 @@ fn draw_stuck_measurements(
                 draw_pill_tether(
                     pixmap,
                     crate::GuideAxis::Vertical,
-                    x,
-                    y0.min(y1),
-                    y0.max(y1),
-                    pill_x,
-                    pill_y,
-                    pill_w,
-                    pill_h,
+                    TetherLine {
+                        pos: x,
+                        lo: y0.min(y1),
+                        hi: y0.max(y1),
+                    },
+                    &BoxRect {
+                        x: pill_x,
+                        y: pill_y,
+                        w: pill_w,
+                        h: pill_h,
+                    },
                     fg,
                     scale_f,
                 );
@@ -997,13 +1129,17 @@ fn draw_stuck_measurements(
                 draw_pill_tether(
                     pixmap,
                     crate::GuideAxis::Horizontal,
-                    y,
-                    x0.min(x1),
-                    x0.max(x1),
-                    pill_x,
-                    pill_y,
-                    pill_w,
-                    pill_h,
+                    TetherLine {
+                        pos: y,
+                        lo: x0.min(x1),
+                        hi: x0.max(x1),
+                    },
+                    &BoxRect {
+                        x: pill_x,
+                        y: pill_y,
+                        w: pill_w,
+                        h: pill_h,
+                    },
                     fg,
                     scale_f,
                 );
@@ -1013,10 +1149,12 @@ fn draw_stuck_measurements(
         push_text_in_box(
             pills,
             display_text.clone(),
-            pill_x,
-            pill_y,
-            pill_w,
-            pill_h,
+            BoxRect {
+                x: pill_x,
+                y: pill_y,
+                w: pill_w,
+                h: pill_h,
+            },
             display_size,
             scale_f,
         );
@@ -1029,52 +1167,45 @@ fn draw_stuck_measurements(
 /// line (centered on it) — there's nothing to tether back to.
 ///
 /// `axis` is the orientation of the MEASUREMENT line, not the
-/// tether. For a Vertical measurement, `line_pos` is its `x` and
-/// `line_lo/hi` are the `y` extent; for Horizontal it's flipped.
-#[allow(clippy::too_many_arguments)]
+/// tether. `pill` is the value pill's bounding box.
 fn draw_pill_tether(
     pixmap: &mut tiny_skia::PixmapMut,
     axis: crate::GuideAxis,
-    line_pos: f32,
-    line_lo: f32,
-    line_hi: f32,
-    pill_x: f32,
-    pill_y: f32,
-    pill_w: f32,
-    pill_h: f32,
+    line: TetherLine,
+    pill: &BoxRect,
     fg: Color,
     scale_f: f32,
 ) {
     use tiny_skia::*;
     let (anchor_pt, pill_pt) = match axis {
         crate::GuideAxis::Vertical => {
-            // Line is vertical at x = line_pos. The pill sits to the
+            // Line is vertical at x = line.pos. The pill sits to the
             // left or right; the tether is horizontal.
-            let pill_cy = (pill_y + pill_h * 0.5).clamp(line_lo, line_hi);
+            let pill_cy = (pill.y + pill.h * 0.5).clamp(line.lo, line.hi);
             // Pill side closest to the line.
-            let pill_near_x = if pill_x + pill_w * 0.5 < line_pos {
-                pill_x + pill_w // right edge of left-side pill
+            let pill_near_x = if pill.x + pill.w * 0.5 < line.pos {
+                pill.x + pill.w // right edge of left-side pill
             } else {
-                pill_x // left edge of right-side pill
+                pill.x // left edge of right-side pill
             };
             // No tether if the pill straddles or sits on the line.
-            if (pill_near_x - line_pos).abs() < 1.0 {
+            if (pill_near_x - line.pos).abs() < 1.0 {
                 return;
             }
-            ((line_pos, pill_cy), (pill_near_x, pill_cy))
+            ((line.pos, pill_cy), (pill_near_x, pill_cy))
         }
         crate::GuideAxis::Horizontal => {
-            // Line is horizontal at y = line_pos.
-            let pill_cx = (pill_x + pill_w * 0.5).clamp(line_lo, line_hi);
-            let pill_near_y = if pill_y + pill_h * 0.5 < line_pos {
-                pill_y + pill_h
+            // Line is horizontal at y = line.pos.
+            let pill_cx = (pill.x + pill.w * 0.5).clamp(line.lo, line.hi);
+            let pill_near_y = if pill.y + pill.h * 0.5 < line.pos {
+                pill.y + pill.h
             } else {
-                pill_y
+                pill.y
             };
-            if (pill_near_y - line_pos).abs() < 1.0 {
+            if (pill_near_y - line.pos).abs() < 1.0 {
                 return;
             }
-            ((pill_cx, line_pos), (pill_cx, pill_near_y))
+            ((pill_cx, line.pos), (pill_cx, pill_near_y))
         }
     };
     let mut paint = Paint::default();
@@ -1099,22 +1230,20 @@ fn draw_pill_tether(
 /// rest of the HUD so the guides sit on top of measurement strokes.
 /// When a guide is `hovered` and we have a `cursor`, draw a small dark
 /// "X" badge on the line at the cursor's free axis to signal removal.
-#[allow(clippy::too_many_arguments)]
 fn draw_guides(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
     guides: &[crate::Guide],
     cursor: Option<(f64, f64)>,
-    align_mode: bool,
-    guide_color: crate::Color,
-    alternative_guide_color: crate::Color,
-    fmt: &crate::HudMeasurementFormat,
-    buf_w: f32,
-    buf_h: f32,
-    scale_f: f32,
+    style: GuideStyle,
+    ctx: &DrawCtx,
 ) {
     use crate::GuideAxis;
     use tiny_skia::*;
+    let fmt = ctx.fmt;
+    let buf_w = ctx.buf.w;
+    let buf_h = ctx.buf.h;
+    let scale_f = ctx.scale_f();
     let stroke = Stroke {
         width: 1.0,
         ..Default::default()
@@ -1123,9 +1252,9 @@ fn draw_guides(
         // Per-guide color (snapshot at placement, except for the
         // pending preview which mirrors the live `color_alternate`).
         let c = if guide.color_alternate {
-            alternative_guide_color
+            style.alternate
         } else {
-            guide_color
+            style.color
         };
         let mut paint = Paint::default();
         paint.set_color_rgba8(c.r, c.g, c.b, c.a);
@@ -1158,7 +1287,7 @@ fn draw_guides(
         }
     }
 
-    let _ = align_mode;
+    let _ = style.align_mode;
     // Inter-guide distance pills. For each adjacent pair of guides
     // sharing an axis, render a small pill (same style as a stuck
     // measurement) showing the px gap between them, centered between
@@ -1190,10 +1319,12 @@ fn draw_guides(
         push_text_in_box(
             pills,
             value,
-            pill_x,
-            pill_y,
-            pill_w,
-            pill_h,
+            BoxRect {
+                x: pill_x,
+                y: pill_y,
+                w: pill_w,
+                h: pill_h,
+            },
             TEXT_STUCK_LOGICAL_PX,
             scale_f,
         );
@@ -1225,10 +1356,12 @@ fn draw_guides(
         push_text_in_box(
             pills,
             value,
-            pill_x,
-            pill_y,
-            pill_w,
-            pill_h,
+            BoxRect {
+                x: pill_x,
+                y: pill_y,
+                w: pill_w,
+                h: pill_h,
+            },
             TEXT_STUCK_LOGICAL_PX,
             scale_f,
         );
@@ -1261,10 +1394,12 @@ fn draw_remove_x_badge(
     push_text_in_box(
         pills,
         "\u{00D7}".to_string(),
-        pill_x,
-        pill_y,
-        pill_w,
-        pill_h,
+        BoxRect {
+            x: pill_x,
+            y: pill_y,
+            w: pill_w,
+            h: pill_h,
+        },
         TEXT_STUCK_LOGICAL_PX * 1.5,
         scale_f,
     );
@@ -1273,22 +1408,23 @@ fn draw_remove_x_badge(
 /// Draw the live measure crosshair: axis lines through the cursor with
 /// tick caps where edges were detected, plus the white `+` cursor
 /// marker on top, and a W×H pill in the lower-right of the cursor.
-#[allow(clippy::too_many_arguments)]
 fn draw_hover_indicators(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
     cursor: &(f64, f64),
     edges: &[Option<crate::HudEdge>; 4],
-    buf_w: f32,
-    buf_h: f32,
-    scale: u32,
-    paint: &tiny_skia::Paint,
-    stroke: &tiny_skia::Stroke,
-    tick_stroke: &tiny_skia::Stroke,
-    fmt: &crate::HudMeasurementFormat,
+    kit: &StrokeKit,
+    ctx: &DrawCtx,
     show_cursor: bool,
 ) {
     use tiny_skia::*;
+    let buf_w = ctx.buf.w;
+    let buf_h = ctx.buf.h;
+    let scale = ctx.scale;
+    let fmt = ctx.fmt;
+    let paint = kit.paint;
+    let stroke = kit.stroke;
+    let tick_stroke = kit.tick_stroke;
     let scale_f = scale as f32;
     {
         // Convert surface-logical coords to buffer-physical, snap
@@ -1532,26 +1668,25 @@ fn draw_hover_indicators(
 /// `camera_armed` is true, the W×H pill renders a camera icon instead
 /// of the dimension text — that signals to the user that clicking will
 /// capture the held region as a screenshot.
-#[allow(clippy::too_many_arguments)]
 fn draw_area_rect(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
-    a: &(f64, f64),
-    b: &(f64, f64),
-    buf_w: f32,
-    buf_h: f32,
-    scale: u32,
+    area: AreaRect,
     fg: Color,
-    fmt: &crate::HudMeasurementFormat,
-    stroke: &tiny_skia::Stroke,
-    line_paint: &tiny_skia::Paint,
-    camera_armed: bool,
-    // Pre-computed dim-pill bbox (logical px) for committed rects;
-    // None for live drag / live held rects → default position, no
-    // collision search.
-    precomputed_dim_bbox: Option<crate::placement::PillRect>,
+    kit: &StrokeKit,
+    ctx: &DrawCtx,
 ) {
     use tiny_skia::*;
+    let a = &area.a;
+    let b = &area.b;
+    let camera_armed = area.camera_armed;
+    let precomputed_dim_bbox = area.precomputed_dim_bbox;
+    let buf_w = ctx.buf.w;
+    let buf_h = ctx.buf.h;
+    let scale = ctx.scale;
+    let fmt = ctx.fmt;
+    let stroke = kit.stroke;
+    let line_paint = kit.paint;
     let scale_f = scale as f32;
     let half = scale_f * 0.5;
     let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
@@ -1636,10 +1771,12 @@ fn draw_area_rect(
         push_text_in_box(
             pills,
             dim_text,
-            dim_pill_x,
-            dim_pill_y,
-            dim_pill_w,
-            dim_pill_h,
+            BoxRect {
+                x: dim_pill_x,
+                y: dim_pill_y,
+                w: dim_pill_w,
+                h: dim_pill_h,
+            },
             TEXT_LOGICAL_PX,
             scale_f,
         );
@@ -1679,10 +1816,12 @@ fn draw_area_rect(
         push_text_in_box(
             pills,
             aspect_text,
-            apill_x,
-            apill_y,
-            apill_w,
-            apill_h,
+            BoxRect {
+                x: apill_x,
+                y: apill_y,
+                w: apill_w,
+                h: apill_h,
+            },
             TEXT_LOGICAL_PX,
             scale_f,
         );
@@ -1738,20 +1877,21 @@ enum PillAnchor {
     BelowRight(f32),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_pill(
     pixmap: &mut tiny_skia::PixmapMut,
     pills: &mut Vec<PillLayout>,
     text: String,
-    anchor_x: f32,
-    anchor_y: f32,
-    anchor: PillAnchor,
-    surface_w: f32,
-    surface_h: f32,
+    anchor_at: PillAnchorAt,
+    surface: BufSize,
     scale_f: f32,
     text_logical_px: f32,
 ) {
     use tiny_skia::*;
+    let anchor_x = anchor_at.x;
+    let anchor_y = anchor_at.y;
+    let anchor = anchor_at.anchor;
+    let surface_w = surface.w;
+    let surface_h = surface.h;
     let Some(font) = hud_font() else {
         return;
     };
@@ -1834,27 +1974,26 @@ fn render_pill_text(
             canvas,
             buf_w,
             buf_h,
-            &bitmap,
-            metrics.width as u32,
-            metrics.height as u32,
-            glyph_origin_x,
-            glyph_origin_y,
+            GlyphBlit {
+                bitmap: &bitmap,
+                w: metrics.width as u32,
+                h: metrics.height as u32,
+                x: glyph_origin_x,
+                y: glyph_origin_y,
+            },
         );
         pen_x += metrics.advance_width;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn composite_glyph(
-    canvas: &mut [u8],
-    buf_w: u32,
-    buf_h: u32,
-    bitmap: &[u8],
-    glyph_w: u32,
-    glyph_h: u32,
-    pos_x: f32,
-    pos_y: f32,
-) {
+fn composite_glyph(canvas: &mut [u8], buf_w: u32, buf_h: u32, glyph: GlyphBlit) {
+    let GlyphBlit {
+        bitmap,
+        w: glyph_w,
+        h: glyph_h,
+        x: pos_x,
+        y: pos_y,
+    } = glyph;
     if glyph_w == 0 || glyph_h == 0 {
         return;
     }
