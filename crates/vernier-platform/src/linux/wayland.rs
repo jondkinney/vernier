@@ -311,9 +311,6 @@ impl Platform for WaylandPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OverlayKey(u64);
 
-// Variants vary widely in size; Box-ing the largest would help memory
-// at the cost of touching every match arm. Skip for now.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Cmd {
     CreateOverlay {
@@ -324,7 +321,10 @@ enum Cmd {
     OverlayHide(OverlayKey),
     OverlaySetTint(OverlayKey, Color),
     OverlaySetInputCapturing(OverlayKey, bool),
-    OverlaySetHud(OverlayKey, Option<Hud>),
+    // `Hud` is large (~440 bytes); box it so it doesn't inflate every
+    // other `Cmd` variant sitting in the calloop channel. `Option<Box>`
+    // keeps the `None` case a null pointer with no allocation.
+    OverlaySetHud(OverlayKey, Option<Box<Hud>>),
     OverlayDestroy(OverlayKey),
     /// Toggle the system pointer cursor on top of the overlay. When
     /// hidden the surface keeps the empty system cursor (we draw our
@@ -386,7 +386,9 @@ impl OverlayOps for WaylandOverlay {
             .send(Cmd::OverlaySetInputCapturing(self.key, capturing));
     }
     fn set_hud(&mut self, hud: Option<Hud>) {
-        let _ = self.cmd_tx.send(Cmd::OverlaySetHud(self.key, hud));
+        let _ = self
+            .cmd_tx
+            .send(Cmd::OverlaySetHud(self.key, hud.map(Box::new)));
     }
     fn set_system_pointer_visible(&mut self, visible: bool) {
         let kind = if visible {
@@ -662,7 +664,7 @@ impl WaylandState {
             }
             Cmd::OverlaySetHud(key, hud) => {
                 if let Some(inst) = self.overlays.get_mut(&key) {
-                    inst.hud = hud;
+                    inst.hud = hud.map(|h| *h);
                     if inst.visible_intent {
                         self.draw_overlay(key);
                     }

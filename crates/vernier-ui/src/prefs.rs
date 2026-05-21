@@ -862,10 +862,11 @@ static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
 
 // Only called from the Linux/Omarchy SUPER-key chip path
 // (`shortcut_chip_segments` cfg(not(target_os = "macos"))). On macOS the
-// chip uses the U+2318 Command glyph directly, so this function is
-// dead — but we don't cfg-gate it because the static it reads is set
-// during the cross-platform `install_glyph_fonts` font-load loop.
-#[allow(dead_code)]
+// chip uses the U+2318 Command glyph directly, so this reader doesn't
+// exist there. `OMARCHY_FONT_AVAILABLE` is still written by the
+// cross-platform `install_glyph_fonts` loop — that store counts as a
+// use, so the static itself stays warning-free on macOS.
+#[cfg(not(target_os = "macos"))]
 fn omarchy_font_available() -> bool {
     OMARCHY_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2344,16 +2345,17 @@ fn capture_outcome(i: &mut egui::InputState, target: ShortcutId) -> Option<Captu
 // OmarchyLogo / Shift / Ctrl / Alt are constructed only in the
 // Linux branches of `shortcut_chip_segments` and read by the
 // Linux-side painter — on macOS we use Unicode modifier glyphs as
-// plain Letter segments instead. The match arms that reference them
-// are unconditional, so we can't cfg-gate the variants; `allow` is
-// the targeted fix.
-#[allow(dead_code)]
+// plain Letter segments instead, so these variants don't exist there.
 #[derive(Clone, Debug)]
 enum ChipSeg {
     Letter(String),
+    #[cfg(not(target_os = "macos"))]
     OmarchyLogo,
+    #[cfg(not(target_os = "macos"))]
     Shift,
+    #[cfg(not(target_os = "macos"))]
     Ctrl,
+    #[cfg(not(target_os = "macos"))]
     Alt,
     Enter,
     Arrow(ArrowDir),
@@ -2455,13 +2457,18 @@ const CHIP_GAP: f32 = 6.0; // gap between segments
 fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
     match seg {
         ChipSeg::Letter(s) => measure_chip_text(ctx, s, CHIP_LETTER_PT),
+        #[cfg(not(target_os = "macos"))]
         ChipSeg::OmarchyLogo => measure_chip_text(ctx, "\u{e900}", CHIP_LETTER_PT),
+        #[cfg(not(target_os = "macos"))]
+        ChipSeg::Shift | ChipSeg::Ctrl | ChipSeg::Alt => CHIP_GLYPH_SIZE,
         // Painter glyphs: most fit in a square, plus/equal/minus/underscore
         // get a slightly wider box so the bars look proportional.
-        ChipSeg::Shift | ChipSeg::Ctrl | ChipSeg::Alt | ChipSeg::Enter | ChipSeg::Arrow(_) => {
-            CHIP_GLYPH_SIZE
-        }
-        ChipSeg::Plus | ChipSeg::Minus | ChipSeg::Equal | ChipSeg::Underscore => CHIP_GLYPH_SIZE,
+        ChipSeg::Enter
+        | ChipSeg::Arrow(_)
+        | ChipSeg::Plus
+        | ChipSeg::Minus
+        | ChipSeg::Equal
+        | ChipSeg::Underscore => CHIP_GLYPH_SIZE,
     }
 }
 
@@ -2517,6 +2524,7 @@ fn paint_shortcut_chip(
                     fg,
                 );
             }
+            #[cfg(not(target_os = "macos"))]
             ChipSeg::OmarchyLogo => {
                 painter.text(
                     glyph_rect.center(),
@@ -2526,8 +2534,11 @@ fn paint_shortcut_chip(
                     fg,
                 );
             }
+            #[cfg(not(target_os = "macos"))]
             ChipSeg::Shift => paint_shift(&painter, glyph_rect, fg),
+            #[cfg(not(target_os = "macos"))]
             ChipSeg::Ctrl => paint_caret(&painter, glyph_rect, fg),
+            #[cfg(not(target_os = "macos"))]
             ChipSeg::Alt => paint_alt(&painter, glyph_rect, fg),
             ChipSeg::Enter => paint_enter(&painter, glyph_rect, fg),
             ChipSeg::Arrow(dir) => paint_arrow(&painter, glyph_rect, fg, *dir),
@@ -2544,6 +2555,7 @@ fn paint_shortcut_chip(
 /// strokes form a closed pentagon — triangular cap on top, narrower
 /// rectangular stem below. Narrower than letter width so it doesn't
 /// look "fat" next to F/V/etc.
+#[cfg(not(target_os = "macos"))]
 fn paint_shift(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
     let h = rect.height();
@@ -2569,6 +2581,7 @@ fn paint_shift(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 /// Bold chevron — the macOS Ctrl/control symbol. Apex sits at
 /// roughly the letter cap-top so it reads as a superscript caret
 /// without floating off the top of the chip.
+#[cfg(not(target_os = "macos"))]
 fn paint_caret(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
     let h = rect.height();
@@ -2589,6 +2602,7 @@ fn paint_caret(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 /// Approximation of the macOS Option (⌥) glyph: a top horizontal
 /// stroke on the right with a step down, plus a separate bottom
 /// horizontal on the left.
+#[cfg(not(target_os = "macos"))]
 fn paint_alt(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
     let h = rect.height();

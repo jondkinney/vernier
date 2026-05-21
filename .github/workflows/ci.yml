@@ -19,8 +19,17 @@ concurrency:
 
 jobs:
   fmt:
-    name: Format
-    runs-on: ubuntu-latest
+    name: Format (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          # Run fmt on both OSes: rustfmt only sees the cfg-gated
+          # source for the platform it runs on, so a macOS-only block
+          # stays unchecked until fmt runs on macOS too.
+          - ubuntu-latest
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

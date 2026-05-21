@@ -1,6 +1,8 @@
 # Plan: CI-gate follow-ups (lint debt + deprecations)
 
-**Status:** draft
+**Status:** in progress — **D1, C1, B1, C2 done** (2026-05-20, from
+Linux). **A1** (macOS, ScreenCaptureKit) and **C3** (test coverage)
+remain.
 
 **Context:** Two changes in quick succession exposed a backlog of
 code-quality debt:
@@ -112,7 +114,14 @@ problem in the freeze-frame path.
 
 ## Category B — Linux / Wayland-specific
 
-### B1. `large_enum_variant` on `enum Cmd`
+### B1. `large_enum_variant` on `enum Cmd` — ✅ done
+
+**Done (2026-05-20):** the offending variant was `OverlaySetHud`, not
+`CreateOverlay` — clippy reported the enum at 448 bytes because
+`Option<Hud>` is ~440 bytes inline. Fixed by boxing it to
+`OverlaySetHud(OverlayKey, Option<Box<Hud>>)` (`Option<Box<_>>` keeps
+the `None` case a no-alloc null pointer). `#[allow]` removed; the
+overlay-create path was untouched.
 
 **File:** `crates/vernier-platform/src/linux/wayland.rs:315`
 **Masked by:** `#[allow(clippy::large_enum_variant)]` on the enum.
@@ -143,7 +152,14 @@ These are shared code. The lints fire (or would fire) on every
 platform; they are not macOS bugs. They appear in this doc only
 because PR #15's `#[allow]` block bundled them in.
 
-### C1. Linux-only `ChipSeg` variants — cfg-gate properly
+### C1. Linux-only `ChipSeg` variants — cfg-gate properly — ✅ done
+
+**Done (2026-05-20):** `OmarchyLogo / Shift / Ctrl / Alt` and the
+`paint_shift / paint_caret / paint_alt` painters and
+`omarchy_font_available` are now `#[cfg(not(target_os = "macos"))]`;
+the match arms that reference them are cfg-gated too. Blanket
+`#[allow(dead_code)]` removed.
+
 
 **File:** `crates/vernier-ui/src/prefs.rs`
 **Masked by:** `#[allow(dead_code)]` on `fn omarchy_font_available`
@@ -183,7 +199,21 @@ those arms.
 macOS-specific modifier variant — then the enum is already
 cfg-structured to take it.
 
-### C2. `too_many_arguments` × 8 functions
+### C2. `too_many_arguments` × 8 functions — ✅ done
+
+**Done (2026-05-20):** the table below was stale — there were
+**15** sites, not 8 (`handle_pointer_button` hid behind a combined
+`#[allow(clippy::ptr_arg, clippy::too_many_arguments)]`, and several
+others post-date the original survey; `apply_nudge_step` / `refresh_hud`
+ran 19–22 args). All 15 were refactored into context structs
+(`DrawCtx`, `StrokeKit`, `MeasureSession`, `SessionContent`,
+`HudScene`, `MeasurementView`, `NudgeRenderCtx`, `PointerButtonFlags`,
+… ~20 structs total). Every `#[allow(clippy::too_many_arguments)]` is
+gone; `handle_pointer_button` keeps its separate `ptr_arg` allow.
+Pure mechanical refactor — compiler + `clippy -D warnings` + tests
+pass. **Caveat:** same-typed argument transpositions at call sites
+are not caught by the compiler — smoke-test measure mode before
+relying on it.
 
 **Masked by:** `#[allow(clippy::too_many_arguments)]` at 8 sites.
 All **cross-platform** code — the rasterizer, the geometry crate, the
@@ -230,7 +260,11 @@ guard for the C1 cfg-gating work.
 
 ## Category D — CI / tooling
 
-### D1. Run `fmt` on macOS in CI
+### D1. Run `fmt` on macOS in CI — ✅ done
+
+**Done (2026-05-20):** the `fmt` job is now a matrix over
+`ubuntu-latest` + `macos-latest`.
+
 
 **File:** `.github/workflows/ci.yml`
 
@@ -261,18 +295,14 @@ on Mac" surprises. Bundle with the next CI tweak.
 
 ## Recommended order
 
-1. **D1 — fmt on macOS** (5 min) — quick win, stops future
-   Linux-clean/Mac-dirty surprises.
-2. **C1 — ChipSeg cfg-gating** (~30 min) — clears one `#[allow]`,
-   mechanical.
-3. **A1 — ScreenCaptureKit migration** (multi-session) — the only
+1. ✅ **D1 — fmt on macOS** — done 2026-05-20.
+2. ✅ **C1 — ChipSeg cfg-gating** — done 2026-05-20.
+3. ⬜ **A1 — ScreenCaptureKit migration** (multi-session) — the only
    item with an external deadline. Start the spike early even if the
    full migration waits.
-4. **B1 — `Cmd` Boxing** (~1 hour) — only after measuring that the
-   variant size matters.
-5. **C2 — `too_many_arguments`** (~half day) — incremental, do each
-   function when it next needs a change.
-6. **C3 — test coverage** (multi-session) — spin off into its own
+4. ✅ **B1 — `Cmd` Boxing** — done 2026-05-20.
+5. ✅ **C2 — `too_many_arguments`** — done 2026-05-20 (all 15 sites).
+6. ⬜ **C3 — test coverage** (multi-session) — spin off into its own
    plan.
 
 Only **A1** is genuinely macOS work. **B1** is Wayland. **C1/C2/C3**
