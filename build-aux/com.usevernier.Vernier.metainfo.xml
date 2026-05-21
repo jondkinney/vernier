@@ -37,6 +37,25 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.3.0" date="2026-05-21">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>paint the frozen screenshot as the overlay background</li>
+        </ul>
+        <p>Fixed:</p>
+        <ul>
+          <li>drop needless return in macOS handoff cfg block</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>group args into context structs (clippy::too_many_arguments)</li>
+          <li>get clippy and fmt clean on workspace (CI was failing)</li>
+          <li>clear CI-gate lint debt — fmt matrix, ChipSeg cfg, Cmd boxing</li>
+          <li>modernize objc2 usage, fix CGImage api, pin toolchain ([#15](https://github.com/jondkinney/vernier/pull/15))</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.6" date="2026-05-19"/>
   </releases>
   <url type="homepage">https://usevernier.com</url>
