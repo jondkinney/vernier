@@ -259,6 +259,74 @@ impl HudMeasurementFormat {
         format!("{}{}", self.format_number(value_logical), self.unit_suffix)
     }
 
+    /// Render a single measurement value carried as an EXACT physical-
+    /// pixel integer. This is THE single physical→logical conversion +
+    /// rounding point for the pixel-perfect measurement path: convert
+    /// to logical exactly once (`÷ scale_factor`), apply the Figma
+    /// `dimension_divisor`, then round per the configured mode.
+    ///
+    /// [`HudRounding::ScreenPixels`] is special-cased to return the
+    /// physical integer verbatim — no ÷scale/×scale round-trip — so an
+    /// N-physical-pixel target reads exactly `N`.
+    pub fn format_number_phys(&self, len_phys: i32) -> String {
+        let divisor = if self.dimension_divisor > 0.0 {
+            self.dimension_divisor
+        } else {
+            1.0
+        };
+        match self.rounding {
+            HudRounding::ScreenPixels => {
+                // Physical pixels already — apply only the Figma
+                // divisor, skipping the scale round-trip entirely.
+                let value = len_phys as f64 / divisor;
+                format!("{}", value.round() as i64)
+            }
+            HudRounding::Points => {
+                let value = (len_phys as f64 / self.scale_factor) / divisor;
+                let r = (value * 10.0).round() / 10.0;
+                if (r - r.round()).abs() < f64::EPSILON {
+                    format!("{}", r as i64)
+                } else {
+                    format!("{r:.1}")
+                }
+            }
+            HudRounding::PointsRounded => {
+                let value = (len_phys as f64 / self.scale_factor) / divisor;
+                format!("{}", value.round() as i64)
+            }
+        }
+    }
+
+    /// [`format_number_phys`](Self::format_number_phys) with the
+    /// configured unit suffix appended.
+    pub fn format_value_phys(&self, len_phys: i32) -> String {
+        format!("{}{}", self.format_number_phys(len_phys), self.unit_suffix)
+    }
+
+    /// Render a `W × H` label from EXACT physical-pixel integers — the
+    /// pixel-perfect counterpart to [`format_wh`](Self::format_wh).
+    /// Each value goes through [`format_number_phys`](Self::format_number_phys),
+    /// the single rounding point.
+    pub fn format_wh_phys(&self, w_phys: i32, h_phys: i32) -> String {
+        if self.wh_indicators {
+            format!(
+                "W: {}{} \u{00D7} H: {}{}",
+                self.format_number_phys(w_phys),
+                self.unit_suffix,
+                self.format_number_phys(h_phys),
+                self.unit_suffix,
+            )
+        } else {
+            format!(
+                "{}{} \u{00D7} {}{}",
+                self.format_number_phys(w_phys),
+                self.unit_suffix,
+                self.format_number_phys(h_phys),
+                self.unit_suffix,
+            )
+        }
+    }
+
     /// Render a `W × H` measurement label, applying the unit suffix
     /// and rounding mode to each value. Shared by the live crosshair
     /// readout, committed held rects, and the pill-layout sizer so
@@ -347,8 +415,17 @@ pub enum HudContextMenuIcon {
 /// the app loop when the cursor hovers the rect's pill.
 #[derive(Debug, Clone, Copy)]
 pub struct HeldRect {
+    /// One corner in logical pixels — DRAWING ONLY.
     pub rect_start: (f64, f64),
+    /// The opposite corner in logical pixels — DRAWING ONLY.
     pub rect_end: (f64, f64),
+    /// INCLUSIVE physical-pixel bounds `(left, top, right, bottom)` of
+    /// the rect's content — the value measurements are computed from.
+    /// Width is `right - left + 1`, height is `bottom - top + 1`. For
+    /// snapped/shrunk rects these come straight from `shrink_to_content`
+    /// (exact); for sessions restored from disk they're derived from
+    /// the logical corners (best-effort, pre-pixel-perfect saves).
+    pub bounds_phys: (i32, i32, i32, i32),
     pub camera_armed: bool,
     /// Foreground variant snapshotted at the moment this rect was
     /// placed. `false` uses `appearance.primary_color`, `true` uses
@@ -359,11 +436,11 @@ pub struct HeldRect {
 }
 
 /// A frozen single-axis measurement. Drawn as a coral line spanning
-/// `start..end` with tick caps on both ends and a pill showing the
-/// pixel length. Positions are kept as `f64` so the renderer can do
-/// the same `subtract-then-round` step the live W×H pill uses; if
-/// the endpoints were rounded individually before subtraction, HiDPI
-/// edge positions could drift the displayed length by 1 px.
+/// `start..end` (logical px, used for drawing only) with tick caps on
+/// both ends and a pill showing the pixel length. The displayed
+/// length is `len_phys` — an EXACT physical-pixel integer captured at
+/// freeze time — so the frozen readout is pixel-perfect and never
+/// drifts from the live crosshair value.
 #[derive(Debug, Clone, Copy)]
 pub struct StuckMeasurement {
     /// `Vertical` = a vertical line measuring up-to-down extent.
@@ -372,10 +449,14 @@ pub struct StuckMeasurement {
     /// Perpendicular position in logical px (x for Vertical,
     /// y for Horizontal).
     pub at: f64,
-    /// Start of the measured span in logical px.
+    /// Start of the measured span in logical px. DRAWING ONLY.
     pub start: f64,
-    /// End of the measured span in logical px.
+    /// End of the measured span in logical px. DRAWING ONLY.
     pub end: f64,
+    /// The measured length in EXACT physical pixels. This is the
+    /// value rendered in the pill — fed straight to
+    /// [`HudMeasurementFormat::format_value_phys`].
+    pub len_phys: i32,
     /// User-applied translation of the value pill, in logical px,
     /// from its computed default anchor. Clamped to ±50 in each
     /// axis at the input layer (click-and-drag on the pill). The
@@ -508,7 +589,16 @@ pub enum HudKind {
 #[derive(Debug, Clone, Copy)]
 pub struct HudEdge {
     pub axis: HudAxis,
+    /// Logical-pixel position on the surface. RENDERING ONLY — used to
+    /// draw the snapped axis line / tick. Carries a draw-time inset
+    /// (the crosshair "step back one pixel") so the line stops short
+    /// of the detected border; it must never be used to measure.
     pub position: (f64, f64),
+    /// True integer physical-pixel coordinate of this edge — the
+    /// inclusive content pixel the scan landed on. This is the value
+    /// measurements are computed from (`right - left + 1`, etc.). No
+    /// inset, no rounding noise.
+    pub pos_phys: (i32, i32),
     pub distance_px: u32,
 }
 
@@ -824,3 +914,33 @@ pub enum PlatformEvent {
 pub type EventReceiver = mpsc::Receiver<PlatformEvent>;
 #[allow(dead_code)]
 pub(crate) type EventSender = mpsc::Sender<PlatformEvent>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target that is N physical pixels must read exactly N in
+    /// `ScreenPixels` mode, and `N / scale` rounded in `PointsRounded`.
+    /// Exercise both modes through the single physical-pixel formatter.
+    #[test]
+    fn format_wh_phys_single_rounding_point() {
+        let base = HudMeasurementFormat {
+            scale_factor: 1.6,
+            ..HudMeasurementFormat::default()
+        };
+
+        // PointsRounded: 400 physical px ÷ 1.6 = 250 logical px.
+        let pts = HudMeasurementFormat {
+            rounding: HudRounding::PointsRounded,
+            ..base.clone()
+        };
+        assert_eq!(pts.format_wh_phys(400, 400), "250px \u{00D7} 250px");
+
+        // ScreenPixels: physical integer passes through verbatim.
+        let screen = HudMeasurementFormat {
+            rounding: HudRounding::ScreenPixels,
+            ..base
+        };
+        assert_eq!(screen.format_wh_phys(400, 400), "400px \u{00D7} 400px");
+    }
+}

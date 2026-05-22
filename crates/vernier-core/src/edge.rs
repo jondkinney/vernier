@@ -141,6 +141,12 @@ fn scan(
 /// pixel by more than `tolerance`. Useful for "fit-to-content" snapping
 /// on a user-dragged region.
 ///
+/// The returned `(left, top, right, bottom)` are INCLUSIVE content-pixel
+/// bounds: `left`/`top` is the first content pixel and `right`/`bottom`
+/// is the last content pixel. An N-physical-pixel-wide region therefore
+/// has `right - left + 1 == N` (likewise `bottom - top + 1` for height).
+/// Callers measuring the region must add the `+1` themselves.
+///
 /// Coordinates are in frame pixel space and may extend outside the
 /// frame; they're clamped before scanning. If shrinking would
 /// degenerate the rect to zero/negative area, the original
@@ -164,6 +170,10 @@ pub fn shrink_to_content(
 /// reference pixel explicitly. Useful for resize, where the rect's
 /// own top-left can land inside content and the default sample would
 /// collapse the algorithm.
+///
+/// As with [`shrink_to_content`], the returned `(left, top, right,
+/// bottom)` are INCLUSIVE content-pixel bounds — width is
+/// `right - left + 1`, height is `bottom - top + 1`.
 pub fn shrink_to_content_with_bg(
     frame: &FrameView,
     x0: i32,

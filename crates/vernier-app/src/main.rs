@@ -1355,15 +1355,17 @@ fn run_daemon() -> Result<()> {
                                 let hi_x = rect.rect_start.0.max(rect.rect_end.0);
                                 let lo_y = rect.rect_start.1.min(rect.rect_end.1);
                                 let hi_y = rect.rect_start.1.max(rect.rect_end.1);
-                                let (snapped_lo, snapped_hi) = snap_shrink_resize(
+                                let (snapped_lo, snapped_hi, snapped_bounds) = snap_shrink_resize(
                                     frozen_frame.as_ref(),
                                     (lo_x, lo_y),
                                     (hi_x, hi_y),
                                     op.handle,
                                     current_tol_value(tol_level),
+                                    rect.bounds_phys,
                                 );
                                 rect.rect_start = snapped_lo;
                                 rect.rect_end = snapped_hi;
+                                rect.bounds_phys = snapped_bounds;
                             }
                         }
                         last_hud_redraw = Instant::now();
@@ -6200,6 +6202,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
         .map(|r| HeldRect {
             rect_start: r.rect_start,
             rect_end: r.rect_end,
+            bounds_phys: r.bounds_phys,
             color_alternate: r.color_alternate,
             camera_armed: cursor_over_pill(
                 cursor_px,
@@ -6559,20 +6562,36 @@ fn freeze_axis_measurement(
     surface_h: u32,
     color_alternate: bool,
 ) -> StuckMeasurement {
-    // Keep edge positions as floats so the renderer's pill text
-    // matches the live W×H readout (subtract first, then round).
-    // Rounding individually here loses the sub-pixel info detected
-    // on HiDPI displays and was the source of an off-by-1 between
-    // live and frozen values.
+    // The measured length is an EXACT physical-pixel integer derived
+    // from the two edges' `pos_phys`. `start`/`end` (logical) are kept
+    // only so the renderer can draw the line; the displayed value
+    // comes from `len_phys`.
+    //
+    // Inclusivity rule: when BOTH ends are real detected/guide edges,
+    // both are inclusive content pixels, so the span is
+    // `far - near + 1`. When an end falls through to the screen
+    // border, that border is an EXCLUSIVE buffer extent, so the `+1`
+    // is dropped on that side. With one inclusive + one exclusive end
+    // the length is simply `far - near` (no `+1`).
+    let scale = primary_scale_factor();
     match axis {
         GuideAxis::Vertical => {
             let up = edges[2].map(|e| e.position.1).unwrap_or(0.0);
             let down = edges[3].map(|e| e.position.1).unwrap_or(surface_h as f64);
+            let up_phys = edges[2].map(|e| e.pos_phys.1);
+            let down_phys = edges[3].map(|e| e.pos_phys.1);
+            let len_phys = inclusive_span_phys(
+                up_phys,
+                0,
+                down_phys,
+                (surface_h as f64 * scale).round() as i32,
+            );
             StuckMeasurement {
                 axis,
                 at: x,
                 start: up,
                 end: down,
+                len_phys,
                 pill_offset: (0.0, 0.0),
                 color_alternate,
                 hovered: false,
@@ -6581,11 +6600,20 @@ fn freeze_axis_measurement(
         GuideAxis::Horizontal => {
             let left = edges[0].map(|e| e.position.0).unwrap_or(0.0);
             let right = edges[1].map(|e| e.position.0).unwrap_or(surface_w as f64);
+            let left_phys = edges[0].map(|e| e.pos_phys.0);
+            let right_phys = edges[1].map(|e| e.pos_phys.0);
+            let len_phys = inclusive_span_phys(
+                left_phys,
+                0,
+                right_phys,
+                (surface_w as f64 * scale).round() as i32,
+            );
             StuckMeasurement {
                 axis,
                 at: y,
                 start: left,
                 end: right,
+                len_phys,
                 pill_offset: (0.0, 0.0),
                 color_alternate,
                 hovered: false,
@@ -6594,11 +6622,40 @@ fn freeze_axis_measurement(
     }
 }
 
+/// Physical-pixel length between a `near` edge and a `far` edge,
+/// applying the inclusive/exclusive rule from the pixel-perfect
+/// conventions:
+///
+/// - Both ends are real content edges (`Some`) → both inclusive →
+///   `far - near + 1`.
+/// - An end is `None` → it falls back to the screen border, an
+///   EXCLUSIVE buffer extent → drop that side's `+1`.
+///
+/// `near_fallback` / `far_fallback` are the physical border extents
+/// used when the respective edge is missing.
+fn inclusive_span_phys(
+    near: Option<i32>,
+    near_fallback: i32,
+    far: Option<i32>,
+    far_fallback: i32,
+) -> i32 {
+    let near_pos = near.unwrap_or(near_fallback);
+    let far_pos = far.unwrap_or(far_fallback);
+    // `+1` only when BOTH bounds are inclusive content pixels.
+    let plus_one = i32::from(near.is_some() && far.is_some());
+    (far_pos - near_pos).abs() + plus_one
+}
+
 /// Mutate `edges` so each guide that lies between the cursor and an
 /// existing edge takes that edge's slot — effectively making guides
 /// behave like detected pixel boundaries. Slot order matches
 /// [`detect_edges`]: 0=Left, 1=Right, 2=Up, 3=Down.
 fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: f64, y: f64) {
+    // Guide positions are integer LOGICAL pixels; fold them into the
+    // physical-pixel measurement space exactly once here (rounded), so
+    // downstream `pos_phys` arithmetic stays integer.
+    let scale = primary_scale_factor();
+    let to_phys = |logical: f64| (logical * scale).round() as i32;
     for guide in guides {
         match guide.axis {
             GuideAxis::Vertical => {
@@ -6609,6 +6666,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[0] = Some(HudEdge {
                             axis: HudAxis::Left,
                             position: (guide.position as f64, y),
+                            pos_phys: (to_phys(guide.position as f64), to_phys(y)),
                             distance_px: dist,
                         });
                     }
@@ -6618,6 +6676,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[1] = Some(HudEdge {
                             axis: HudAxis::Right,
                             position: (guide.position as f64, y),
+                            pos_phys: (to_phys(guide.position as f64), to_phys(y)),
                             distance_px: dist,
                         });
                     }
@@ -6631,6 +6690,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[2] = Some(HudEdge {
                             axis: HudAxis::Up,
                             position: (x, guide.position as f64),
+                            pos_phys: (to_phys(x), to_phys(guide.position as f64)),
                             distance_px: dist,
                         });
                     }
@@ -6640,6 +6700,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, guide.position as f64),
+                            pos_phys: (to_phys(x), to_phys(guide.position as f64)),
                             distance_px: dist,
                         });
                     }
@@ -6660,11 +6721,14 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
 /// sides within the horizontal span), so a side acts as an edge only
 /// where a pixel-detection ray would actually have crossed it.
 ///
-/// Each snap lands one logical pixel *outside* the rect border,
-/// stepping back into the anchor region — the same one-pixel step
-/// `convert_edges_to_surface` applies to detected pixel edges — so
-/// the measurement line stops just short of the border instead of
-/// drawing on top of it.
+/// The drawn `position` lands one logical pixel *inside* the rect
+/// border, stepping back into the anchor region — the same one-pixel
+/// step `convert_edges_to_surface` applies to detected pixel edges —
+/// so the measurement line stops just short of the border instead of
+/// drawing on top of it. That inset is a RENDERING concern only:
+/// `pos_phys` carries the rect's true integer physical-pixel border
+/// (from `bounds_phys`, the inclusive content bounds) so the measured
+/// value is exact.
 fn apply_held_rects_to_edges(
     edges: &mut [Option<HudEdge>; 4],
     held_rects: &[HeldRect],
@@ -6680,20 +6744,23 @@ fn apply_held_rects_to_edges(
         let max_x = rect.rect_start.0.max(rect.rect_end.0);
         let min_y = rect.rect_start.1.min(rect.rect_end.1);
         let max_y = rect.rect_start.1.max(rect.rect_end.1);
+        let (px_left, px_top, px_right, px_bot) = rect.bounds_phys;
         // Left/right sides snap horizontally — only while the cursor
         // is level with the rect.
         if y >= min_y && y <= max_y {
-            for side_x in [min_x, max_x] {
+            for (side_x, side_px) in [(min_x, px_left), (max_x, px_right)] {
                 let dx = side_x - x;
                 if dx <= -1.0 {
-                    // Side is left of the cursor: step the snap one px
-                    // right (toward the cursor) so it stops before the
-                    // border, not on it.
+                    // Side is left of the cursor: step the drawn snap
+                    // one px right (toward the cursor) so the line
+                    // stops before the border, not on it. `pos_phys`
+                    // stays the exact border pixel.
                     let dist = ((-dx) as u32).saturating_sub(1);
                     if edges[0].is_none_or(|e| e.distance_px > dist) {
                         edges[0] = Some(HudEdge {
                             axis: HudAxis::Left,
                             position: (side_x + 1.0, y),
+                            pos_phys: (side_px, edge_pos_phys_y(edges, y)),
                             distance_px: dist,
                         });
                     }
@@ -6703,6 +6770,7 @@ fn apply_held_rects_to_edges(
                         edges[1] = Some(HudEdge {
                             axis: HudAxis::Right,
                             position: (side_x - 1.0, y),
+                            pos_phys: (side_px, edge_pos_phys_y(edges, y)),
                             distance_px: dist,
                         });
                     }
@@ -6712,7 +6780,7 @@ fn apply_held_rects_to_edges(
         // Top/bottom sides snap vertically — only while the cursor is
         // within the rect's horizontal span.
         if x >= min_x && x <= max_x {
-            for side_y in [min_y, max_y] {
+            for (side_y, side_py) in [(min_y, px_top), (max_y, px_bot)] {
                 let dy = side_y - y;
                 if dy <= -1.0 {
                     let dist = ((-dy) as u32).saturating_sub(1);
@@ -6720,6 +6788,7 @@ fn apply_held_rects_to_edges(
                         edges[2] = Some(HudEdge {
                             axis: HudAxis::Up,
                             position: (x, side_y + 1.0),
+                            pos_phys: (edge_pos_phys_x(edges, x), side_py),
                             distance_px: dist,
                         });
                     }
@@ -6729,6 +6798,7 @@ fn apply_held_rects_to_edges(
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, side_y - 1.0),
+                            pos_phys: (edge_pos_phys_x(edges, x), side_py),
                             distance_px: dist,
                         });
                     }
@@ -6736,6 +6806,19 @@ fn apply_held_rects_to_edges(
             }
         }
     }
+}
+
+/// Physical-pixel x for a cursor-anchored edge. The perpendicular
+/// coordinate of a held-rect snap edge only matters for drawing the
+/// tick mark, so derive it from the cursor's logical x.
+fn edge_pos_phys_x(_edges: &[Option<HudEdge>; 4], x: f64) -> i32 {
+    (x * primary_scale_factor()).round() as i32
+}
+
+/// Physical-pixel y for a cursor-anchored edge — companion to
+/// [`edge_pos_phys_x`].
+fn edge_pos_phys_y(_edges: &[Option<HudEdge>; 4], y: f64) -> i32 {
+    (y * primary_scale_factor()).round() as i32
 }
 
 /// True when the cursor is over the W×H / camera-icon pill of any
@@ -7061,6 +7144,11 @@ fn apply_resize(
     }
     rect.rect_start = (lo_x, lo_y);
     rect.rect_end = (hi_x, hi_y);
+    // Mid-resize the rect tracks the cursor (an integer logical pixel),
+    // so the bounds can only be best-effort here — derived from the
+    // logical corners. The release handler (`snap_shrink_resize`)
+    // restores exact physical bounds from `shrink_to_content`.
+    rect.bounds_phys = logical_corners_to_phys_bounds((lo_x, lo_y), (hi_x, hi_y));
 }
 
 /// True when `cursor` (logical pixels) is inside the held rectangle.
@@ -7113,10 +7201,14 @@ fn convert_edges_to_surface(edges: &EdgeQuad, scale_x: f64, scale_y: f64) -> [Op
     for (slot, candidate) in out.iter_mut().zip(edges.iter()) {
         if let Some(c) = candidate {
             // detect_edges returns the FIRST pixel that exceeds tolerance
-            // — i.e., the first different-color pixel ACROSS the boundary.
-            // For visual snap, step back one pixel into the anchor region
-            // so the line stops on the last same-color pixel. Matches
-            //
+            // — the first different-color pixel ACROSS the boundary, i.e.
+            // one pixel OUTSIDE the anchor's region. Step one pixel back
+            // toward the anchor (`dx`/`dy`) to land on the last in-region
+            // pixel — that is the inclusive content edge. `pos_phys`
+            // carries its true integer physical coordinate, and the
+            // measurement spans those inclusive edges as `right - left
+            // + 1`. The drawn `position` uses the same stepped-back
+            // point so the snapped line sits on the content edge.
             let (dx, dy, axis) = match c.direction {
                 Direction::Left => (1, 0, HudAxis::Left),
                 Direction::Right => (-1, 0, HudAxis::Right),
@@ -7128,6 +7220,7 @@ fn convert_edges_to_surface(edges: &EdgeQuad, scale_x: f64, scale_y: f64) -> [Op
             *slot = Some(HudEdge {
                 axis,
                 position: (adj_x as f64 * inv_x, adj_y as f64 * inv_y),
+                pos_phys: (adj_x, adj_y),
                 distance_px: c.distance.saturating_sub(1),
             });
         }
@@ -7275,7 +7368,7 @@ fn handle_pointer_button(
             (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
         };
         // Snap-shrink to fit content.
-        let (snapped_start, snapped_end) =
+        let (snapped_start, snapped_end, bounds_phys) =
             snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance);
         let measurement = Measurement::new(
             SnapPoint::loose(Px::new(
@@ -7308,6 +7401,7 @@ fn handle_pointer_button(
         held_rects.push(HeldRect {
             rect_start: snapped_start,
             rect_end: snapped_end,
+            bounds_phys,
             camera_armed: false,
             color_alternate,
         });
@@ -7327,21 +7421,33 @@ fn handle_pointer_button(
     ButtonOutcome::None
 }
 
+/// A snapped rectangle result: logical `(start, end)` corners for
+/// drawing, plus inclusive physical-pixel bounds `(left, top, right,
+/// bottom)` for measurement.
+type SnappedRect = ((f64, f64), (f64, f64), (i32, i32, i32, i32));
+
 /// Apply [`shrink_to_content`] to a rect given in surface (logical)
 /// coords. Maps logical → frame coords, runs the shrink, maps back.
+///
+/// Returns both the logical corners (for drawing) AND the inclusive
+/// physical-pixel bounds `(left, top, right, bottom)` straight from
+/// `shrink_to_content` — the latter is what measurement is computed
+/// from, so it never round-trips through logical space and stays
+/// pixel-exact. When there's no frame to scan, the physical bounds
+/// are derived from the (un-shrunk) logical corners as a best effort.
 fn snap_shrink_logical_rect(
     frozen_frame: Option<&vernier_platform::NativeFrame>,
     a: (f64, f64),
     b: (f64, f64),
     tolerance: u32,
-) -> ((f64, f64), (f64, f64)) {
+) -> SnappedRect {
     let Some(frame) = frozen_frame else {
-        return (a, b);
+        return (a, b, logical_corners_to_phys_bounds(a, b));
     };
     let surface_w = frame.bounds.w as f64;
     let surface_h = frame.bounds.h as f64;
     if surface_w <= 0.0 || surface_h <= 0.0 {
-        return (a, b);
+        return (a, b, logical_corners_to_phys_bounds(a, b));
     }
     let scale_x = frame.width as f64 / surface_w;
     let scale_y = frame.height as f64 / surface_h;
@@ -7361,7 +7467,23 @@ fn snap_shrink_logical_rect(
     (
         (sx0 as f64 * inv_x, sy0 as f64 * inv_y),
         (sx1 as f64 * inv_x, sy1 as f64 * inv_y),
+        // INCLUSIVE physical-pixel bounds, normalized lo→hi. These
+        // are exact frame pixels — width is `right - left + 1`.
+        (sx0.min(sx1), sy0.min(sy1), sx0.max(sx1), sy0.max(sy1)),
     )
+}
+
+/// Best-effort physical-pixel bounds from logical corners — used only
+/// when no frame is available to run `shrink_to_content` against (and
+/// for sessions restored from disk). Rounds each corner to the
+/// physical grid; `right`/`bottom` are treated as inclusive content
+/// pixels so width stays `right - left + 1`.
+fn logical_corners_to_phys_bounds(a: (f64, f64), b: (f64, f64)) -> (i32, i32, i32, i32) {
+    let scale = primary_scale_factor();
+    let to_phys = |v: f64| (v * scale).round() as i32;
+    let (ax, bx) = (to_phys(a.0), to_phys(b.0));
+    let (ay, by) = (to_phys(a.1), to_phys(b.1));
+    (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
 }
 
 /// Snap-shrink a held rect after a resize-release. Only the side(s)
@@ -7370,20 +7492,26 @@ fn snap_shrink_logical_rect(
 /// OUTSIDE the un-moved corner / edge — sampling the rect's own
 /// top-left (the default) breaks down once the user drags the rect
 /// so its top-left lands inside content.
+///
+/// `prev_bounds_phys` is the rect's current inclusive physical bounds;
+/// sides the handle did NOT move keep their value from it so the
+/// measurement stays pixel-exact on the un-snapped axes. The snapped
+/// sides come straight from `shrink_to_content` (exact frame pixels).
 fn snap_shrink_resize(
     frozen_frame: Option<&vernier_platform::NativeFrame>,
     rect_lo: (f64, f64),
     rect_hi: (f64, f64),
     handle: ResizeHandle,
     tolerance: u32,
-) -> ((f64, f64), (f64, f64)) {
+    prev_bounds_phys: (i32, i32, i32, i32),
+) -> SnappedRect {
     let Some(frame) = frozen_frame else {
-        return (rect_lo, rect_hi);
+        return (rect_lo, rect_hi, prev_bounds_phys);
     };
     let surface_w = frame.bounds.w as f64;
     let surface_h = frame.bounds.h as f64;
     if surface_w <= 0.0 || surface_h <= 0.0 {
-        return (rect_lo, rect_hi);
+        return (rect_lo, rect_hi, prev_bounds_phys);
     }
     let scale_x = frame.width as f64 / surface_w;
     let scale_y = frame.height as f64 / surface_h;
@@ -7423,23 +7551,48 @@ fn snap_shrink_resize(
     );
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
-    let snapped_lo_x = match handle {
-        Left | TopLeft | BottomLeft => sx0 as f64 * inv_x,
-        _ => rect_lo.0,
+    let (prev_left, prev_top, prev_right, prev_bot) = prev_bounds_phys;
+    let snaps_left = matches!(handle, Left | TopLeft | BottomLeft);
+    let snaps_right = matches!(handle, Right | TopRight | BottomRight);
+    let snaps_top = matches!(handle, Top | TopLeft | TopRight);
+    let snaps_bot = matches!(handle, Bottom | BottomLeft | BottomRight);
+    let snapped_lo_x = if snaps_left {
+        sx0 as f64 * inv_x
+    } else {
+        rect_lo.0
     };
-    let snapped_hi_x = match handle {
-        Right | TopRight | BottomRight => sx1 as f64 * inv_x,
-        _ => rect_hi.0,
+    let snapped_hi_x = if snaps_right {
+        sx1 as f64 * inv_x
+    } else {
+        rect_hi.0
     };
-    let snapped_lo_y = match handle {
-        Top | TopLeft | TopRight => sy0 as f64 * inv_y,
-        _ => rect_lo.1,
+    let snapped_lo_y = if snaps_top {
+        sy0 as f64 * inv_y
+    } else {
+        rect_lo.1
     };
-    let snapped_hi_y = match handle {
-        Bottom | BottomLeft | BottomRight => sy1 as f64 * inv_y,
-        _ => rect_hi.1,
+    let snapped_hi_y = if snaps_bot {
+        sy1 as f64 * inv_y
+    } else {
+        rect_hi.1
     };
-    ((snapped_lo_x, snapped_lo_y), (snapped_hi_x, snapped_hi_y))
+    // Snapped sides take the exact frame pixel from `shrink_to_content`;
+    // un-snapped sides keep their previous physical bound untouched.
+    let bounds_phys = (
+        if snaps_left { sx0.min(sx1) } else { prev_left },
+        if snaps_top { sy0.min(sy1) } else { prev_top },
+        if snaps_right {
+            sx0.max(sx1)
+        } else {
+            prev_right
+        },
+        if snaps_bot { sy0.max(sy1) } else { prev_bot },
+    );
+    (
+        (snapped_lo_x, snapped_lo_y),
+        (snapped_hi_x, snapped_hi_y),
+        bounds_phys,
+    )
 }
 
 fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {
@@ -7567,9 +7720,21 @@ fn save_session(
     let mut s = String::new();
     s.push_str("# vernier session v1\n");
     for r in rects {
+        // v3 rect line: logical corners, color-alt flag, then the four
+        // inclusive physical-pixel bounds so a restored measurement is
+        // pixel-exact. Older readers stop at the 6-token form and
+        // recompute bounds from the logical corners.
         s.push_str(&format!(
-            "rect {} {} {} {} {}\n",
-            r.rect_start.0, r.rect_start.1, r.rect_end.0, r.rect_end.1, r.color_alternate as u8,
+            "rect {} {} {} {} {} {} {} {} {}\n",
+            r.rect_start.0,
+            r.rect_start.1,
+            r.rect_end.0,
+            r.rect_end.1,
+            r.color_alternate as u8,
+            r.bounds_phys.0,
+            r.bounds_phys.1,
+            r.bounds_phys.2,
+            r.bounds_phys.3,
         ));
     }
     for g in guides {
@@ -7587,12 +7752,28 @@ fn save_session(
             GuideAxis::Horizontal => "h",
             GuideAxis::Vertical => "v",
         };
+        // v4 stuck line: trailing `len_phys` so the frozen pixel
+        // value survives a round-trip exactly. Older readers stop at
+        // the 8-token form and recompute length from start/end.
         s.push_str(&format!(
-            "stuck {axis} {} {} {} {} {} {}\n",
-            m.at, m.start, m.end, m.pill_offset.0, m.pill_offset.1, m.color_alternate as u8,
+            "stuck {axis} {} {} {} {} {} {} {}\n",
+            m.at,
+            m.start,
+            m.end,
+            m.pill_offset.0,
+            m.pill_offset.1,
+            m.color_alternate as u8,
+            m.len_phys,
         ));
     }
     std::fs::write(&path, s)
+}
+
+/// Best-effort physical length for a stuck measurement restored from a
+/// pre-pixel-perfect session — the logical span scaled to physical
+/// pixels. Newer saves carry an exact `len_phys` and skip this.
+fn legacy_len_phys(start: f64, end: f64) -> i32 {
+    ((end - start).abs() * primary_scale_factor()).round() as i32
 }
 
 /// Load whatever was last saved. Returns empty vecs if no session
@@ -7620,6 +7801,9 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     rects.push(HeldRect {
                         rect_start: (ax, ay),
                         rect_end: (bx, by),
+                        // Pre-pixel-perfect save: no physical bounds
+                        // stored — recompute from the logical corners.
+                        bounds_phys: logical_corners_to_phys_bounds((ax, ay), (bx, by)),
                         camera_armed: false,
                         color_alternate: false,
                     });
@@ -7638,6 +7822,31 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     rects.push(HeldRect {
                         rect_start: (ax, ay),
                         rect_end: (bx, by),
+                        bounds_phys: logical_corners_to_phys_bounds((ax, ay), (bx, by)),
+                        camera_armed: false,
+                        color_alternate: alt != 0,
+                    });
+                }
+            }
+            // v3 rect line: color-alt flag + four inclusive physical-
+            // pixel bounds (left, top, right, bottom) for pixel-exact
+            // restore.
+            ["rect", a, b, c, d, alt, pl, pt, pr, pb] => {
+                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by), Ok(alt), Ok(pl), Ok(pt), Ok(pr), Ok(pb)) = (
+                    a.parse::<f64>(),
+                    b.parse::<f64>(),
+                    c.parse::<f64>(),
+                    d.parse::<f64>(),
+                    alt.parse::<u8>(),
+                    pl.parse::<i32>(),
+                    pt.parse::<i32>(),
+                    pr.parse::<i32>(),
+                    pb.parse::<i32>(),
+                ) {
+                    rects.push(HeldRect {
+                        rect_start: (ax, ay),
+                        rect_end: (bx, by),
+                        bounds_phys: (pl, pt, pr, pb),
                         camera_armed: false,
                         color_alternate: alt != 0,
                     });
@@ -7685,12 +7894,17 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     "v" => GuideAxis::Vertical,
                     _ => continue,
                 };
-                if let (Ok(at), Ok(start), Ok(end)) = (at.parse(), start.parse(), end.parse()) {
+                if let (Ok(at), Ok(start), Ok(end)) =
+                    (at.parse::<f64>(), start.parse::<f64>(), end.parse::<f64>())
+                {
                     stuck.push(StuckMeasurement {
                         axis: ax,
                         at,
                         start,
                         end,
+                        // Pre-pixel-perfect save: derive a physical
+                        // length from the logical span.
+                        len_phys: legacy_len_phys(start, end),
                         pill_offset: (0.0, 0.0),
                         color_alternate: false,
                         hovered: false,
@@ -7707,17 +7921,18 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     _ => continue,
                 };
                 if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy)) = (
-                    at.parse(),
-                    start.parse(),
-                    end.parse(),
-                    ox.parse(),
-                    oy.parse(),
+                    at.parse::<f64>(),
+                    start.parse::<f64>(),
+                    end.parse::<f64>(),
+                    ox.parse::<f64>(),
+                    oy.parse::<f64>(),
                 ) {
                     stuck.push(StuckMeasurement {
                         axis: ax,
                         at,
                         start,
                         end,
+                        len_phys: legacy_len_phys(start, end),
                         pill_offset: (ox, oy),
                         color_alternate: false,
                         hovered: false,
@@ -7744,6 +7959,35 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                         at,
                         start,
                         end,
+                        len_phys: legacy_len_phys(start, end),
+                        pill_offset: (ox, oy),
+                        color_alternate: alt != 0,
+                        hovered: false,
+                    });
+                }
+            }
+            // v4 stuck-line format: trailing exact physical length.
+            ["stuck", axis, at, start, end, ox, oy, alt, len] => {
+                let ax = match *axis {
+                    "h" => GuideAxis::Horizontal,
+                    "v" => GuideAxis::Vertical,
+                    _ => continue,
+                };
+                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy), Ok(alt), Ok(len)) = (
+                    at.parse::<f64>(),
+                    start.parse::<f64>(),
+                    end.parse::<f64>(),
+                    ox.parse::<f64>(),
+                    oy.parse::<f64>(),
+                    alt.parse::<u8>(),
+                    len.parse::<i32>(),
+                ) {
+                    stuck.push(StuckMeasurement {
+                        axis: ax,
+                        at,
+                        start,
+                        end,
+                        len_phys: len,
                         pill_offset: (ox, oy),
                         color_alternate: alt != 0,
                         hovered: false,
