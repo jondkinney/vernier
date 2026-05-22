@@ -507,10 +507,10 @@ fn render_static_strokes(
     };
 
     let stroke = Stroke {
-        // Hard 2 physical pixels regardless of buffer scale — narrow
-        // enough not to obscure the pixel boundary being measured,
-        // wide enough to stay legible against busy backgrounds.
-        width: 2.0,
+        // 1 logical pixel = `scale` physical px. Narrow enough not to
+        // obscure the pixel boundary being measured, wide enough to
+        // stay legible — and crisp on a 1x display instead of doubled.
+        width: scale as f32,
         ..Default::default()
     };
 
@@ -645,12 +645,13 @@ fn render_dynamic_strokes(
     let mut paint = Paint::default();
     paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
     paint.anti_alias = false;
+    // 1 logical pixel (`scale` physical px) — see render_static_strokes.
     let stroke = Stroke {
-        width: 2.0,
+        width: scale as f32,
         ..Default::default()
     };
     let tick_stroke = Stroke {
-        width: 2.0,
+        width: scale as f32,
         ..Default::default()
     };
 
@@ -905,8 +906,8 @@ fn draw_resize_cursor(
         &white,
         &Stroke {
             // Lighter white outline so the cursor stays slim against
-            // smaller geometry.
-            width: 4.0,
+            // smaller geometry. 2 logical px — scales with the buffer.
+            width: 2.0 * scale_f,
             line_join: LineJoin::Miter,
             ..Default::default()
         },
@@ -975,7 +976,8 @@ fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
             &path,
             &white,
             &Stroke {
-                width: 4.0,
+                // 2 logical px — scales with the buffer.
+                width: 2.0 * scale_f,
                 line_join: LineJoin::Miter,
                 ..Default::default()
             },
@@ -1010,12 +1012,13 @@ fn draw_stuck_measurements(
     use tiny_skia::*;
     let fmt = ctx.fmt;
     let scale_f = ctx.scale_f();
+    // 1 logical pixel — crisp at 1x, unchanged at HiDPI.
     let line_stroke = Stroke {
-        width: 2.0,
+        width: scale_f,
         ..Default::default()
     };
     let tick_stroke = Stroke {
-        width: 2.0,
+        width: scale_f,
         ..Default::default()
     };
     let tick_half = 5.0 * scale_f; // tick reach in buffer px
@@ -1518,8 +1521,9 @@ fn draw_hover_indicators(
             pb.move_to(cx, cy - arm);
             pb.line_to(cx, cy + arm);
             if let Some(path) = pb.finish() {
-                // Hard physical-pixel widths: 4 px white outline,
-                // 2 px black core, regardless of buffer scale.
+                // 1 logical-px black core under a white halo, both
+                // scaled to the buffer — crisp at 1x, unchanged at
+                // HiDPI (2 px core / 8 px halo at scale 2).
                 let mut outline = Paint::default();
                 outline.set_color_rgba8(255, 255, 255, 255);
                 outline.anti_alias = true;
@@ -1527,9 +1531,9 @@ fn draw_hover_indicators(
                     &path,
                     &outline,
                     &Stroke {
-                        // Total stroke = black core 2 + 3 px white
-                        // halo on each side.
-                        width: 8.0,
+                        // 4 logical px total (1 core + 1.5 halo each
+                        // side), scaled to the buffer.
+                        width: 4.0 * scale_f,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -1543,7 +1547,8 @@ fn draw_hover_indicators(
                     &path,
                     &fill,
                     &Stroke {
-                        width: 2.0,
+                        // 1 logical-px core.
+                        width: scale_f,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -2168,7 +2173,8 @@ fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_
     black.set_color_rgba8(0, 0, 0, 255);
     black.anti_alias = true;
     let stroke = Stroke {
-        width: 2.0,
+        // 1 logical px — scales with the buffer.
+        width: scale_f,
         line_join: LineJoin::Miter,
         ..Default::default()
     };
