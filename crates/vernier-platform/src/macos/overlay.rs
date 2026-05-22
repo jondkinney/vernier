@@ -844,7 +844,7 @@ fn transparent_cursor(view: &OverlayView) -> Retained<objc2_app_kit::NSCursor> {
 fn rasterize_layer_for_view(
     view: &OverlayView,
     hud: &Hud,
-    render_fn: fn(&mut [u8], u32, u32, u32, &Hud),
+    render_fn: fn(&mut [u8], u32, u32, f32, &Hud),
 ) -> Option<CFRetained<CGImage>> {
     let bounds = view.bounds();
     let scale = view
@@ -856,13 +856,7 @@ fn rasterize_layer_for_view(
     let phys_h = ((bounds.size.height * scale).round() as u32).max(1);
 
     let mut canvas = vec![0u8; (phys_w as usize) * (phys_h as usize) * 4];
-    render_fn(
-        &mut canvas,
-        phys_w,
-        phys_h,
-        scale.round().max(1.0) as u32,
-        hud,
-    );
+    render_fn(&mut canvas, phys_w, phys_h, scale as f32, hud);
 
     cgimage_from_rgba(&canvas, phys_w, phys_h)
 }

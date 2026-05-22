@@ -3731,6 +3731,7 @@ dependencies = [
  "usvg",
  "vernier-rs-core",
  "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

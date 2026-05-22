@@ -29,6 +29,7 @@ usvg = { version = "0.45", default-features = false }
 ksni = { version = "0.3", features = ["blocking"] }
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 ashpd = { version = "0.13", features = ["global_shortcuts", "screencast", "pipewire"] }
