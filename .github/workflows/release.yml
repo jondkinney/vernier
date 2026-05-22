@@ -45,7 +45,7 @@ jobs:
           echo "Building for tag=$TAG version=$VERSION"
 
       - name: Checkout source at tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
@@ -122,7 +122,7 @@ jobs:
           echo "Building for tag=$TAG version=$VERSION"
 
       - name: Checkout source at tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
@@ -197,7 +197,7 @@ jobs:
           echo "Building for tag=$TAG version=$VERSION"
 
       - name: Checkout source at tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
