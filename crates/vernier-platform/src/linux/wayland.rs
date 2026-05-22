@@ -51,6 +51,13 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 
 use crate::{
     Accelerator, AppIdentity, Color, EventReceiver, EventSender, Frame, HotkeyId, Hud, MonitorId,
@@ -461,6 +468,16 @@ struct WaylandState {
     /// it (Hyprland does). Used to display the user's actual theme
     /// pointer instead of a hand-drawn arrow.
     cursor_shape_manager: Option<CursorShapeManager>,
+    /// `wp_fractional_scale_manager_v1` global if the compositor offers
+    /// it. Lets us learn each surface's true (possibly fractional)
+    /// preferred scale so the overlay buffer renders at native
+    /// resolution instead of a rounded integer scale.
+    fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
+    /// `wp_viewporter` global if the compositor offers it. Paired with
+    /// fractional-scale: the buffer is sized to the fractional scale
+    /// and the viewport's `set_destination` maps it back to the
+    /// surface's logical dimensions.
+    viewporter: Option<WpViewporter>,
     /// `zwp_pointer_constraints_v1` global if the compositor offers
     /// it. We use `confine_pointer` to physically bound the cursor
     /// while a stuck-measurement pill is being dragged so the user
@@ -495,10 +512,19 @@ struct OverlayInst {
     monitor: MonitorId,
     width: u32,
     height: u32,
-    /// Buffer scale factor (HiDPI). Buffer dimensions = (width *
-    /// buffer_scale, height * buffer_scale). Set on the wl_surface so
-    /// the compositor doesn't upscale our pixels.
-    buffer_scale: i32,
+    /// True (possibly fractional) display scale, e.g. 1.6. Physical
+    /// buffer dimensions = ceil(width * frac_scale, height *
+    /// frac_scale). Seeded from the monitor's scale factor and
+    /// refined by `wp_fractional_scale_v1`'s `preferred_scale` event.
+    frac_scale: f32,
+    /// Per-surface viewport, present when `wp_viewporter` is bound. Its
+    /// `set_destination` maps the fractionally-scaled buffer back to
+    /// the surface's logical dimensions.
+    viewport: Option<WpViewport>,
+    /// Per-surface fractional-scale object, present when
+    /// `wp_fractional_scale_manager_v1` is bound. Delivers
+    /// `preferred_scale` events.
+    frac_scale_obj: Option<WpFractionalScaleV1>,
     configured: bool,
     visible_intent: bool,
     tint: Color,
@@ -555,6 +581,21 @@ struct OverlayInst {
     pixmap_buf_h: i32,
 }
 
+impl Drop for OverlayInst {
+    fn drop(&mut self) {
+        // Release the per-surface viewport + fractional-scale objects.
+        // Covers both teardown paths — `Cmd::OverlayDestroy` and
+        // `LayerShellHandler::closed` — since both `remove` the inst
+        // from the map, dropping it here.
+        if let Some(vp) = self.viewport.take() {
+            vp.destroy();
+        }
+        if let Some(fs) = self.frac_scale_obj.take() {
+            fs.destroy();
+        }
+    }
+}
+
 fn run_event_loop(
     cmd_rx: calloop::channel::Channel<Cmd>,
     cmd_tx: calloop::channel::Sender<Cmd>,
@@ -592,6 +633,22 @@ fn run_event_loop(
         }
     };
 
+    // Fractional-scale + viewporter: bind both or neither. With both we
+    // render the overlay buffer at the monitor's true fractional scale
+    // (e.g. 1.6×) and let the viewport map it back to logical size.
+    // Missing either ⇒ fall back to a rounded integer buffer scale.
+    let fractional_scale_manager: Option<WpFractionalScaleManagerV1> =
+        globals.bind(&qh, 1..=1, ()).ok();
+    if fractional_scale_manager.is_none() {
+        log::info!(
+            "wp_fractional_scale_v1 unavailable — overlay falls back to integer buffer scale"
+        );
+    }
+    let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    if viewporter.is_none() {
+        log::info!("wp_viewporter unavailable — overlay falls back to integer buffer scale");
+    }
+
     let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
     let mut state = WaylandState {
         registry,
@@ -607,6 +664,8 @@ fn run_event_loop(
         keyboards: Vec::new(),
         loop_handle: None,
         cursor_shape_manager,
+        fractional_scale_manager,
+        viewporter,
         pointer_constraints,
         active_confined_pointer: None,
         pointer_shape_devices: HashMap::new(),
@@ -785,18 +844,46 @@ impl WaylandState {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         layer.set_size(0, 0);
-        // HiDPI: tell the compositor our buffers are at the monitor's
-        // scale factor, so it shows them 1:1 without upscale blur.
-        let buffer_scale = self
+        // True (possibly fractional) display scale. Seed from the
+        // monitor's scale factor WITHOUT rounding — the fractional-
+        // scale event will refine it once the compositor knows which
+        // output the surface lives on.
+        let mut frac_scale = self
             .monitors_pub
             .lock()
             .unwrap()
             .iter()
             .find(|m| m.id == monitor)
-            .map(|m| m.scale_factor.round() as i32)
-            .unwrap_or(1)
-            .max(1);
-        layer.wl_surface().set_buffer_scale(buffer_scale);
+            .map(|m| m.scale_factor as f32)
+            .unwrap_or(1.0)
+            .max(1.0);
+
+        let key = OverlayKey(self.next_overlay_id);
+        self.next_overlay_id += 1;
+
+        // Per-surface viewport + fractional-scale objects. With both
+        // present the compositor shows our fractionally-scaled buffer
+        // at native resolution; the wl_surface buffer scale stays 1.
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|vp| vp.get_viewport(layer.wl_surface(), &qh, ()));
+        let frac_scale_obj = self
+            .fractional_scale_manager
+            .as_ref()
+            .map(|mgr| mgr.get_fractional_scale(layer.wl_surface(), &qh, key));
+        if viewport.is_some() && frac_scale_obj.is_some() {
+            // wp_fractional_scale spec: keep buffer scale at 1; the
+            // viewport carries the logical→buffer mapping instead.
+            layer.wl_surface().set_buffer_scale(1);
+        } else {
+            // Fallback: no fractional-scale support. Snap `frac_scale`
+            // to an integer so the ceil-sized buffer in `draw_overlay`
+            // matches the integer buffer scale declared here — the
+            // legacy HiDPI path.
+            frac_scale = frac_scale.round();
+            layer.wl_surface().set_buffer_scale(frac_scale as i32);
+        }
         // Empty input region = click-through. Measurement mode will swap this
         // for a full-coverage region when we want to capture mouse later.
         layer
@@ -804,8 +891,6 @@ impl WaylandState {
             .set_input_region(Some(self.empty_region.wl_region()));
         layer.commit();
 
-        let key = OverlayKey(self.next_overlay_id);
-        self.next_overlay_id += 1;
         let visible_atomic = Arc::new(AtomicBool::new(false));
 
         self.overlays.insert(
@@ -815,7 +900,9 @@ impl WaylandState {
                 monitor,
                 width: 0,
                 height: 0,
-                buffer_scale,
+                frac_scale,
+                viewport,
+                frac_scale_obj,
                 configured: false,
                 visible_intent: false,
                 tint: Color::rgba(0x00, 0x88, 0xFF, 0x40),
@@ -949,12 +1036,14 @@ impl WaylandState {
             inst.redraw_pending = true;
             return;
         }
-        let scale = inst.buffer_scale.max(1);
-        // Buffer is at PHYSICAL resolution (surface dims × buffer_scale).
-        // Compositor displays it 1:1 without upscaling, so all our
-        // strokes and text render at native HiDPI clarity.
-        let buf_w = inst.width as i32 * scale;
-        let buf_h = inst.height as i32 * scale;
+        let scale_f = inst.frac_scale.max(1.0);
+        // Buffer is at PHYSICAL resolution (surface dims × frac_scale).
+        // `ceil` so a fractional scale never under-sizes the buffer
+        // and leaves an uncovered logical strip. Compositor displays
+        // it 1:1 (via the viewport, or via buffer-scale in the integer
+        // fallback), so strokes and text render at native clarity.
+        let buf_w = (inst.width as f32 * scale_f).ceil() as i32;
+        let buf_h = (inst.height as f32 * scale_f).ceil() as i32;
         let stride = buf_w * 4;
 
         let (buffer, canvas) =
@@ -1032,7 +1121,7 @@ impl WaylandState {
                     &mut inst.combined_bg_static_pixmap,
                     buf_w as u32,
                     buf_h as u32,
-                    scale as u32,
+                    scale_f,
                     hud,
                 );
                 inst.combined_cache_key = Some(new_key);
@@ -1074,7 +1163,7 @@ impl WaylandState {
             // `OverlaySetHud` handler — it's drawn by the OS
             // pointer cursor instead, so the screencast portal
             // strips it from live captures.
-            render_dynamic_onto(canvas, buf_w as u32, buf_h as u32, scale as u32, hud);
+            render_dynamic_onto(canvas, buf_w as u32, buf_h as u32, scale_f, hud);
         } else {
             // Plain tint, no HUD.
             let pixel = rgba8888_premul(inst.tint);
@@ -1087,6 +1176,12 @@ impl WaylandState {
         if let Err(e) = buffer.attach_to(surface) {
             log::warn!("buffer attach failed: {e}");
             return;
+        }
+        // With a viewport active the buffer is at fractional physical
+        // resolution; map it to the surface's logical size so the
+        // compositor scales it 1:1 to native pixels.
+        if let Some(vp) = inst.viewport.as_ref() {
+            vp.set_destination(inst.width as i32, inst.height as i32);
         }
         // damage_buffer is in BUFFER coords — match the buffer dims.
         surface.damage_buffer(0, 0, buf_w, buf_h);
@@ -1131,17 +1226,25 @@ impl WaylandState {
                 self.next_monitor_id += 1;
                 id
             });
-            let (lw, lh) = info
-                .logical_size
-                .map(|(w, h)| (w as u32, h as u32))
-                .unwrap_or_else(|| {
-                    info.modes
-                        .iter()
-                        .find(|m| m.current)
-                        .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
-                        .unwrap_or((0, 0))
-                });
+            let logical = info.logical_size.map(|(w, h)| (w as u32, h as u32));
+            let current_mode = info.modes.iter().find(|m| m.current);
+            let (lw, lh) = logical.unwrap_or_else(|| {
+                current_mode
+                    .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
+                    .unwrap_or((0, 0))
+            });
             let (lx, ly) = info.logical_position.unwrap_or((0, 0));
+            // `wl_output`'s integer `scale_factor` rounds a fractional
+            // scale (1.6 → 2). When both the physical mode size and the
+            // logical size are known, derive the true (fractional)
+            // scale from their ratio; otherwise fall back to the
+            // rounded integer.
+            let scale_factor = match (logical, current_mode) {
+                (Some((log_w, _)), Some(m)) if log_w > 0 && m.dimensions.0 > 0 => {
+                    m.dimensions.0 as f64 / log_w as f64
+                }
+                _ => info.scale_factor as f64,
+            };
             vec.push(MonitorInfo {
                 id,
                 name: info
@@ -1149,7 +1252,7 @@ impl WaylandState {
                     .clone()
                     .unwrap_or_else(|| format!("{} {}", info.make, info.model)),
                 bounds: Rect::new(lx, ly, lw, lh),
-                scale_factor: info.scale_factor as f64,
+                scale_factor,
                 is_primary: vec.is_empty(),
             });
         }
@@ -1554,6 +1657,81 @@ impl Dispatch<wl_callback::WlCallback, OverlayKey> for WaylandState {
             if inst.redraw_pending {
                 inst.redraw_pending = false;
                 redraw_now = true;
+            }
+        }
+        if redraw_now {
+            state.draw_overlay(*data);
+        }
+    }
+}
+
+// --- Fractional-scale + viewporter Dispatch ------------------------------
+//
+// The two manager globals and the viewport object carry no events, so
+// their Dispatch impls are empty. Only `wp_fractional_scale_v1`
+// delivers an event (`preferred_scale`), handled below.
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: <WpViewporter as Proxy>::Event,
+        _data: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewport, ()> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: <WpViewport as Proxy>::Event,
+        _data: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// `preferred_scale` carries the compositor's suggested scale as the
+/// numerator of a fraction over 120 (so 192 ⇒ 1.6×). When it differs
+/// from our current `frac_scale` we adopt it, drop the bg+static cache
+/// (the buffer dims change), and redraw.
+impl Dispatch<WpFractionalScaleV1, OverlayKey> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        data: &OverlayKey,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
+            return;
+        };
+        let new = (scale as f32 / 120.0).max(1.0);
+        let mut redraw_now = false;
+        if let Some(inst) = state.overlays.get_mut(data) {
+            if (inst.frac_scale - new).abs() > f32::EPSILON {
+                inst.frac_scale = new;
+                // Buffer dims change ⇒ the pre-baked bg+static
+                // composite is stale.
+                inst.combined_cache_key = None;
+                redraw_now = inst.visible_intent;
             }
         }
         if redraw_now {

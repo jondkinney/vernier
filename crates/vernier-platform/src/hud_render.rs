@@ -52,8 +52,9 @@ struct BufSize {
 struct DrawCtx<'a> {
     /// Canvas dimensions in BUFFER pixels.
     buf: BufSize,
-    /// HiDPI scale factor (surface → buffer pixels).
-    scale: u32,
+    /// HiDPI scale factor (surface → buffer pixels). May be fractional
+    /// (e.g. 1.6) when the compositor advertises `wp_fractional_scale_v1`.
+    scale: f32,
     /// Unit / rounding / aspect settings for value formatting.
     fmt: &'a crate::HudMeasurementFormat,
 }
@@ -61,7 +62,7 @@ struct DrawCtx<'a> {
 impl DrawCtx<'_> {
     /// Scale factor as `f32` — most geometry math wants the float.
     fn scale_f(&self) -> f32 {
-        self.scale as f32
+        self.scale
     }
 }
 
@@ -311,7 +312,7 @@ fn push_text_in_box(
 /// want to skip the static rasterize on hot paths call
 /// [`render_static_into`] / [`render_dynamic_into`] directly and key
 /// the static layer off [`static_hash`].
-pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     fill_background(canvas, hud);
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
     render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
@@ -321,7 +322,7 @@ pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: 
 /// held rects, stuck measurements, guides — into a fresh transparent
 /// canvas. Pair with [`static_hash`] so the backend can skip this
 /// call entirely when the static-affecting inputs haven't changed.
-pub(crate) fn render_static_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+pub(crate) fn render_static_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     canvas.fill(0);
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
 }
@@ -335,7 +336,7 @@ pub(crate) fn render_dynamic_into(
     canvas: &mut [u8],
     buf_w: u32,
     buf_h: u32,
-    scale: u32,
+    scale: f32,
     hud: &Hud,
 ) {
     canvas.fill(0);
@@ -347,7 +348,7 @@ pub(crate) fn render_dynamic_into(
 /// there. Pair with [`render_dynamic_onto`] for backends that want to
 /// pre-composite background + static into a single cached buffer and
 /// avoid an extra full-buffer SrcOver per frame.
-pub(crate) fn render_static_onto(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+pub(crate) fn render_static_onto(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
 }
 
@@ -360,7 +361,7 @@ pub(crate) fn render_dynamic_onto(
     canvas: &mut [u8],
     buf_w: u32,
     buf_h: u32,
-    scale: u32,
+    scale: f32,
     hud: &Hud,
 ) {
     render_dynamic_layer(canvas, buf_w, buf_h, scale, hud);
@@ -465,7 +466,7 @@ fn fill_background(canvas: &mut [u8], hud: &Hud) {
 /// Static-layer strokes + pill text. Mutates `canvas` in place,
 /// expecting an existing background (transparent or tint-filled). Does
 /// NOT clear the canvas — the caller does that.
-fn render_static_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+fn render_static_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     // tiny-skia phase scoped so its &mut borrow on canvas is released
     // before the glyph rasterizer writes into it.
     let pills = render_static_strokes(canvas, buf_w, buf_h, scale, hud);
@@ -480,7 +481,7 @@ fn render_static_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hu
 
 /// Dynamic-layer strokes + pill text. Same canvas contract as
 /// [`render_static_layer`].
-fn render_dynamic_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: u32, hud: &Hud) {
+fn render_dynamic_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     let pills = render_dynamic_strokes(canvas, buf_w, buf_h, scale, hud);
     if !pills.is_empty() {
         if let Some(font) = hud_font() {
@@ -498,7 +499,7 @@ fn render_static_strokes(
     canvas: &mut [u8],
     buf_w: u32,
     buf_h: u32,
-    scale: u32,
+    scale: f32,
     hud: &Hud,
 ) -> Vec<PillLayout> {
     use tiny_skia::*;
@@ -507,10 +508,10 @@ fn render_static_strokes(
     };
 
     let stroke = Stroke {
-        // Hard 2 physical pixels regardless of buffer scale — narrow
-        // enough not to obscure the pixel boundary being measured,
-        // wide enough to stay legible against busy backgrounds.
-        width: 2.0,
+        // 1 logical pixel = `scale` physical px. Narrow enough not to
+        // obscure the pixel boundary being measured, wide enough to
+        // stay legible — and crisp on a 1x display instead of doubled.
+        width: scale,
         ..Default::default()
     };
 
@@ -522,8 +523,8 @@ fn render_static_strokes(
         &hud.held_rects,
         &hud.stuck_measurements,
         &hud.measurement_format,
-        (buf_w as f32 / scale as f32) as f64,
-        (buf_h as f32 / scale as f32) as f64,
+        (buf_w as f32 / scale) as f64,
+        (buf_h as f32 / scale) as f64,
     );
 
     // Held rects are additive — drawn first. Each accumulated drag
@@ -633,7 +634,7 @@ fn render_dynamic_strokes(
     canvas: &mut [u8],
     buf_w: u32,
     buf_h: u32,
-    scale: u32,
+    scale: f32,
     hud: &Hud,
 ) -> Vec<PillLayout> {
     use tiny_skia::*;
@@ -645,12 +646,13 @@ fn render_dynamic_strokes(
     let mut paint = Paint::default();
     paint.set_color_rgba8(fg.r, fg.g, fg.b, fg.a);
     paint.anti_alias = false;
+    // 1 logical pixel (`scale` physical px) — see render_static_strokes.
     let stroke = Stroke {
-        width: 2.0,
+        width: scale,
         ..Default::default()
     };
     let tick_stroke = Stroke {
-        width: 2.0,
+        width: scale,
         ..Default::default()
     };
 
@@ -754,9 +756,9 @@ fn render_dynamic_strokes(
         if *cursor_in_rect {
             draw_arrow_cursor(
                 &mut pixmap,
-                cursor.0 as f32 * scale as f32,
-                cursor.1 as f32 * scale as f32,
-                scale as f32,
+                cursor.0 as f32 * scale,
+                cursor.1 as f32 * scale,
+                scale,
             );
         } else {
             draw_hover_indicators(
@@ -771,23 +773,23 @@ fn render_dynamic_strokes(
         }
     }
     if let Some((cx, cy)) = hud.move_cursor_at {
-        let bx = cx as f32 * scale as f32;
-        let by = cy as f32 * scale as f32;
+        let bx = cx as f32 * scale;
+        let by = cy as f32 * scale;
         match hud.cursor_kind {
             crate::CursorKind::Move => {
-                draw_move_cursor(&mut pixmap, bx, by, scale as f32);
+                draw_move_cursor(&mut pixmap, bx, by, scale);
             }
             crate::CursorKind::ResizeNS => {
-                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 0.0);
+                draw_resize_cursor(&mut pixmap, bx, by, scale, 0.0);
             }
             crate::CursorKind::ResizeEW => {
-                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 90.0);
+                draw_resize_cursor(&mut pixmap, bx, by, scale, 90.0);
             }
             crate::CursorKind::ResizeNWSE => {
-                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, -45.0);
+                draw_resize_cursor(&mut pixmap, bx, by, scale, -45.0);
             }
             crate::CursorKind::ResizeNESW => {
-                draw_resize_cursor(&mut pixmap, bx, by, scale as f32, 45.0);
+                draw_resize_cursor(&mut pixmap, bx, by, scale, 45.0);
             }
         }
     }
@@ -798,7 +800,7 @@ fn render_dynamic_strokes(
             &toast.text,
             buf_w as f32,
             buf_h as f32,
-            scale as f32,
+            scale,
         );
     }
     if let Some(menu) = &hud.context_menu {
@@ -808,7 +810,7 @@ fn render_dynamic_strokes(
             menu,
             buf_w as f32,
             buf_h as f32,
-            scale as f32,
+            scale,
         );
     }
     if let Some(text) = hud.corner_indicator.as_deref() {
@@ -818,7 +820,7 @@ fn render_dynamic_strokes(
             text,
             buf_w as f32,
             buf_h as f32,
-            scale as f32,
+            scale,
         );
     }
 
@@ -905,8 +907,8 @@ fn draw_resize_cursor(
         &white,
         &Stroke {
             // Lighter white outline so the cursor stays slim against
-            // smaller geometry.
-            width: 4.0,
+            // smaller geometry. 2 logical px — scales with the buffer.
+            width: 2.0 * scale_f,
             line_join: LineJoin::Miter,
             ..Default::default()
         },
@@ -975,7 +977,8 @@ fn draw_move_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_f
             &path,
             &white,
             &Stroke {
-                width: 4.0,
+                // 2 logical px — scales with the buffer.
+                width: 2.0 * scale_f,
                 line_join: LineJoin::Miter,
                 ..Default::default()
             },
@@ -1010,12 +1013,13 @@ fn draw_stuck_measurements(
     use tiny_skia::*;
     let fmt = ctx.fmt;
     let scale_f = ctx.scale_f();
+    // 1 logical pixel — crisp at 1x, unchanged at HiDPI.
     let line_stroke = Stroke {
-        width: 2.0,
+        width: scale_f,
         ..Default::default()
     };
     let tick_stroke = Stroke {
-        width: 2.0,
+        width: scale_f,
         ..Default::default()
     };
     let tick_half = 5.0 * scale_f; // tick reach in buffer px
@@ -1425,7 +1429,7 @@ fn draw_hover_indicators(
     let paint = kit.paint;
     let stroke = kit.stroke;
     let tick_stroke = kit.tick_stroke;
-    let scale_f = scale as f32;
+    let scale_f = scale;
     {
         // Convert surface-logical coords to buffer-physical, snap
         // to the pixel grid, offset by stroke half-width so non-AA
@@ -1518,8 +1522,9 @@ fn draw_hover_indicators(
             pb.move_to(cx, cy - arm);
             pb.line_to(cx, cy + arm);
             if let Some(path) = pb.finish() {
-                // Hard physical-pixel widths: 4 px white outline,
-                // 2 px black core, regardless of buffer scale.
+                // 1 logical-px black core under a white halo, both
+                // scaled to the buffer — crisp at 1x, unchanged at
+                // HiDPI (2 px core / 8 px halo at scale 2).
                 let mut outline = Paint::default();
                 outline.set_color_rgba8(255, 255, 255, 255);
                 outline.anti_alias = true;
@@ -1527,9 +1532,9 @@ fn draw_hover_indicators(
                     &path,
                     &outline,
                     &Stroke {
-                        // Total stroke = black core 2 + 3 px white
-                        // halo on each side.
-                        width: 8.0,
+                        // 4 logical px total (1 core + 1.5 halo each
+                        // side), scaled to the buffer.
+                        width: 4.0 * scale_f,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -1543,7 +1548,8 @@ fn draw_hover_indicators(
                     &path,
                     &fill,
                     &Stroke {
-                        width: 2.0,
+                        // 1 logical-px core.
+                        width: scale_f,
                         line_cap: tiny_skia::LineCap::Round,
                         ..Default::default()
                     },
@@ -1687,7 +1693,7 @@ fn draw_area_rect(
     let fmt = ctx.fmt;
     let stroke = kit.stroke;
     let line_paint = kit.paint;
-    let scale_f = scale as f32;
+    let scale_f = scale;
     let half = scale_f * 0.5;
     let snap = |v: f64| (v * scale as f64).floor() as f32 + half;
     let ax = snap(a.0);
@@ -2168,7 +2174,8 @@ fn draw_arrow_cursor(pixmap: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, scale_
     black.set_color_rgba8(0, 0, 0, 255);
     black.anti_alias = true;
     let stroke = Stroke {
-        width: 2.0,
+        // 1 logical px — scales with the buffer.
+        width: scale_f,
         line_join: LineJoin::Miter,
         ..Default::default()
     };
@@ -2770,7 +2777,7 @@ mod tests {
     /// background-tinted pixmap and return the resulting bytes. Uses
     /// tiny-skia's `draw_pixmap` so the SrcOver math matches the
     /// stroke pipeline.
-    fn compose_layers(hud: &Hud, w: u32, h: u32, scale: u32) -> Vec<u8> {
+    fn compose_layers(hud: &Hud, w: u32, h: u32, scale: f32) -> Vec<u8> {
         use tiny_skia::{IntSize, Pixmap, PixmapPaint, Transform};
         let mut sta = vec![0u8; (w * h * 4) as usize];
         render_static_into(&mut sta, w, h, scale, hud);
@@ -2817,7 +2824,7 @@ mod tests {
     /// any draw call leaking between layers would change the output.
     #[test]
     fn split_matches_single_pass_byte_for_byte() {
-        let (w, h, scale) = (240u32, 240u32, 1u32);
+        let (w, h, scale) = (240u32, 240u32, 1.0f32);
         let hud = fixture_no_overlap();
         let mut all = vec![0u8; (w * h * 4) as usize];
         render_hud_into(&mut all, w, h, scale, &hud);
@@ -2836,7 +2843,7 @@ mod tests {
     /// glyph would be thousands of bad pixels, not single digits.
     #[test]
     fn split_matches_single_pass_with_crosshair_overlap() {
-        let (w, h, scale) = (240u32, 240u32, 1u32);
+        let (w, h, scale) = (240u32, 240u32, 1.0f32);
         let hud = fixture_with_crosshair();
         let mut all = vec![0u8; (w * h * 4) as usize];
         render_hud_into(&mut all, w, h, scale, &hud);

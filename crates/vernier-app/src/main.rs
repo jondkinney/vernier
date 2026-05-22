@@ -315,10 +315,11 @@ fn run_daemon() -> Result<()> {
         );
     }
 
-    let primary = monitors
+    let mut primary = monitors
         .iter()
         .find(|m| m.is_primary)
         .or_else(|| monitors.first())
+        .cloned()
         .context("no monitors available")?;
     set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
@@ -476,9 +477,17 @@ fn run_daemon() -> Result<()> {
         .name("vernier-ipc".into())
         .spawn(move || ipc_loop(listener, combined_for_ipc))?;
 
+    // Poll display geometry every 2s so a runtime scale / resolution
+    // change doesn't leave the daemon rendering at stale dimensions.
+    spawn_display_poll(&combined_tx);
+
     log::info!("running. Hotkey toggles measurement; tray Quit or `vernier quit` exits.");
 
     let mut mode = InteractionMode::Idle;
+    // Set when a display change is detected mid-measurement; the
+    // overlay surface rebuild is deferred to the next Idle tick so the
+    // active HUD isn't yanked away.
+    let mut pending_overlay_rebuild = false;
     // Rate-limit overlay redraws driven by pointer-move events. Wayland
     // pointer events arrive at ~120Hz, but committing a fresh wl_buffer
     // that often overwhelms the compositor and gets us disconnected.
@@ -3499,6 +3508,64 @@ fn run_daemon() -> Result<()> {
                     },
                 );
             }
+            MainEvent::PollDisplays => {
+                // Apply a rebuild deferred from a change detected
+                // mid-measurement, now that we're back at Idle.
+                if pending_overlay_rebuild && matches!(mode, InteractionMode::Idle) {
+                    match platform.create_overlay(primary.id) {
+                        Ok(o) => {
+                            overlay = o;
+                            pending_overlay_rebuild = false;
+                            log::info!("display change: overlay rebuilt post-measurement");
+                        }
+                        Err(e) => log::warn!("deferred overlay rebuild failed: {e:#}"),
+                    }
+                }
+                // Re-query monitors; react to a geometry / scale change.
+                let fresh = match platform.monitors() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::debug!("display poll: monitors() failed: {e:#}");
+                        continue;
+                    }
+                };
+                let new_primary = fresh
+                    .iter()
+                    .find(|m| m.is_primary)
+                    .or_else(|| fresh.first())
+                    .cloned();
+                if let Some(np) = new_primary {
+                    let changed = np.id != primary.id
+                        || np.bounds != primary.bounds
+                        || (np.scale_factor - primary.scale_factor).abs() > f64::EPSILON;
+                    if changed {
+                        log::info!(
+                            "display changed: {}x{} scale={} -> {}x{} scale={}",
+                            primary.bounds.w,
+                            primary.bounds.h,
+                            primary.scale_factor,
+                            np.bounds.w,
+                            np.bounds.h,
+                            np.scale_factor,
+                        );
+                        primary = np;
+                        set_primary_scale_factor(primary.scale_factor);
+                        if matches!(mode, InteractionMode::Idle) {
+                            // Idle: rebuild now — the new surface picks
+                            // up the fresh buffer scale immediately.
+                            match platform.create_overlay(primary.id) {
+                                Ok(o) => overlay = o,
+                                Err(e) => log::warn!("overlay rebuild failed: {e:#}"),
+                            }
+                        } else {
+                            // Mid-measurement: coordinate math already
+                            // tracks the new `primary`; defer the
+                            // overlay surface rebuild to the next Idle.
+                            pending_overlay_rebuild = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5061,6 +5128,25 @@ fn spawn_toast_timer(
         .ok();
 }
 
+/// Spawn a detached thread that enqueues `MainEvent::PollDisplays`
+/// every 2s. `monitors()` is a cheap lock+clone, so the poll lets the
+/// daemon track runtime display scale / resolution changes without a
+/// restart.
+fn spawn_display_poll(tx: &std::sync::mpsc::Sender<MainEvent>) {
+    let tx = tx.clone();
+    std::thread::Builder::new()
+        .name("vernier-display-poll".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if tx.send(MainEvent::PollDisplays).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok();
+}
+
 #[derive(Debug)]
 enum MainEvent {
     Platform(PlatformEvent),
@@ -5080,6 +5166,9 @@ enum MainEvent {
         dir: NudgeDir,
         generation: u64,
     },
+    /// Internal: 2s periodic poll so the daemon notices monitor scale
+    /// / resolution changes instead of running on stale geometry.
+    PollDisplays,
 }
 
 #[derive(Debug, Clone, Copy)]
