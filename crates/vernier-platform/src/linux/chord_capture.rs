@@ -61,7 +61,10 @@ pub fn record_chord(timeout: Duration) -> Result<String, RecordError> {
     let keymap_text = compile_keymap()?;
     log::info!("chord_capture: enumerating keyboards");
     let keyboards = keyboard_devices()?;
-    log::info!("chord_capture: opened {} keyboard device(s)", keyboards.len());
+    log::info!(
+        "chord_capture: opened {} keyboard device(s)",
+        keyboards.len()
+    );
     let (tx, rx) = mpsc::channel::<String>();
     for (idx, device) in keyboards.into_iter().enumerate() {
         let tx = tx.clone();
@@ -95,16 +98,9 @@ pub fn record_chord(timeout: Duration) -> Result<String, RecordError> {
 
 fn compile_keymap() -> Result<String, RecordError> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_names(
-        &context,
-        "",
-        "",
-        "",
-        "",
-        None,
-        xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )
-    .ok_or(RecordError::Keymap)?;
+    let keymap =
+        xkb::Keymap::new_from_names(&context, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
+            .ok_or(RecordError::Keymap)?;
     Ok(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
 }
 
@@ -249,19 +245,19 @@ fn chord_key_token(sym: u32) -> Option<String> {
     // as "ESCAPE" and the punctuation keys from colliding with the
     // `+` modifier separator.
     let named = match sym {
-        0xff1b => Some("ESC"),       // Escape
+        0xff1b => Some("ESC"),            // Escape
         0xff0d | 0xff8d => Some("ENTER"), // Return / KP_Enter
-        0xff09 => Some("TAB"),       // Tab
-        0xff08 => Some("BACKSPACE"), // BackSpace
-        0xffff => Some("DELETE"),    // Delete
-        0xff52 => Some("UP"),        // Up
-        0xff54 => Some("DOWN"),      // Down
-        0xff51 => Some("LEFT"),      // Left
-        0xff53 => Some("RIGHT"),     // Right
-        0x20 => Some("SPACE"),       // space
-        0x2b => Some("PLUS"),        // +
-        0x2d => Some("MINUS"),       // -
-        0x3d => Some("EQUAL"),       // =
+        0xff09 => Some("TAB"),            // Tab
+        0xff08 => Some("BACKSPACE"),      // BackSpace
+        0xffff => Some("DELETE"),         // Delete
+        0xff52 => Some("UP"),             // Up
+        0xff54 => Some("DOWN"),           // Down
+        0xff51 => Some("LEFT"),           // Left
+        0xff53 => Some("RIGHT"),          // Right
+        0x20 => Some("SPACE"),            // space
+        0x2b => Some("PLUS"),             // +
+        0x2d => Some("MINUS"),            // -
+        0x3d => Some("EQUAL"),            // =
         _ => None,
     };
     if let Some(token) = named {

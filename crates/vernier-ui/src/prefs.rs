@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::{App, CreationContext, Frame, NativeOptions, egui};
-#[cfg(target_os = "linux")]
-use vernier_platform::linux::chord_capture::{self, ClientError};
 use vernier_core::{
     AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
     ToleranceSettings,
 };
+#[cfg(target_os = "linux")]
+use vernier_platform::linux::chord_capture::{self, ClientError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -980,8 +980,7 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     // macOS-style key glyph the chips use (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣
     // ↑↓←→). Bundling it (vs. trying system fonts) keeps the chip
     // looking identical regardless of which fonts are installed.
-    const ADWAITA_SANS: &[u8] =
-        include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+    const ADWAITA_SANS: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
     fonts.font_data.insert(
         "shortcut_letters".into(),
         std::sync::Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
@@ -2480,6 +2479,11 @@ const CHIP_LETTER_PT: f32 = 17.0; // letters / SUPER font size — sized to matc
 const CHIP_GAP: f32 = 6.0; // gap between segments
 
 fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
+    // `match` on macOS resolves to a single irrefutable arm
+    // (OmarchyLogo is cfg-gated out). Clippy flags that; the
+    // ergonomic alternative is to keep this as a match because
+    // adding more chip variants in the future is more natural here.
+    #[cfg_attr(target_os = "macos", allow(clippy::infallible_destructuring_match))]
     match seg {
         ChipSeg::Letter(s) => measure_chip_text(ctx, s, CHIP_LETTER_PT),
         #[cfg(not(target_os = "macos"))]
@@ -2530,6 +2534,7 @@ fn paint_shortcut_chip(
             egui::vec2(*w, CHIP_GLYPH_SIZE),
         );
         let _ = glyph_rect; // glyph_rect.center() == letter centre below
+        #[cfg_attr(target_os = "macos", allow(clippy::infallible_destructuring_match))]
         let glyph_text: &str = match seg {
             ChipSeg::Letter(s) => s,
             #[cfg(not(target_os = "macos"))]
@@ -2545,7 +2550,6 @@ fn paint_shortcut_chip(
         cursor_x += w + CHIP_GAP;
     }
 }
-
 
 fn shortcut_row(
     ui: &mut egui::Ui,

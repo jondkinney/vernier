@@ -5453,7 +5453,7 @@ fn ipc_loop(
                     // we've handed the writer to the worker, so this
                     // connection is done from ipc_loop's perspective.
                     use vernier_platform::linux::chord_capture::{
-                        record_chord, DEFAULT_RECORD_TIMEOUT, RecordError,
+                        DEFAULT_RECORD_TIMEOUT, RecordError, record_chord,
                     };
                     let mut worker_writer = match writer.try_clone() {
                         Ok(w) => w,
