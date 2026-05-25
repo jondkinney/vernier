@@ -1,5 +1,6 @@
 //! Linux backend selection. Picks Wayland or X11 at runtime.
 
+pub mod chord_capture;
 pub(crate) mod hotkey;
 pub(crate) mod screencast;
 mod wayland;

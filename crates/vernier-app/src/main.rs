@@ -5436,6 +5436,57 @@ fn ipc_loop(
                     // constant captured at daemon startup.
                     let _ = writer.write_all(format!("{}\n", vernier_core::build_id()).as_bytes());
                 }
+                #[cfg(target_os = "linux")]
+                "capture-chord" => {
+                    // Read raw key events via evdev so the prefs UI
+                    // can record SUPER-containing chords — egui-winit
+                    // drops Super in its Linux Modifiers translation.
+                    //
+                    // Spawn a worker thread for the long-running
+                    // record_chord call so ipc_loop keeps accepting
+                    // new connections; otherwise the prefs window's
+                    // ~750 ms daemon-alive probe would block on
+                    // connect for the duration of the 30 s capture
+                    // window, freezing the UI thread → ANR.
+                    //
+                    // Break out of the per-connection line loop too:
+                    // we've handed the writer to the worker, so this
+                    // connection is done from ipc_loop's perspective.
+                    use vernier_platform::linux::chord_capture::{
+                        record_chord, DEFAULT_RECORD_TIMEOUT, RecordError,
+                    };
+                    let mut worker_writer = match writer.try_clone() {
+                        Ok(w) => w,
+                        Err(e) => {
+                            log::warn!("capture-chord clone: {e}");
+                            let _ = writer.write_all(b"error: ipc clone failed\n");
+                            continue;
+                        }
+                    };
+                    std::thread::spawn(move || {
+                        log::info!("capture-chord: worker entering record_chord");
+                        let result = record_chord(DEFAULT_RECORD_TIMEOUT);
+                        let reply = match &result {
+                            Ok(chord) => {
+                                log::info!("capture-chord: got chord {chord:?}");
+                                format!("{chord}\n")
+                            }
+                            Err(RecordError::Timeout) => {
+                                log::info!("capture-chord: timeout");
+                                "cancel\n".to_string()
+                            }
+                            Err(e) => {
+                                log::warn!("capture-chord: error {e}");
+                                format!("error: {e}\n")
+                            }
+                        };
+                        match worker_writer.write_all(reply.as_bytes()) {
+                            Ok(()) => log::info!("capture-chord: reply sent"),
+                            Err(e) => log::warn!("capture-chord: write reply failed: {e}"),
+                        }
+                    });
+                    break;
+                }
                 other => log::debug!("ipc unknown command: {other:?}"),
             }
         }

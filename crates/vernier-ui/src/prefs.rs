@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::{App, CreationContext, Frame, NativeOptions, egui};
+#[cfg(target_os = "linux")]
+use vernier_platform::linux::chord_capture::{self, ClientError};
 use vernier_core::{
     AppearanceSettings, ClipboardUnit, ColorRgba, CopyFormat, HandoffApp, IntegrationSettings,
     RoundingMode, ScreenshotSettings, Settings, ShortcutSettings, ToleranceLevel,
@@ -113,6 +115,14 @@ struct PrefsApp {
     /// the matching Shortcuts row — the next key press (with
     /// modifiers) is recorded as that shortcut's accelerator.
     capturing_shortcut: Option<ShortcutId>,
+    /// In-flight chord-capture IPC. Linux only — egui-winit on
+    /// Linux discards Super from `Modifiers`, so we record chords
+    /// via the daemon's evdev path on `capture-chord`. `None`
+    /// outside of capture mode and for the `Crosshair` row, which
+    /// stays on the egui path since it captures bare modifiers
+    /// (Super not required — Shift/Ctrl/Alt visible to egui).
+    #[cfg(target_os = "linux")]
+    chord_recorder: Option<vernier_platform::linux::chord_capture::ChordRecording>,
     /// Path of a config file that has a static `bind = …, exec,
     /// vernier toggle` line shadowing the prefs-managed
     /// shortcut. Surfaced as a banner on the Shortcuts pane so
@@ -207,6 +217,8 @@ impl PrefsApp {
             folder_pick: None,
             handoff_pick: None,
             capturing_shortcut: None,
+            #[cfg(target_os = "linux")]
+            chord_recorder: None,
             static_bind_warning,
             // Assume alive on startup — `run_prefs_window` either
             // confirmed the daemon was responsive or auto-spawned
@@ -250,7 +262,100 @@ impl PrefsApp {
         // when they accidentally clicked into a shortcut chip or
         // its X button and want the original binding back.
         self.capturing_shortcut = None;
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(rec) = self.chord_recorder.take() {
+                rec.abort();
+            }
+        }
         self.last_status = Some("Reverted to last save.".to_string());
+    }
+
+    /// Write a captured chord string into the right `Shortcuts`
+    /// field for the row being recorded. The big-match isn't
+    /// pretty but keeps `Shortcuts` as a plain struct (no enum
+    /// indirection in settings.toml).
+    fn apply_captured_shortcut(&mut self, target: ShortcutId, s: String) {
+        match target {
+            ShortcutId::Toggle => self.edited.shortcuts.toggle = s,
+            ShortcutId::ClearAndHide => self.edited.shortcuts.clear_and_hide = s,
+            ShortcutId::ClearAndExit => self.edited.shortcuts.clear_and_exit = s,
+            ShortcutId::Restore => self.edited.shortcuts.restore_session = s,
+            ShortcutId::Capture => self.edited.shortcuts.capture = s,
+            ShortcutId::Crosshair => self.edited.shortcuts.crosshair_mode = s,
+            ShortcutId::GuideHorizontal => self.edited.shortcuts.guide_horizontal = s,
+            ShortcutId::GuideVertical => self.edited.shortcuts.guide_vertical = s,
+            ShortcutId::ColorToggle => self.edited.shortcuts.color_toggle = s,
+            ShortcutId::StuckHorizontal => self.edited.shortcuts.stuck_horizontal = s,
+            ShortcutId::StuckVertical => self.edited.shortcuts.stuck_vertical = s,
+            ShortcutId::RefreshCapture => self.edited.shortcuts.refresh_capture = s,
+            ShortcutId::ToleranceUp => self.edited.shortcuts.tolerance_up = s,
+            ShortcutId::ToleranceDown => self.edited.shortcuts.tolerance_down = s,
+            ShortcutId::NudgeLeft => self.edited.shortcuts.nudge_left = s,
+            ShortcutId::NudgeRight => self.edited.shortcuts.nudge_right = s,
+            ShortcutId::NudgeUp => self.edited.shortcuts.nudge_up = s,
+            ShortcutId::NudgeDown => self.edited.shortcuts.nudge_down = s,
+            ShortcutId::TakeNormalScreenshot => self.edited.shortcuts.take_normal_screenshot = s,
+        }
+    }
+
+    /// Linux chord-capture: arm an IPC recording on first frame,
+    /// then poll the worker channel each frame. Esc shuts down the
+    /// stream so the daemon's slot cancels promptly. Commit on
+    /// success; report any IPC error in the status banner.
+    #[cfg(target_os = "linux")]
+    fn poll_daemon_chord_capture(&mut self, ctx: &egui::Context, target: ShortcutId) {
+        if self.chord_recorder.is_none() {
+            match chord_capture::record_chord_ipc() {
+                Ok(rec) => self.chord_recorder = Some(rec),
+                Err(e) => {
+                    self.capturing_shortcut = None;
+                    self.last_status = Some(chord_record_error(&e));
+                    return;
+                }
+            }
+        }
+        let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc_pressed && let Some(rec) = &self.chord_recorder {
+            rec.abort();
+        }
+        if let Some(rec) = &self.chord_recorder {
+            match rec.try_recv() {
+                Ok(None) => {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                Ok(Some(chord)) => {
+                    self.apply_captured_shortcut(target, chord);
+                    self.capturing_shortcut = None;
+                    self.chord_recorder = None;
+                }
+                Err(ClientError::Cancelled) => {
+                    self.capturing_shortcut = None;
+                    self.chord_recorder = None;
+                }
+                Err(e) => {
+                    self.last_status = Some(chord_record_error(&e));
+                    self.capturing_shortcut = None;
+                    self.chord_recorder = None;
+                }
+            }
+        }
+    }
+}
+
+/// Build a user-facing status message for a chord-capture IPC
+/// failure. The DaemonOffline case is by far the most common —
+/// usually because the user disabled or quit the daemon — and gets
+/// a tailored hint.
+#[cfg(target_os = "linux")]
+fn chord_record_error(err: &ClientError) -> String {
+    match err {
+        ClientError::DaemonOffline => {
+            "Daemon not running — start vernier, then try recording again.".to_string()
+        }
+        ClientError::Cancelled => "Recording cancelled.".to_string(),
+        ClientError::Daemon(msg) => format!("Daemon error: {msg}"),
+        ClientError::Io(msg) => format!("Chord-capture IPC failed: {msg}"),
     }
 }
 
@@ -323,45 +428,36 @@ impl App for PrefsApp {
             self.last_recording_probe = Instant::now();
         }
 
-        // While in shortcut-capture mode, drain key events from
-        // egui's input queue (so other widgets don't act on them)
-        // and apply the first non-modifier key as the new
-        // shortcut. Esc cancels capture without changing the
-        // value.
+        // While in shortcut-capture mode, fetch the chord either via
+        // the daemon (Linux, evdev — see vernier-platform's
+        // `chord_capture` module) or via egui's input queue. Linux
+        // routes through the daemon because egui-winit discards
+        // Super from `Modifiers` there; the `Crosshair` row stays
+        // on the egui path on every OS since it captures bare
+        // modifiers and only needs Shift/Ctrl/Alt (Super-only
+        // crosshair binding is intentionally unsupported here, as
+        // it would conflict with most Linux Super-based binds).
+        // Esc cancels capture without changing the value.
         if let Some(target) = self.capturing_shortcut {
-            let outcome = ctx.input_mut(|i| capture_outcome(i, target));
-            if let Some(outcome) = outcome {
-                match outcome {
-                    CaptureOutcome::Cancel => self.capturing_shortcut = None,
-                    CaptureOutcome::Commit(s) => {
-                        match target {
-                            ShortcutId::Toggle => self.edited.shortcuts.toggle = s,
-                            ShortcutId::ClearAndHide => self.edited.shortcuts.clear_and_hide = s,
-                            ShortcutId::ClearAndExit => self.edited.shortcuts.clear_and_exit = s,
-                            ShortcutId::Restore => self.edited.shortcuts.restore_session = s,
-                            ShortcutId::Capture => self.edited.shortcuts.capture = s,
-                            ShortcutId::Crosshair => self.edited.shortcuts.crosshair_mode = s,
-                            ShortcutId::GuideHorizontal => {
-                                self.edited.shortcuts.guide_horizontal = s
-                            }
-                            ShortcutId::GuideVertical => self.edited.shortcuts.guide_vertical = s,
-                            ShortcutId::ColorToggle => self.edited.shortcuts.color_toggle = s,
-                            ShortcutId::StuckHorizontal => {
-                                self.edited.shortcuts.stuck_horizontal = s
-                            }
-                            ShortcutId::StuckVertical => self.edited.shortcuts.stuck_vertical = s,
-                            ShortcutId::RefreshCapture => self.edited.shortcuts.refresh_capture = s,
-                            ShortcutId::ToleranceUp => self.edited.shortcuts.tolerance_up = s,
-                            ShortcutId::ToleranceDown => self.edited.shortcuts.tolerance_down = s,
-                            ShortcutId::NudgeLeft => self.edited.shortcuts.nudge_left = s,
-                            ShortcutId::NudgeRight => self.edited.shortcuts.nudge_right = s,
-                            ShortcutId::NudgeUp => self.edited.shortcuts.nudge_up = s,
-                            ShortcutId::NudgeDown => self.edited.shortcuts.nudge_down = s,
-                            ShortcutId::TakeNormalScreenshot => {
-                                self.edited.shortcuts.take_normal_screenshot = s
-                            }
+            #[cfg(target_os = "linux")]
+            let use_daemon = target != ShortcutId::Crosshair;
+            #[cfg(not(target_os = "linux"))]
+            let use_daemon = false;
+
+            if use_daemon {
+                #[cfg(target_os = "linux")]
+                {
+                    self.poll_daemon_chord_capture(ctx, target);
+                }
+            } else {
+                let outcome = ctx.input_mut(|i| capture_outcome(i, target));
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        CaptureOutcome::Cancel => self.capturing_shortcut = None,
+                        CaptureOutcome::Commit(s) => {
+                            self.apply_captured_shortcut(target, s);
+                            self.capturing_shortcut = None;
                         }
-                        self.capturing_shortcut = None;
                     }
                 }
             }
@@ -880,41 +976,17 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut shortcut_chain: Vec<String> = Vec::new();
 
-    // Bold sans-serif for letters/digits in chips. Liberation Sans
-    // is ~414KB; the JetBrains Mono Nerd Font we used to load is
-    // 2.4MB and made egui's font init slow enough to trigger the
-    // compositor's "Application Not Responding" ping. We don't need
-    // the Nerd Font icons since every symbol on the chip is now
-    // painter-drawn.
-    let letter_paths = [
-        // Linux distros (Arch / Fedora layout).
-        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
-        // macOS system fonts. HelveticaNeue.ttc and Helvetica.ttc
-        // are guaranteed present on every modern macOS; we pick a
-        // bold face out of the TTC by adding the index suffix that
-        // egui's FontData doesn't support — so we fall back to
-        // SFNS (San Francisco) variants which ship as standalone
-        // .otf files, and finally a generic Helvetica.
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/Library/Fonts/Arial Bold.ttf",
-    ];
-    for path in letter_paths {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                fonts.font_data.insert(
-                    "shortcut_letters".into(),
-                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-                );
-                shortcut_chain.push("shortcut_letters".to_string());
-                break;
-            }
-            Err(_) => continue,
-        }
-    }
+    // Bundled Adwaita Sans Regular: ships ASCII letters + every
+    // macOS-style key glyph the chips use (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣
+    // ↑↓←→). Bundling it (vs. trying system fonts) keeps the chip
+    // looking identical regardless of which fonts are installed.
+    const ADWAITA_SANS: &[u8] =
+        include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+    fonts.font_data.insert(
+        "shortcut_letters".into(),
+        std::sync::Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
+    );
+    shortcut_chain.push("shortcut_letters".to_string());
 
     // Omarchy launcher glyph at U+E900.
     let omarchy_path = std::env::var_os("HOME")
@@ -930,8 +1002,8 @@ fn install_glyph_fonts(ctx: &egui::Context) {
                 // shift outline. y_offset positive = nudge DOWN so
                 // the logo sits on the same baseline as the F.
                 data.tweak = egui::FontTweak {
-                    scale: 0.85,
-                    y_offset_factor: 0.10,
+                    scale: 0.75,
+                    y_offset_factor: 0.09,
                     ..Default::default()
                 };
                 fonts
@@ -2342,116 +2414,69 @@ fn capture_outcome(i: &mut egui::InputState, target: ShortcutId) -> Option<Captu
 /// else is drawn manually so we can guarantee uniform stroke
 /// weight, baseline alignment, and the solid stubby Shift / chevron
 /// Ctrl / matching arrows the user wants.
-// OmarchyLogo / Shift / Ctrl / Alt are constructed only in the
-// Linux branches of `shortcut_chip_segments` and read by the
-// Linux-side painter — on macOS we use Unicode modifier glyphs as
-// plain Letter segments instead, so these variants don't exist there.
+// `OmarchyLogo` is the only non-letter segment left: the Omarchy
+// glyph lives at U+E900 in a separate font (no Unicode codepoint
+// to render). Everything else uses `Letter` with the conventional
+// Unicode key glyph (matches hyprcorrect and macOS native menus).
 #[derive(Clone, Debug)]
 enum ChipSeg {
     Letter(String),
     #[cfg(not(target_os = "macos"))]
     OmarchyLogo,
-    #[cfg(not(target_os = "macos"))]
-    Shift,
-    #[cfg(not(target_os = "macos"))]
-    Ctrl,
-    #[cfg(not(target_os = "macos"))]
-    Alt,
-    Enter,
-    Arrow(ArrowDir),
-    Plus,
-    Minus,
-    Equal,
-    Underscore,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ArrowDir {
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 fn shortcut_chip_segments(stored: &str) -> Vec<ChipSeg> {
     #[cfg(not(target_os = "macos"))]
     let omarchy = omarchy_font_available();
-    // On macOS the modifiers all have well-known Unicode glyphs
-    // that every system font ships. They're what users see in
-    // every native menu's key-equivalent column, so use them
-    // verbatim instead of the painter-drawn outlines that match
-    // the Linux/Hyprland look.
-    #[cfg(target_os = "macos")]
-    let mac_glyph = |g: &str| ChipSeg::Letter(g.to_string());
     stored
         .split('+')
         .filter(|t| !t.is_empty())
         .map(|tok| match tok {
-            "SHIFT" => {
-                #[cfg(target_os = "macos")]
-                {
-                    mac_glyph("\u{21E7}")
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    ChipSeg::Shift
-                }
-            }
-            "CTRL" => {
-                #[cfg(target_os = "macos")]
-                {
-                    mac_glyph("\u{2303}")
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    ChipSeg::Ctrl
-                }
-            }
-            "ALT" => {
-                #[cfg(target_os = "macos")]
-                {
-                    mac_glyph("\u{2325}")
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    ChipSeg::Alt
-                }
-            }
+            "SHIFT" => ChipSeg::Letter("\u{21E7}".to_string()), // ⇧
+            "CTRL" => ChipSeg::Letter("\u{2303}".to_string()),  // ⌃
+            "ALT" => ChipSeg::Letter("\u{2325}".to_string()),   // ⌥
             "SUPER" => {
-                // On macOS the conventional rendering for the
-                // Command modifier is the U+2318 PLACE OF
-                // INTEREST SIGN glyph (⌘). Every system font
-                // ships it, so we go straight to a Letter
-                // segment and skip the omarchy fallback chain.
+                // On Linux with Omarchy installed, the Hyprland
+                // logo at U+E900 is the user's expected glyph;
+                // elsewhere fall back to the macOS-style Command
+                // glyph U+2318 (⌘) which every system font ships.
                 #[cfg(target_os = "macos")]
                 {
-                    mac_glyph("\u{2318}")
+                    ChipSeg::Letter("\u{2318}".to_string())
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
                     if omarchy {
                         ChipSeg::OmarchyLogo
                     } else {
-                        ChipSeg::Letter("SUPER".to_string())
+                        ChipSeg::Letter("\u{2318}".to_string())
                     }
                 }
             }
-            "ENTER" | "RETURN" => ChipSeg::Enter,
-            "LEFT" => ChipSeg::Arrow(ArrowDir::Left),
-            "RIGHT" => ChipSeg::Arrow(ArrowDir::Right),
-            "UP" => ChipSeg::Arrow(ArrowDir::Up),
-            "DOWN" => ChipSeg::Arrow(ArrowDir::Down),
-            "PLUS" => ChipSeg::Plus,
-            "MINUS" => ChipSeg::Minus,
-            "EQUAL" => ChipSeg::Equal,
-            "UNDERSCORE" => ChipSeg::Underscore,
+            "ENTER" | "RETURN" => ChipSeg::Letter("\u{21B5}".to_string()), // ↵
+            "LEFT" => ChipSeg::Letter("\u{2190}".to_string()),             // ←
+            "RIGHT" => ChipSeg::Letter("\u{2192}".to_string()),            // →
+            "UP" => ChipSeg::Letter("\u{2191}".to_string()),               // ↑
+            "DOWN" => ChipSeg::Letter("\u{2193}".to_string()),             // ↓
+            // Punctuation captured as words by chord-record so the
+            // saved string doesn't collide with the `+` separator —
+            // render as the actual characters they represent.
+            "PLUS" => ChipSeg::Letter("+".to_string()),
+            "MINUS" => ChipSeg::Letter("-".to_string()),
+            "EQUAL" => ChipSeg::Letter("=".to_string()),
+            "UNDERSCORE" => ChipSeg::Letter("_".to_string()),
+            "ESC" | "ESCAPE" => ChipSeg::Letter("\u{238B}".to_string()), // ⎋
+            "TAB" => ChipSeg::Letter("\u{21E5}".to_string()),            // ⇥
+            "BACKSPACE" => ChipSeg::Letter("\u{232B}".to_string()),      // ⌫
+            "DELETE" => ChipSeg::Letter("\u{2326}".to_string()),         // ⌦
+            "SPACE" => ChipSeg::Letter("\u{2423}".to_string()),          // ␣
             other => ChipSeg::Letter(other.to_string()),
         })
         .collect()
 }
 
 const CHIP_GLYPH_SIZE: f32 = 14.0; // square box (px) each painter glyph fits in
-const CHIP_LETTER_PT: f32 = 15.0; // letters / SUPER font size — sized to match omarchy cap height
+const CHIP_LETTER_PT: f32 = 17.0; // letters / SUPER font size — sized to match omarchy cap height
 const CHIP_GAP: f32 = 6.0; // gap between segments
 
 fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
@@ -2459,16 +2484,6 @@ fn segment_advance(seg: &ChipSeg, ctx: &egui::Context) -> f32 {
         ChipSeg::Letter(s) => measure_chip_text(ctx, s, CHIP_LETTER_PT),
         #[cfg(not(target_os = "macos"))]
         ChipSeg::OmarchyLogo => measure_chip_text(ctx, "\u{e900}", CHIP_LETTER_PT),
-        #[cfg(not(target_os = "macos"))]
-        ChipSeg::Shift | ChipSeg::Ctrl | ChipSeg::Alt => CHIP_GLYPH_SIZE,
-        // Painter glyphs: most fit in a square, plus/equal/minus/underscore
-        // get a slightly wider box so the bars look proportional.
-        ChipSeg::Enter
-        | ChipSeg::Arrow(_)
-        | ChipSeg::Plus
-        | ChipSeg::Minus
-        | ChipSeg::Equal
-        | ChipSeg::Underscore => CHIP_GLYPH_SIZE,
     }
 }
 
@@ -2514,322 +2529,23 @@ fn paint_shortcut_chip(
             egui::pos2(cursor_x + w / 2.0, cy),
             egui::vec2(*w, CHIP_GLYPH_SIZE),
         );
-        match seg {
-            ChipSeg::Letter(s) => {
-                painter.text(
-                    glyph_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    s,
-                    letter_font.clone(),
-                    fg,
-                );
-            }
+        let _ = glyph_rect; // glyph_rect.center() == letter centre below
+        let glyph_text: &str = match seg {
+            ChipSeg::Letter(s) => s,
             #[cfg(not(target_os = "macos"))]
-            ChipSeg::OmarchyLogo => {
-                painter.text(
-                    glyph_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "\u{e900}",
-                    letter_font.clone(),
-                    fg,
-                );
-            }
-            #[cfg(not(target_os = "macos"))]
-            ChipSeg::Shift => paint_shift(&painter, glyph_rect, fg),
-            #[cfg(not(target_os = "macos"))]
-            ChipSeg::Ctrl => paint_caret(&painter, glyph_rect, fg),
-            #[cfg(not(target_os = "macos"))]
-            ChipSeg::Alt => paint_alt(&painter, glyph_rect, fg),
-            ChipSeg::Enter => paint_enter(&painter, glyph_rect, fg),
-            ChipSeg::Arrow(dir) => paint_arrow(&painter, glyph_rect, fg, *dir),
-            ChipSeg::Plus => paint_plus(&painter, glyph_rect, fg),
-            ChipSeg::Minus => paint_minus(&painter, glyph_rect, fg),
-            ChipSeg::Equal => paint_equal(&painter, glyph_rect, fg),
-            ChipSeg::Underscore => paint_underscore(&painter, glyph_rect, fg),
-        }
+            ChipSeg::OmarchyLogo => "\u{e900}",
+        };
+        painter.text(
+            egui::pos2(cursor_x + w / 2.0, cy),
+            egui::Align2::CENTER_CENTER,
+            glyph_text,
+            letter_font.clone(),
+            fg,
+        );
         cursor_x += w + CHIP_GAP;
     }
 }
 
-/// Hollow stubby Shift glyph: two
-/// strokes form a closed pentagon — triangular cap on top, narrower
-/// rectangular stem below. Narrower than letter width so it doesn't
-/// look "fat" next to F/V/etc.
-#[cfg(not(target_os = "macos"))]
-fn paint_shift(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let cx = rect.center().x;
-    let top = rect.top() + h * 0.15;
-    let mid = rect.top() + h * 0.55;
-    let bot = rect.top() + h * 0.85;
-    let stem_half = w * 0.18;
-    let cap_half = w * 0.36;
-    let pts = vec![
-        egui::pos2(cx, top),
-        egui::pos2(cx + cap_half, mid),
-        egui::pos2(cx + stem_half, mid),
-        egui::pos2(cx + stem_half, bot),
-        egui::pos2(cx - stem_half, bot),
-        egui::pos2(cx - stem_half, mid),
-        egui::pos2(cx - cap_half, mid),
-    ];
-    let shape = egui::epaint::PathShape::closed_line(pts, egui::Stroke::new(1.8, color));
-    painter.add(egui::Shape::Path(shape));
-}
-
-/// Bold chevron — the macOS Ctrl/control symbol. Apex sits at
-/// roughly the letter cap-top so it reads as a superscript caret
-/// without floating off the top of the chip.
-#[cfg(not(target_os = "macos"))]
-fn paint_caret(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let cx = rect.center().x;
-    let apex_y = rect.top() + h * 0.22;
-    let foot_y = rect.top() + h * 0.55;
-    let stroke = egui::Stroke::new(2.4, color);
-    painter.line_segment(
-        [egui::pos2(cx - w * 0.40, foot_y), egui::pos2(cx, apex_y)],
-        stroke,
-    );
-    painter.line_segment(
-        [egui::pos2(cx, apex_y), egui::pos2(cx + w * 0.40, foot_y)],
-        stroke,
-    );
-}
-
-/// Approximation of the macOS Option (⌥) glyph: a top horizontal
-/// stroke on the right with a step down, plus a separate bottom
-/// horizontal on the left.
-#[cfg(not(target_os = "macos"))]
-fn paint_alt(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let stroke = egui::Stroke::new(2.0, color);
-    // Proportions derived from rasterizing the canonical Mac ⌥ glyph
-    // and measuring pixel positions in the 60×52 trimmed glyph:
-    // top-LEFT bar cols 0-22 (x=0%–37%), detached upper-RIGHT cols
-    // 34-59 (x=57%–99%), bottom-RIGHT bar cols 33-59 (x=55%–99%).
-    // Visual corners (where bars meet the diagonal): top at 37%,
-    // bottom at 55%. Vertical extent matches paint_shift (15%–85%).
-    let top_y = rect.top() + h * 0.15;
-    let bot_y = rect.top() + h * 0.85;
-    let left = rect.left();
-    // The glyph is intrinsically right-heavy (bottom-right bar +
-    // detached tick + diagonal-end-on-right vs. only top-left bar
-    // on the left), so a uniform 5% inset would put its visual
-    // mass center near 54% — reading as "more space on the left"
-    // next to the centered Ctrl/Shift chips. Shifting all anchors
-    // ~3pp left aligns the mass center with the chip center.
-    let corner_top_x = left + w * 0.35;
-    let corner_bot_x = left + w * 0.52;
-    // Top-LEFT horizontal.
-    painter.line_segment(
-        [
-            egui::pos2(left + w * 0.02, top_y),
-            egui::pos2(corner_top_x, top_y),
-        ],
-        stroke,
-    );
-    // Diagonal connector: bar-corner top to bar-corner bottom.
-    painter.line_segment(
-        [
-            egui::pos2(corner_top_x, top_y),
-            egui::pos2(corner_bot_x, bot_y),
-        ],
-        stroke,
-    );
-    // Bottom-RIGHT horizontal — starts where the diagonal lands.
-    painter.line_segment(
-        [
-            egui::pos2(corner_bot_x, bot_y),
-            egui::pos2(left + w * 0.92, bot_y),
-        ],
-        stroke,
-    );
-    // Detached upper-right segment.
-    painter.line_segment(
-        [
-            egui::pos2(left + w * 0.64, top_y),
-            egui::pos2(left + w * 0.92, top_y),
-        ],
-        stroke,
-    );
-}
-
-/// Enter / Return arrow: a horizontal stroke at the top with a
-/// down-then-left hook ending in an arrowhead.
-fn paint_enter(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let stroke = egui::Stroke::new(2.0, color);
-    let top_y = rect.top() + h * 0.25;
-    let mid_y = rect.top() + h * 0.65;
-    let left_x = rect.left() + w * 0.12;
-    let right_x = rect.right() - w * 0.10;
-    // Top horizontal + drop down to mid_y on the right.
-    painter.line_segment(
-        [egui::pos2(right_x, top_y), egui::pos2(right_x, mid_y)],
-        stroke,
-    );
-    // Tail going left.
-    painter.line_segment(
-        [egui::pos2(right_x, mid_y), egui::pos2(left_x + 2.0, mid_y)],
-        stroke,
-    );
-    // Filled arrowhead pointing left.
-    let head = vec![
-        egui::pos2(left_x, mid_y),
-        egui::pos2(left_x + 4.0, mid_y - 3.0),
-        egui::pos2(left_x + 4.0, mid_y + 3.0),
-    ];
-    painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
-        head,
-        color,
-        egui::Stroke::NONE,
-    )));
-}
-
-/// Identical arrow shape rotated for each direction so the four
-/// nudge keys read as a matched set: shaft + filled triangular head,
-/// head occupies 35% of the glyph length.
-fn paint_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, dir: ArrowDir) {
-    let w = rect.width();
-    let h = rect.height();
-    let stroke = egui::Stroke::new(2.0, color);
-    let half_head = (w.min(h)) * 0.30;
-    match dir {
-        ArrowDir::Up => {
-            let cx = rect.center().x;
-            let tail_y = rect.bottom() - h * 0.10;
-            let head_base_y = rect.top() + h * 0.40;
-            let head_tip_y = rect.top() + h * 0.05;
-            painter.line_segment(
-                [egui::pos2(cx, tail_y), egui::pos2(cx, head_base_y)],
-                stroke,
-            );
-            let head = vec![
-                egui::pos2(cx, head_tip_y),
-                egui::pos2(cx - half_head, head_base_y),
-                egui::pos2(cx + half_head, head_base_y),
-            ];
-            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
-                head,
-                color,
-                egui::Stroke::NONE,
-            )));
-        }
-        ArrowDir::Down => {
-            let cx = rect.center().x;
-            let tail_y = rect.top() + h * 0.10;
-            let head_base_y = rect.bottom() - h * 0.40;
-            let head_tip_y = rect.bottom() - h * 0.05;
-            painter.line_segment(
-                [egui::pos2(cx, tail_y), egui::pos2(cx, head_base_y)],
-                stroke,
-            );
-            let head = vec![
-                egui::pos2(cx, head_tip_y),
-                egui::pos2(cx - half_head, head_base_y),
-                egui::pos2(cx + half_head, head_base_y),
-            ];
-            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
-                head,
-                color,
-                egui::Stroke::NONE,
-            )));
-        }
-        ArrowDir::Right => {
-            let cy = rect.center().y;
-            let tail_x = rect.left() + w * 0.10;
-            let head_base_x = rect.right() - w * 0.40;
-            let head_tip_x = rect.right() - w * 0.05;
-            painter.line_segment(
-                [egui::pos2(tail_x, cy), egui::pos2(head_base_x, cy)],
-                stroke,
-            );
-            let head = vec![
-                egui::pos2(head_tip_x, cy),
-                egui::pos2(head_base_x, cy - half_head),
-                egui::pos2(head_base_x, cy + half_head),
-            ];
-            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
-                head,
-                color,
-                egui::Stroke::NONE,
-            )));
-        }
-        ArrowDir::Left => {
-            let cy = rect.center().y;
-            let tail_x = rect.right() - w * 0.10;
-            let head_base_x = rect.left() + w * 0.40;
-            let head_tip_x = rect.left() + w * 0.05;
-            painter.line_segment(
-                [egui::pos2(tail_x, cy), egui::pos2(head_base_x, cy)],
-                stroke,
-            );
-            let head = vec![
-                egui::pos2(head_tip_x, cy),
-                egui::pos2(head_base_x, cy - half_head),
-                egui::pos2(head_base_x, cy + half_head),
-            ];
-            painter.add(egui::Shape::Path(egui::epaint::PathShape::convex_polygon(
-                head,
-                color,
-                egui::Stroke::NONE,
-            )));
-        }
-    }
-}
-
-// Bar thickness for +/-/=/_ — sized to match the painted Shift /
-// arrow stroke weight (~1.8px) so all painted glyphs read at the
-// same line weight as the ExtraBold letter strokes.
-const CHIP_BAR_THICKNESS: f32 = 1.8;
-
-fn paint_minus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(w * 0.80, CHIP_BAR_THICKNESS));
-    painter.rect_filled(bar, egui::CornerRadius::same(1), color);
-}
-
-fn paint_plus(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let horiz =
-        egui::Rect::from_center_size(rect.center(), egui::vec2(w * 0.80, CHIP_BAR_THICKNESS));
-    let vert =
-        egui::Rect::from_center_size(rect.center(), egui::vec2(CHIP_BAR_THICKNESS, h * 0.80));
-    painter.rect_filled(horiz, egui::CornerRadius::same(1), color);
-    painter.rect_filled(vert, egui::CornerRadius::same(1), color);
-}
-
-fn paint_equal(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let cx = rect.center().x;
-    let top = egui::Rect::from_center_size(
-        egui::pos2(cx, rect.center().y - h * 0.16),
-        egui::vec2(w * 0.80, CHIP_BAR_THICKNESS),
-    );
-    let bot = egui::Rect::from_center_size(
-        egui::pos2(cx, rect.center().y + h * 0.16),
-        egui::vec2(w * 0.80, CHIP_BAR_THICKNESS),
-    );
-    painter.rect_filled(top, egui::CornerRadius::same(1), color);
-    painter.rect_filled(bot, egui::CornerRadius::same(1), color);
-}
-
-fn paint_underscore(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let w = rect.width();
-    let h = rect.height();
-    let bar = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.bottom() - h * 0.10),
-        egui::vec2(w * 0.80, CHIP_BAR_THICKNESS),
-    );
-    painter.rect_filled(bar, egui::CornerRadius::same(1), color);
-}
 
 fn shortcut_row(
     ui: &mut egui::Ui,
