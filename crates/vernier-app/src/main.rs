@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use vernier_core::{
-    EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings, SnapPoint,
-    Tolerance, classify_aspect, detect_edges, shrink_to_content, shrink_to_content_with_bg,
+    EdgeBias, EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings,
+    SnapPoint, Tolerance, classify_aspect, detect_edges, shrink_to_content_frac,
+    shrink_to_content_with_bg_frac,
 };
 use vernier_platform::{
     Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId, Hud,
@@ -71,6 +72,11 @@ enum Cmd {
         /// Color tolerance (sum-of-channel difference, 0..=765). Default 30.
         #[arg(long, default_value_t = 30)]
         tolerance: u32,
+        /// Override the edge-localization bias for this one call:
+        /// `inner` | `midpoint` | `outer`. When omitted, uses the
+        /// daemon's configured bias.
+        #[arg(long)]
+        bias: Option<String>,
     },
     /// Open the preferences window. Reads the current settings from
     /// `~/.config/vernier/settings.toml`, lets the user edit them
@@ -106,8 +112,14 @@ fn main() -> Result<()> {
             "capture {}",
             path.canonicalize().unwrap_or(path).display()
         )),
-        Some(Cmd::DetectEdges { x, y, tolerance }) => {
-            run_client_command(&format!("detect-edges {x} {y} {tolerance}"))
+        Some(Cmd::DetectEdges {
+            x,
+            y,
+            tolerance,
+            bias,
+        }) => {
+            let bias_tok = bias.map(|b| format!(" {b}")).unwrap_or_default();
+            run_client_command(&format!("detect-edges {x} {y} {tolerance}{bias_tok}"))
         }
         Some(Cmd::Prefs) => run_prefs_window(),
         Some(Cmd::ReloadSettings) => run_client_command("reload-settings"),
@@ -502,6 +514,7 @@ fn run_daemon() -> Result<()> {
     // delta that the edge-detection scan uses to ignore minor color
     // variation.
     let mut tol_level = initial_settings.tolerance.default_level;
+    let mut edge_bias = initial_settings.edge_bias.default;
     let mut last_pointer_xy: Option<(f64, f64)> = None;
     // Active toast (centered or bottom-center). While `toast_until` is
     // in the future we keep showing the toast on every redraw and
@@ -855,6 +868,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -992,6 +1006,7 @@ fn run_daemon() -> Result<()> {
                             pending_guide,
                             toast,
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                             screen: ScreenSize {
                                 w: primary.bounds.w as i32,
                                 h: primary.bounds.h as i32,
@@ -1081,6 +1096,7 @@ fn run_daemon() -> Result<()> {
                             pending_guide,
                             toast,
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                             screen: ScreenSize {
                                 w: primary.bounds.w as i32,
                                 h: primary.bounds.h as i32,
@@ -1132,6 +1148,7 @@ fn run_daemon() -> Result<()> {
                                         cx,
                                         cy,
                                         current_tol_value(tol_level),
+                                        edge_bias,
                                         &guides,
                                         &held_rects,
                                     );
@@ -1154,6 +1171,7 @@ fn run_daemon() -> Result<()> {
                                         cx,
                                         cy,
                                         current_tol_value(tol_level),
+                                        edge_bias,
                                         &guides,
                                         &held_rects,
                                     );
@@ -1316,6 +1334,7 @@ fn run_daemon() -> Result<()> {
                             pending_guide,
                             toast,
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                             screen: ScreenSize {
                                 w: primary.bounds.w as i32,
                                 h: primary.bounds.h as i32,
@@ -1361,6 +1380,7 @@ fn run_daemon() -> Result<()> {
                                     (hi_x, hi_y),
                                     op.handle,
                                     current_tol_value(tol_level),
+                                    edge_bias,
                                     rect.bounds_phys,
                                 );
                                 rect.rect_start = snapped_lo;
@@ -1383,6 +1403,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -1439,6 +1460,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -1544,6 +1566,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -1596,6 +1619,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -1636,6 +1660,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -1696,6 +1721,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -1737,6 +1763,7 @@ fn run_daemon() -> Result<()> {
                                     x,
                                     y,
                                     current_tol_value(tol_level),
+                                    edge_bias,
                                     &guides,
                                     &held_rects,
                                 );
@@ -1770,6 +1797,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -1797,6 +1825,7 @@ fn run_daemon() -> Result<()> {
                         CaptureFrame {
                             frozen_frame: frozen_frame.as_ref(),
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                         },
                         &mut MeasurementEdit {
                             guides: &mut guides,
@@ -1979,6 +2008,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast: toast_ref,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -2017,6 +2047,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2174,6 +2205,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -2245,6 +2277,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -2323,6 +2356,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2462,6 +2496,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2506,6 +2541,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2542,6 +2578,7 @@ fn run_daemon() -> Result<()> {
                             x,
                             y,
                             current_tol_value(tol_level),
+                            edge_bias,
                             &guides,
                             &held_rects,
                         );
@@ -2576,6 +2613,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2626,6 +2664,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2677,6 +2716,54 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
+                                screen: ScreenSize {
+                                    w: primary.bounds.w as i32,
+                                    h: primary.bounds.h as i32,
+                                },
+                                flags: HudFlags {
+                                    color_alternate,
+                                    align_mode,
+                                    alt_held,
+                                    stuck_drag_committed: stuck_pill_drag_committed,
+                                },
+                                resize_handle: None,
+                                context_menu: context_menu.as_ref(),
+                            },
+                            x,
+                            y,
+                        );
+                    }
+                } else if pressed_accel.is_some() && pressed_accel == shortcut_accels.bias_cycle {
+                    edge_bias = edge_bias.cycle();
+                    log::info!("edge bias → {}", edge_bias.label());
+                    let toast = HudToast {
+                        text: format!("Edge bias: {}", edge_bias.label()),
+                    };
+                    active_toast = Some(toast);
+                    toast_until = Some(Instant::now() + Duration::from_millis(TOAST_TOLERANCE_MS));
+                    spawn_toast_timer(
+                        &combined_tx,
+                        Duration::from_millis(TOAST_TOLERANCE_MS),
+                        false,
+                    );
+                    if let Some((x, y)) = last_pointer_xy {
+                        last_hud_redraw = Instant::now();
+                        let toast = current_toast(&active_toast, toast_until);
+                        refresh_hud(
+                            &mut overlay,
+                            &HudScene {
+                                mode: &mode,
+                                frozen_frame: frozen_frame.as_ref(),
+                                measurements: MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                pending_guide,
+                                toast,
+                                tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2750,6 +2837,7 @@ fn run_daemon() -> Result<()> {
                                         pending_guide,
                                         toast,
                                         tolerance: current_tol_value(tol_level),
+                                        bias: edge_bias,
                                         screen: ScreenSize {
                                             w: primary.bounds.w as i32,
                                             h: primary.bounds.h as i32,
@@ -2856,6 +2944,7 @@ fn run_daemon() -> Result<()> {
                                 pending_guide,
                                 toast,
                                 tolerance: current_tol_value(tol_level),
+                                bias: edge_bias,
                                 screen: ScreenSize {
                                     w: primary.bounds.w as i32,
                                     h: primary.bounds.h as i32,
@@ -2933,6 +3022,7 @@ fn run_daemon() -> Result<()> {
                                         pending_guide,
                                         toast,
                                         tolerance: current_tol_value(tol_level),
+                                        bias: edge_bias,
                                         screen: ScreenSize {
                                             w: primary.bounds.w as i32,
                                             h: primary.bounds.h as i32,
@@ -3014,6 +3104,7 @@ fn run_daemon() -> Result<()> {
                                             pending_guide,
                                             toast,
                                             tolerance: current_tol_value(tol_level),
+                                            bias: edge_bias,
                                             screen: ScreenSize {
                                                 w: primary.bounds.w as i32,
                                                 h: primary.bounds.h as i32,
@@ -3110,6 +3201,7 @@ fn run_daemon() -> Result<()> {
                             active_toast: &active_toast,
                             toast_until,
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                             screen: ScreenSize {
                                 w: primary.bounds.w as i32,
                                 h: primary.bounds.h as i32,
@@ -3202,11 +3294,13 @@ fn run_daemon() -> Result<()> {
                 x,
                 y,
                 tolerance,
+                bias,
                 reply,
             }) => {
-                log::info!("ipc: detect-edges ({x},{y}) tol={tolerance}");
+                let effective_bias = bias.unwrap_or(edge_bias);
+                log::info!("ipc: detect-edges ({x},{y}) tol={tolerance} bias={effective_bias:?}");
                 let resp = match platform.capture_screen(primary.id) {
-                    Ok(frame) => format_edges(&frame, x, y, tolerance),
+                    Ok(frame) => format_edges(&frame, x, y, tolerance, effective_bias),
                     Err(e) => format!("error: capture_screen: {e}\n"),
                 };
                 let _ = reply.send(resp);
@@ -3221,6 +3315,7 @@ fn run_daemon() -> Result<()> {
                         // Reset live tolerance to the new default so the
                         // user immediately sees their pref reflected.
                         tol_level = s.tolerance.default_level;
+                        edge_bias = s.edge_bias.default;
                         shortcut_accels = parse_shortcut_accels(&s);
                         align_mode = shortcut_accels
                             .crosshair
@@ -3330,6 +3425,7 @@ fn run_daemon() -> Result<()> {
                                         pending_guide,
                                         toast,
                                         tolerance: current_tol_value(tol_level),
+                                        bias: edge_bias,
                                         screen: ScreenSize {
                                             w: primary.bounds.w as i32,
                                             h: primary.bounds.h as i32,
@@ -3402,6 +3498,7 @@ fn run_daemon() -> Result<()> {
                             pending_guide,
                             toast: None,
                             tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
                             screen: ScreenSize {
                                 w: primary.bounds.w as i32,
                                 h: primary.bounds.h as i32,
@@ -3452,6 +3549,7 @@ fn run_daemon() -> Result<()> {
                                     pending_guide,
                                     toast,
                                     tolerance: current_tol_value(tol_level),
+                                    bias: edge_bias,
                                     screen: ScreenSize {
                                         w: primary.bounds.w as i32,
                                         h: primary.bounds.h as i32,
@@ -3496,6 +3594,7 @@ fn run_daemon() -> Result<()> {
                         active_toast: &active_toast,
                         toast_until,
                         tolerance: current_tol_value(tol_level),
+                        bias: edge_bias,
                         screen: ScreenSize {
                             w: primary.bounds.w as i32,
                             h: primary.bounds.h as i32,
@@ -4576,6 +4675,7 @@ struct ParsedShortcuts {
     refresh_capture: Option<Accelerator>,
     tolerance_up: Option<Accelerator>,
     tolerance_down: Option<Accelerator>,
+    bias_cycle: Option<Accelerator>,
     nudge_left: Option<Accelerator>,
     nudge_right: Option<Accelerator>,
     nudge_up: Option<Accelerator>,
@@ -4725,6 +4825,7 @@ struct HudScene<'a> {
     pending_guide: Option<GuideAxis>,
     toast: Option<&'a HudToast>,
     tolerance: u32,
+    bias: EdgeBias,
     screen: ScreenSize,
     flags: HudFlags,
     resize_handle: Option<ResizeHandle>,
@@ -4797,6 +4898,7 @@ struct NudgeRenderCtx<'a> {
     active_toast: &'a Option<HudToast>,
     toast_until: Option<Instant>,
     tolerance: u32,
+    bias: EdgeBias,
     screen: ScreenSize,
     flags: HudFlags,
     context_menu: Option<&'a ContextMenuState>,
@@ -4809,6 +4911,7 @@ struct NudgeRenderCtx<'a> {
 struct CaptureFrame<'a> {
     frozen_frame: Option<&'a NativeFrame>,
     tolerance: u32,
+    bias: EdgeBias,
 }
 
 /// Mutable borrow of the persisted measurement collections plus the
@@ -4885,6 +4988,7 @@ fn apply_nudge_step(
             pending_guide: ctx.pending_guide,
             toast,
             tolerance: ctx.tolerance,
+            bias: ctx.bias,
             screen: ctx.screen,
             flags: ctx.flags,
             resize_handle: None,
@@ -4913,7 +5017,7 @@ fn log_shortcut_accels(p: &ParsedShortcuts) {
     log::info!(
         "shortcuts reloaded — clear_and_hide={} restore={} capture={} crosshair={} \
          guide_h={} guide_v={} color_toggle={} stuck_h={} stuck_v={} \
-         refresh={} tol_up={} tol_down={} nudge_l={} nudge_r={} nudge_u={} nudge_d={} \
+         refresh={} tol_up={} tol_down={} bias_cycle={} nudge_l={} nudge_r={} nudge_u={} nudge_d={} \
          screenshot={}",
         fmt(&p.clear_and_hide),
         fmt(&p.restore),
@@ -4927,6 +5031,7 @@ fn log_shortcut_accels(p: &ParsedShortcuts) {
         fmt(&p.refresh_capture),
         fmt(&p.tolerance_up),
         fmt(&p.tolerance_down),
+        fmt(&p.bias_cycle),
         fmt(&p.nudge_left),
         fmt(&p.nudge_right),
         fmt(&p.nudge_up),
@@ -4950,6 +5055,7 @@ fn parse_shortcut_accels(s: &Settings) -> ParsedShortcuts {
         refresh_capture: Accelerator::parse(&s.shortcuts.refresh_capture),
         tolerance_up: Accelerator::parse(&s.shortcuts.tolerance_up),
         tolerance_down: Accelerator::parse(&s.shortcuts.tolerance_down),
+        bias_cycle: Accelerator::parse(&s.shortcuts.bias_cycle),
         nudge_left: Accelerator::parse(&s.shortcuts.nudge_left),
         nudge_right: Accelerator::parse(&s.shortcuts.nudge_right),
         nudge_up: Accelerator::parse(&s.shortcuts.nudge_up),
@@ -5214,6 +5320,9 @@ enum IpcCmd {
         x: i32,
         y: i32,
         tolerance: u32,
+        /// Per-call bias override; `None` = use the daemon's
+        /// configured `edge_bias`.
+        bias: Option<EdgeBias>,
         reply: SyncSender<String>,
     },
     /// Re-read settings.toml and apply user-tunable behavior
@@ -5277,8 +5386,16 @@ fn ipc_loop(
                         .get(2)
                         .and_then(|s| s.parse::<u32>().ok())
                         .unwrap_or(30);
+                    let bias = parts
+                        .get(3)
+                        .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                            "inner" => Some(EdgeBias::Inner),
+                            "midpoint" | "mid" => Some(EdgeBias::Midpoint),
+                            "outer" => Some(EdgeBias::Outer),
+                            _ => None,
+                        });
                     let (Some(x), Some(y)) = (x, y) else {
-                        let _ = writer.write_all(b"error: detect-edges X Y [tolerance]\n");
+                        let _ = writer.write_all(b"error: detect-edges X Y [tolerance] [bias]\n");
                         continue;
                     };
                     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
@@ -5287,6 +5404,7 @@ fn ipc_loop(
                             x,
                             y,
                             tolerance: tol,
+                            bias,
                             reply: tx,
                         }))
                         .is_err()
@@ -6110,6 +6228,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
         pending_guide,
         toast,
         tolerance,
+        bias,
         screen: ScreenSize {
             w: screen_w,
             h: screen_h,
@@ -6145,7 +6264,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
         if alt_held {
             (x, y)
         } else {
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects);
             match axis {
                 GuideAxis::Horizontal => (x, snap_to_nearest_y_edge(y, &edges)),
                 GuideAxis::Vertical => (snap_to_nearest_x_edge(x, &edges), y),
@@ -6323,7 +6442,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
             let edges = if align_mode {
                 [None; 4]
             } else {
-                edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects)
+                edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects)
             };
             let mut hud = Hud {
                 kind: HudKind::Hover {
@@ -6373,7 +6492,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
                 // Below the drag threshold the rect would just be a
                 // 1×1 dot — fall back to the live measurement HUD so a
                 // mis-click looks identical to hovering.
-                let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
+                let edges = edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects);
                 hud.kind = HudKind::Hover {
                     cursor: (x, y),
                     edges,
@@ -6434,11 +6553,12 @@ fn edges_for_hud(
     x: f64,
     y: f64,
     tolerance: u32,
+    bias: EdgeBias,
     guides: &[Guide],
     held_rects: &[HeldRect],
 ) -> [Option<HudEdge>; 4] {
     let mut edges = frozen_frame
-        .and_then(|f| detect_hud_edges(f, x, y, tolerance))
+        .and_then(|f| detect_hud_edges(f, x, y, tolerance, bias))
         .unwrap_or([None; 4]);
     apply_guides_to_edges(&mut edges, guides, x, y);
     apply_held_rects_to_edges(&mut edges, held_rects, x, y);
@@ -6562,17 +6682,15 @@ fn freeze_axis_measurement(
     surface_h: u32,
     color_alternate: bool,
 ) -> StuckMeasurement {
-    // The measured length is an EXACT physical-pixel integer derived
-    // from the two edges' `pos_phys`. `start`/`end` (logical) are kept
-    // only so the renderer can draw the line; the displayed value
+    // The measured length is a physical-pixel span derived from the
+    // two edges' `pos_phys` boundaries. `start`/`end` (logical) are
+    // kept only so the renderer can draw the line; the displayed value
     // comes from `len_phys`.
     //
-    // Inclusivity rule: when BOTH ends are real detected/guide edges,
-    // both are inclusive content pixels, so the span is
-    // `far - near + 1`. When an end falls through to the screen
-    // border, that border is an EXCLUSIVE buffer extent, so the `+1`
-    // is dropped on that side. With one inclusive + one exclusive end
-    // the length is simply `far - near` (no `+1`).
+    // `pos_phys` is already the localized half-pixel boundary, so the
+    // span is `far - near` directly — no fence-post `+1`. When an end
+    // falls through to the screen border, the fallback is that
+    // border's boundary (a half-pixel line just outside the buffer).
     let scale = primary_scale_factor();
     match axis {
         GuideAxis::Vertical => {
@@ -6582,9 +6700,9 @@ fn freeze_axis_measurement(
             let down_phys = edges[3].map(|e| e.pos_phys.1);
             let len_phys = inclusive_span_phys(
                 up_phys,
-                0,
+                -0.5,
                 down_phys,
-                (surface_h as f64 * scale).round() as i32,
+                (surface_h as f64 * scale).round() - 0.5,
             );
             StuckMeasurement {
                 axis,
@@ -6604,9 +6722,9 @@ fn freeze_axis_measurement(
             let right_phys = edges[1].map(|e| e.pos_phys.0);
             let len_phys = inclusive_span_phys(
                 left_phys,
-                0,
+                -0.5,
                 right_phys,
-                (surface_w as f64 * scale).round() as i32,
+                (surface_w as f64 * scale).round() - 0.5,
             );
             StuckMeasurement {
                 axis,
@@ -6622,28 +6740,23 @@ fn freeze_axis_measurement(
     }
 }
 
-/// Physical-pixel length between a `near` edge and a `far` edge,
-/// applying the inclusive/exclusive rule from the pixel-perfect
-/// conventions:
+/// Physical-pixel length between a `near` edge boundary and a `far`
+/// edge boundary.
 ///
-/// - Both ends are real content edges (`Some`) → both inclusive →
-///   `far - near + 1`.
-/// - An end is `None` → it falls back to the screen border, an
-///   EXCLUSIVE buffer extent → drop that side's `+1`.
-///
-/// `near_fallback` / `far_fallback` are the physical border extents
-/// used when the respective edge is missing.
+/// Edge boundaries are the localized half-pixel lines bracketing the
+/// content (see [`HudEdge::pos_phys`]), so the span is simply
+/// `far - near` — no fence-post `+1`. A missing end falls back to the
+/// screen border boundary; `near_fallback` / `far_fallback` are those
+/// border boundaries (half-pixel lines just outside the buffer).
 fn inclusive_span_phys(
-    near: Option<i32>,
-    near_fallback: i32,
-    far: Option<i32>,
-    far_fallback: i32,
-) -> i32 {
+    near: Option<f64>,
+    near_fallback: f64,
+    far: Option<f64>,
+    far_fallback: f64,
+) -> f64 {
     let near_pos = near.unwrap_or(near_fallback);
     let far_pos = far.unwrap_or(far_fallback);
-    // `+1` only when BOTH bounds are inclusive content pixels.
-    let plus_one = i32::from(near.is_some() && far.is_some());
-    (far_pos - near_pos).abs() + plus_one
+    (far_pos - near_pos).abs()
 }
 
 /// Mutate `edges` so each guide that lies between the cursor and an
@@ -6652,10 +6765,14 @@ fn inclusive_span_phys(
 /// [`detect_edges`]: 0=Left, 1=Right, 2=Up, 3=Down.
 fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: f64, y: f64) {
     // Guide positions are integer LOGICAL pixels; fold them into the
-    // physical-pixel measurement space exactly once here (rounded), so
-    // downstream `pos_phys` arithmetic stays integer.
+    // physical-pixel measurement space exactly once here (rounded).
+    // The measured-axis coordinate is then nudged ±0.5 to the guide
+    // line's OUTWARD side — `-0.5` for a near (Left/Up) edge, `+0.5`
+    // for a far (Right/Down) edge — so it reads as a half-pixel
+    // boundary like a detected edge, and a guide-to-guide span keeps
+    // its inclusive `far - near + 1` count under the boundary model.
     let scale = primary_scale_factor();
-    let to_phys = |logical: f64| (logical * scale).round() as i32;
+    let to_phys = |logical: f64| (logical * scale).round();
     for guide in guides {
         match guide.axis {
             GuideAxis::Vertical => {
@@ -6666,7 +6783,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[0] = Some(HudEdge {
                             axis: HudAxis::Left,
                             position: (guide.position as f64, y),
-                            pos_phys: (to_phys(guide.position as f64), to_phys(y)),
+                            pos_phys: (to_phys(guide.position as f64) - 0.5, to_phys(y)),
                             distance_px: dist,
                         });
                     }
@@ -6676,7 +6793,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[1] = Some(HudEdge {
                             axis: HudAxis::Right,
                             position: (guide.position as f64, y),
-                            pos_phys: (to_phys(guide.position as f64), to_phys(y)),
+                            pos_phys: (to_phys(guide.position as f64) + 0.5, to_phys(y)),
                             distance_px: dist,
                         });
                     }
@@ -6690,7 +6807,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[2] = Some(HudEdge {
                             axis: HudAxis::Up,
                             position: (x, guide.position as f64),
-                            pos_phys: (to_phys(x), to_phys(guide.position as f64)),
+                            pos_phys: (to_phys(x), to_phys(guide.position as f64) - 0.5),
                             distance_px: dist,
                         });
                     }
@@ -6700,7 +6817,7 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
                         edges[3] = Some(HudEdge {
                             axis: HudAxis::Down,
                             position: (x, guide.position as f64),
-                            pos_phys: (to_phys(x), to_phys(guide.position as f64)),
+                            pos_phys: (to_phys(x), to_phys(guide.position as f64) + 0.5),
                             distance_px: dist,
                         });
                     }
@@ -6726,9 +6843,9 @@ fn apply_guides_to_edges(edges: &mut [Option<HudEdge>; 4], guides: &[Guide], x: 
 /// step `convert_edges_to_surface` applies to detected pixel edges —
 /// so the measurement line stops just short of the border instead of
 /// drawing on top of it. That inset is a RENDERING concern only:
-/// `pos_phys` carries the rect's true integer physical-pixel border
-/// (from `bounds_phys`, the inclusive content bounds) so the measured
-/// value is exact.
+/// `pos_phys` carries the rect's localized physical-pixel edge
+/// boundary (straight from `bounds_phys`) so the measured value is
+/// exact.
 fn apply_held_rects_to_edges(
     edges: &mut [Option<HudEdge>; 4],
     held_rects: &[HeldRect],
@@ -6811,14 +6928,14 @@ fn apply_held_rects_to_edges(
 /// Physical-pixel x for a cursor-anchored edge. The perpendicular
 /// coordinate of a held-rect snap edge only matters for drawing the
 /// tick mark, so derive it from the cursor's logical x.
-fn edge_pos_phys_x(_edges: &[Option<HudEdge>; 4], x: f64) -> i32 {
-    (x * primary_scale_factor()).round() as i32
+fn edge_pos_phys_x(_edges: &[Option<HudEdge>; 4], x: f64) -> f64 {
+    (x * primary_scale_factor()).round()
 }
 
 /// Physical-pixel y for a cursor-anchored edge — companion to
 /// [`edge_pos_phys_x`].
-fn edge_pos_phys_y(_edges: &[Option<HudEdge>; 4], y: f64) -> i32 {
-    (y * primary_scale_factor()).round() as i32
+fn edge_pos_phys_y(_edges: &[Option<HudEdge>; 4], y: f64) -> f64 {
+    (y * primary_scale_factor()).round()
 }
 
 /// True when the cursor is over the W×H / camera-icon pill of any
@@ -7170,6 +7287,7 @@ fn detect_hud_edges(
     surface_x: f64,
     surface_y: f64,
     tolerance: u32,
+    bias: EdgeBias,
 ) -> Option<[Option<HudEdge>; 4]> {
     let surface_w = frame.bounds.w as f64;
     let surface_h = frame.bounds.h as f64;
@@ -7189,7 +7307,7 @@ fn detect_hud_edges(
         height: frame.height,
         stride: frame.stride,
     };
-    let edges = detect_edges(&view, frame_cursor, Tolerance(tolerance));
+    let edges = detect_edges(&view, frame_cursor, Tolerance(tolerance), bias);
     Some(convert_edges_to_surface(&edges, scale_x, scale_y))
 }
 
@@ -7200,27 +7318,36 @@ fn convert_edges_to_surface(edges: &EdgeQuad, scale_x: f64, scale_y: f64) -> [Op
     let mut out: [Option<HudEdge>; 4] = [None; 4];
     for (slot, candidate) in out.iter_mut().zip(edges.iter()) {
         if let Some(c) = candidate {
-            // detect_edges returns the FIRST pixel that exceeds tolerance
-            // — the first different-color pixel ACROSS the boundary, i.e.
-            // one pixel OUTSIDE the anchor's region. Step one pixel back
-            // toward the anchor (`dx`/`dy`) to land on the last in-region
-            // pixel — that is the inclusive content edge. `pos_phys`
-            // carries its true integer physical coordinate, and the
-            // measurement spans those inclusive edges as `right - left
-            // + 1`. The drawn `position` uses the same stepped-back
-            // point so the snapped line sits on the content edge.
+            // `pos_phys` (MEASUREMENT): the localized edge boundary
+            // from `EdgeCandidate::edge_phys` — a fractional half-pixel
+            // line that *follows* the active [`EdgeBias`]. The spans
+            // between two boundaries are `far - near` (no `+1`).
+            //
+            // `position` (DRAWING): drawn at the same boundary as
+            // `pos_phys` so the green crosshair line tracks the bias —
+            // pressing `E` visibly snaps the line by half the ramp
+            // width on a soft edge. (Before bias was added the line
+            // was inset by one pixel toward the anchor; with a
+            // variable bias point that inset would lie on different
+            // sides of the boundary depending on the bias, so we drop
+            // it.) The perpendicular axis carries the cursor's
+            // anchored draw point for the tick mark.
             let (dx, dy, axis) = match c.direction {
                 Direction::Left => (1, 0, HudAxis::Left),
                 Direction::Right => (-1, 0, HudAxis::Right),
                 Direction::Up => (0, 1, HudAxis::Up),
                 Direction::Down => (0, -1, HudAxis::Down),
             };
-            let adj_x = c.position.x + dx;
-            let adj_y = c.position.y + dy;
+            let perp_x = (c.position.x + dx) as f64;
+            let perp_y = (c.position.y + dy) as f64;
+            let pos_phys = match c.direction {
+                Direction::Left | Direction::Right => (c.edge_phys, perp_y),
+                Direction::Up | Direction::Down => (perp_x, c.edge_phys),
+            };
             *slot = Some(HudEdge {
                 axis,
-                position: (adj_x as f64 * inv_x, adj_y as f64 * inv_y),
-                pos_phys: (adj_x, adj_y),
+                position: (pos_phys.0 * inv_x, pos_phys.1 * inv_y),
+                pos_phys,
                 distance_px: c.distance.saturating_sub(1),
             });
         }
@@ -7246,6 +7373,7 @@ fn handle_pointer_button(
     let CaptureFrame {
         frozen_frame,
         tolerance,
+        bias,
     } = frame;
     let guides: &mut [Guide] = &mut *content.guides;
     let stuck_measurements: &mut [StuckMeasurement] = &mut *content.stuck_measurements;
@@ -7326,7 +7454,7 @@ fn handle_pointer_button(
             // Don't paint the rect yet — wait for the user to actually
             // move past `DRAG_THRESHOLD_PX`. A bare click should look
             // like a hover, not a 1×1 box.
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
@@ -7344,7 +7472,7 @@ fn handle_pointer_button(
         if !has_drag_distance(start.pixel, cursor_px) {
             log::info!("click without drag — no measurement");
             *mode = InteractionMode::Hover { cursor: cursor_px };
-            let edges = edges_for_hud(frozen_frame, x, y, tolerance, guides, held_rects);
+            let edges = edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects);
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
@@ -7369,7 +7497,7 @@ fn handle_pointer_button(
         };
         // Snap-shrink to fit content.
         let (snapped_start, snapped_end, bounds_phys) =
-            snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance);
+            snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance, bias);
         let measurement = Measurement::new(
             SnapPoint::loose(Px::new(
                 snapped_start.0.round() as i32,
@@ -7422,24 +7550,27 @@ fn handle_pointer_button(
 }
 
 /// A snapped rectangle result: logical `(start, end)` corners for
-/// drawing, plus inclusive physical-pixel bounds `(left, top, right,
+/// drawing, plus physical-pixel edge boundaries `(left, top, right,
 /// bottom)` for measurement.
-type SnappedRect = ((f64, f64), (f64, f64), (i32, i32, i32, i32));
+type SnappedRect = ((f64, f64), (f64, f64), (f64, f64, f64, f64));
 
-/// Apply [`shrink_to_content`] to a rect given in surface (logical)
-/// coords. Maps logical → frame coords, runs the shrink, maps back.
+/// Apply [`shrink_to_content_frac`] to a rect given in surface
+/// (logical) coords. Maps logical → frame coords, runs the shrink,
+/// maps back.
 ///
-/// Returns both the logical corners (for drawing) AND the inclusive
-/// physical-pixel bounds `(left, top, right, bottom)` straight from
-/// `shrink_to_content` — the latter is what measurement is computed
-/// from, so it never round-trips through logical space and stays
-/// pixel-exact. When there's no frame to scan, the physical bounds
-/// are derived from the (un-shrunk) logical corners as a best effort.
+/// Returns both the logical corners (for drawing) AND the fractional
+/// physical-pixel edge boundaries `(left, top, right, bottom)`
+/// straight from `shrink_to_content_frac` — the latter is what
+/// measurement is computed from, so it never round-trips through
+/// logical space and stays pixel-exact. When there's no frame to scan,
+/// the physical bounds are derived from the (un-shrunk) logical
+/// corners as a best effort.
 fn snap_shrink_logical_rect(
     frozen_frame: Option<&vernier_platform::NativeFrame>,
     a: (f64, f64),
     b: (f64, f64),
     tolerance: u32,
+    bias: EdgeBias,
 ) -> SnappedRect {
     let Some(frame) = frozen_frame else {
         return (a, b, logical_corners_to_phys_bounds(a, b));
@@ -7461,29 +7592,39 @@ fn snap_shrink_logical_rect(
     let fy0 = (a.1 * scale_y).round() as i32;
     let fx1 = (b.0 * scale_x).round() as i32;
     let fy1 = (b.1 * scale_y).round() as i32;
-    let (sx0, sy0, sx1, sy1) = shrink_to_content(&view, fx0, fy0, fx1, fy1, Tolerance(tolerance));
+    // Fractional edge boundaries `(left, top, right, bottom)`, already
+    // normalized lo→hi — width is `right - left` (no `+1`).
+    let (left, top, right, bottom) =
+        shrink_to_content_frac(&view, fx0, fy0, fx1, fy1, Tolerance(tolerance), bias);
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
+    // Drawing corners: a boundary brackets the content half a pixel
+    // out, so step back to the inclusive content pixel before mapping
+    // to logical space — keeps the drawn rect on the content.
     (
-        (sx0 as f64 * inv_x, sy0 as f64 * inv_y),
-        (sx1 as f64 * inv_x, sy1 as f64 * inv_y),
-        // INCLUSIVE physical-pixel bounds, normalized lo→hi. These
-        // are exact frame pixels — width is `right - left + 1`.
-        (sx0.min(sx1), sy0.min(sy1), sx0.max(sx1), sy0.max(sy1)),
+        ((left + 0.5) * inv_x, (top + 0.5) * inv_y),
+        ((right - 0.5) * inv_x, (bottom - 0.5) * inv_y),
+        (left, top, right, bottom),
     )
 }
 
-/// Best-effort physical-pixel bounds from logical corners — used only
-/// when no frame is available to run `shrink_to_content` against (and
-/// for sessions restored from disk). Rounds each corner to the
-/// physical grid; `right`/`bottom` are treated as inclusive content
-/// pixels so width stays `right - left + 1`.
-fn logical_corners_to_phys_bounds(a: (f64, f64), b: (f64, f64)) -> (i32, i32, i32, i32) {
+/// Best-effort physical-pixel edge boundaries from logical corners —
+/// used only when no frame is available to run `shrink_to_content_frac`
+/// against (and for sessions restored from disk). Rounds each corner
+/// to the physical grid, then treats the corner pixels as inclusive
+/// content: the left/top boundary sits at `pixel - 0.5`, the
+/// right/bottom at `pixel + 0.5`, so width stays `right - left`.
+fn logical_corners_to_phys_bounds(a: (f64, f64), b: (f64, f64)) -> (f64, f64, f64, f64) {
     let scale = primary_scale_factor();
-    let to_phys = |v: f64| (v * scale).round() as i32;
+    let to_phys = |v: f64| (v * scale).round();
     let (ax, bx) = (to_phys(a.0), to_phys(b.0));
     let (ay, by) = (to_phys(a.1), to_phys(b.1));
-    (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+    (
+        ax.min(bx) - 0.5,
+        ay.min(by) - 0.5,
+        ax.max(bx) + 0.5,
+        ay.max(by) + 0.5,
+    )
 }
 
 /// Snap-shrink a held rect after a resize-release. Only the side(s)
@@ -7493,17 +7634,18 @@ fn logical_corners_to_phys_bounds(a: (f64, f64), b: (f64, f64)) -> (i32, i32, i3
 /// top-left (the default) breaks down once the user drags the rect
 /// so its top-left lands inside content.
 ///
-/// `prev_bounds_phys` is the rect's current inclusive physical bounds;
+/// `prev_bounds_phys` is the rect's current physical edge boundaries;
 /// sides the handle did NOT move keep their value from it so the
 /// measurement stays pixel-exact on the un-snapped axes. The snapped
-/// sides come straight from `shrink_to_content` (exact frame pixels).
+/// sides come straight from `shrink_to_content_with_bg_frac`.
 fn snap_shrink_resize(
     frozen_frame: Option<&vernier_platform::NativeFrame>,
     rect_lo: (f64, f64),
     rect_hi: (f64, f64),
     handle: ResizeHandle,
     tolerance: u32,
-    prev_bounds_phys: (i32, i32, i32, i32),
+    bias: EdgeBias,
+    prev_bounds_phys: (f64, f64, f64, f64),
 ) -> SnappedRect {
     let Some(frame) = frozen_frame else {
         return (rect_lo, rect_hi, prev_bounds_phys);
@@ -7540,7 +7682,9 @@ fn snap_shrink_resize(
         Left => (fx1 + pad_x, mid_fy),
         Right => (fx0 - pad_x, mid_fy),
     };
-    let (sx0, sy0, sx1, sy1) = shrink_to_content_with_bg(
+    // Fractional edge boundaries `(left, top, right, bottom)`, already
+    // normalized lo→hi.
+    let (fl, ft, fr, fb) = shrink_to_content_with_bg_frac(
         &view,
         fx0,
         fy0,
@@ -7548,6 +7692,7 @@ fn snap_shrink_resize(
         fy1,
         Px::new(bg_x, bg_y),
         Tolerance(tolerance),
+        bias,
     );
     let inv_x = 1.0 / scale_x;
     let inv_y = 1.0 / scale_y;
@@ -7556,37 +7701,35 @@ fn snap_shrink_resize(
     let snaps_right = matches!(handle, Right | TopRight | BottomRight);
     let snaps_top = matches!(handle, Top | TopLeft | TopRight);
     let snaps_bot = matches!(handle, Bottom | BottomLeft | BottomRight);
+    // Drawing corners step the half-pixel boundary back to the
+    // inclusive content pixel before mapping to logical space.
     let snapped_lo_x = if snaps_left {
-        sx0 as f64 * inv_x
+        (fl + 0.5) * inv_x
     } else {
         rect_lo.0
     };
     let snapped_hi_x = if snaps_right {
-        sx1 as f64 * inv_x
+        (fr - 0.5) * inv_x
     } else {
         rect_hi.0
     };
     let snapped_lo_y = if snaps_top {
-        sy0 as f64 * inv_y
+        (ft + 0.5) * inv_y
     } else {
         rect_lo.1
     };
     let snapped_hi_y = if snaps_bot {
-        sy1 as f64 * inv_y
+        (fb - 0.5) * inv_y
     } else {
         rect_hi.1
     };
-    // Snapped sides take the exact frame pixel from `shrink_to_content`;
+    // Snapped sides take the localized boundary from the shrink;
     // un-snapped sides keep their previous physical bound untouched.
     let bounds_phys = (
-        if snaps_left { sx0.min(sx1) } else { prev_left },
-        if snaps_top { sy0.min(sy1) } else { prev_top },
-        if snaps_right {
-            sx0.max(sx1)
-        } else {
-            prev_right
-        },
-        if snaps_bot { sy0.max(sy1) } else { prev_bot },
+        if snaps_left { fl } else { prev_left },
+        if snaps_top { ft } else { prev_top },
+        if snaps_right { fr } else { prev_right },
+        if snaps_bot { fb } else { prev_bot },
     );
     (
         (snapped_lo_x, snapped_lo_y),
@@ -7595,7 +7738,7 @@ fn snap_shrink_resize(
     )
 }
 
-fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {
+fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32, bias: EdgeBias) -> String {
     let view = match FrameView::packed(&frame.pixels, frame.width, frame.height) {
         Some(v) => v,
         None => {
@@ -7607,20 +7750,24 @@ fn format_edges(frame: &Frame, x: i32, y: i32, tolerance: u32) -> String {
             );
         }
     };
-    let edges = detect_edges(&view, Px::new(x, y), Tolerance(tolerance));
+    let edges = detect_edges(&view, Px::new(x, y), Tolerance(tolerance), bias);
     let mut out = String::new();
     out.push_str(&format!(
-        "frame: {}x{} cursor: ({},{}) tolerance: {}\n",
-        frame.width, frame.height, x, y, tolerance
+        "frame: {}x{} cursor: ({},{}) tolerance: {} bias: {:?}\n",
+        frame.width, frame.height, x, y, tolerance, bias
     ));
     let labels = ["Left  ", "Right ", "Up    ", "Down  "];
     for (slot, label) in edges.iter().zip(labels.iter()) {
         match slot {
+            // `pos`/`dist` mark the first over-tolerance pixel;
+            // `edge_phys` is the localized edge (the soft-edge
+            // midpoint) — the fractional coordinate measurements use.
             Some(c) => out.push_str(&format!(
-                "  {label} dist={:4}px pos=({:5},{:5}) Δ={:3} edge=#{:02x}{:02x}{:02x}\n",
+                "  {label} dist={:4}px pos=({:5},{:5}) edge_phys={:9.3} Δ={:3} edge=#{:02x}{:02x}{:02x}\n",
                 c.distance,
                 c.position.x,
                 c.position.y,
+                c.edge_phys,
                 c.strength,
                 c.edge_color.r,
                 c.edge_color.g,
@@ -7721,11 +7868,13 @@ fn save_session(
     s.push_str("# vernier session v1\n");
     for r in rects {
         // v3 rect line: logical corners, color-alt flag, then the four
-        // inclusive physical-pixel bounds so a restored measurement is
-        // pixel-exact. Older readers stop at the 6-token form and
-        // recompute bounds from the logical corners.
+        // physical-pixel edge boundaries so a restored measurement is
+        // pixel-exact. The boundaries are written with a forced decimal
+        // (`{:.4}`) so a reader can tell them apart from legacy v3
+        // saves, which stored integer inclusive content pixels. Older
+        // readers stop at the 6-token form and recompute from corners.
         s.push_str(&format!(
-            "rect {} {} {} {} {} {} {} {} {}\n",
+            "rect {} {} {} {} {} {:.4} {:.4} {:.4} {:.4}\n",
             r.rect_start.0,
             r.rect_start.1,
             r.rect_end.0,
@@ -7753,10 +7902,12 @@ fn save_session(
             GuideAxis::Vertical => "v",
         };
         // v4 stuck line: trailing `len_phys` so the frozen pixel
-        // value survives a round-trip exactly. Older readers stop at
-        // the 8-token form and recompute length from start/end.
+        // value survives a round-trip exactly. Written with a forced
+        // decimal (`{:.4}`) so a reader can tell it apart from legacy
+        // v4 saves, which stored an integer length. Older readers stop
+        // at the 8-token form and recompute length from start/end.
         s.push_str(&format!(
-            "stuck {axis} {} {} {} {} {} {} {}\n",
+            "stuck {axis} {} {} {} {} {} {} {:.4}\n",
             m.at,
             m.start,
             m.end,
@@ -7772,8 +7923,8 @@ fn save_session(
 /// Best-effort physical length for a stuck measurement restored from a
 /// pre-pixel-perfect session — the logical span scaled to physical
 /// pixels. Newer saves carry an exact `len_phys` and skip this.
-fn legacy_len_phys(start: f64, end: f64) -> i32 {
-    ((end - start).abs() * primary_scale_factor()).round() as i32
+fn legacy_len_phys(start: f64, end: f64) -> f64 {
+    ((end - start).abs() * primary_scale_factor()).round()
 }
 
 /// Load whatever was last saved. Returns empty vecs if no session
@@ -7828,25 +7979,50 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                     });
                 }
             }
-            // v3 rect line: color-alt flag + four inclusive physical-
-            // pixel bounds (left, top, right, bottom) for pixel-exact
-            // restore.
+            // v3 rect line: color-alt flag + four physical-pixel
+            // bounds (left, top, right, bottom) for pixel-exact
+            // restore. New saves store fractional edge boundaries
+            // (always with a decimal point); legacy v3 saves stored
+            // integer inclusive content pixels — convert those to the
+            // half-pixel boundaries the boundary model expects.
             ["rect", a, b, c, d, alt, pl, pt, pr, pb] => {
-                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by), Ok(alt), Ok(pl), Ok(pt), Ok(pr), Ok(pb)) = (
+                if let (Ok(ax), Ok(ay), Ok(bx), Ok(by), Ok(alt)) = (
                     a.parse::<f64>(),
                     b.parse::<f64>(),
                     c.parse::<f64>(),
                     d.parse::<f64>(),
                     alt.parse::<u8>(),
-                    pl.parse::<i32>(),
-                    pt.parse::<i32>(),
-                    pr.parse::<i32>(),
-                    pb.parse::<i32>(),
                 ) {
+                    let bounds = if [pl, pt, pr, pb].iter().any(|t| t.contains('.')) {
+                        match (
+                            pl.parse::<f64>(),
+                            pt.parse::<f64>(),
+                            pr.parse::<f64>(),
+                            pb.parse::<f64>(),
+                        ) {
+                            (Ok(l), Ok(t), Ok(r), Ok(bo)) => (l, t, r, bo),
+                            _ => continue,
+                        }
+                    } else {
+                        match (
+                            pl.parse::<i32>(),
+                            pt.parse::<i32>(),
+                            pr.parse::<i32>(),
+                            pb.parse::<i32>(),
+                        ) {
+                            (Ok(l), Ok(t), Ok(r), Ok(bo)) => (
+                                l as f64 - 0.5,
+                                t as f64 - 0.5,
+                                r as f64 + 0.5,
+                                bo as f64 + 0.5,
+                            ),
+                            _ => continue,
+                        }
+                    };
                     rects.push(HeldRect {
                         rect_start: (ax, ay),
                         rect_end: (bx, by),
-                        bounds_phys: (pl, pt, pr, pb),
+                        bounds_phys: bounds,
                         camera_armed: false,
                         color_alternate: alt != 0,
                     });
@@ -7967,27 +8143,40 @@ fn load_session() -> Option<(Vec<HeldRect>, Vec<Guide>, Vec<StuckMeasurement>)> 
                 }
             }
             // v4 stuck-line format: trailing exact physical length.
+            // New saves write it fractional (with a decimal point);
+            // legacy v4 saves wrote an integer — same units (a span),
+            // so just widen it.
             ["stuck", axis, at, start, end, ox, oy, alt, len] => {
                 let ax = match *axis {
                     "h" => GuideAxis::Horizontal,
                     "v" => GuideAxis::Vertical,
                     _ => continue,
                 };
-                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy), Ok(alt), Ok(len)) = (
+                if let (Ok(at), Ok(start), Ok(end), Ok(ox), Ok(oy), Ok(alt)) = (
                     at.parse::<f64>(),
                     start.parse::<f64>(),
                     end.parse::<f64>(),
                     ox.parse::<f64>(),
                     oy.parse::<f64>(),
                     alt.parse::<u8>(),
-                    len.parse::<i32>(),
                 ) {
+                    let len_phys = if len.contains('.') {
+                        match len.parse::<f64>() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        match len.parse::<i32>() {
+                            Ok(v) => v as f64,
+                            Err(_) => continue,
+                        }
+                    };
                     stuck.push(StuckMeasurement {
                         axis: ax,
                         at,
                         start,
                         end,
-                        len_phys: len,
+                        len_phys,
                         pill_offset: (ox, oy),
                         color_alternate: alt != 0,
                         hovered: false,

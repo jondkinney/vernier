@@ -112,13 +112,13 @@ struct AreaRect {
     a: (f64, f64),
     /// The opposite corner (logical pixels) — DRAWING ONLY.
     b: (f64, f64),
-    /// Inclusive physical-pixel bounds `(left, top, right, bottom)`
-    /// for the W×H measurement. `Some` for committed/snapped rects
-    /// (exact — width is `right - left + 1`); `None` for the live
-    /// free-drag rect, whose corners track an integer logical cursor
-    /// and so cannot be pixel-perfect — that path falls back to the
+    /// Physical-pixel edge boundaries `(left, top, right, bottom)` for
+    /// the W×H measurement. `Some` for committed/snapped rects (exact —
+    /// width is `right - left`, no `+1`); `None` for the live free-drag
+    /// rect, whose corners track an integer logical cursor and so
+    /// cannot be pixel-perfect — that path falls back to the
     /// logical-span estimate.
-    bounds_phys: Option<(i32, i32, i32, i32)>,
+    bounds_phys: Option<(f64, f64, f64, f64)>,
     /// When true the W×H pill shows a camera icon instead of text.
     camera_armed: bool,
     /// Pre-computed dim-pill bbox (logical px) for committed rects;
@@ -399,7 +399,10 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
         hash_f64(&mut h, r.rect_start.1);
         hash_f64(&mut h, r.rect_end.0);
         hash_f64(&mut h, r.rect_end.1);
-        r.bounds_phys.hash(&mut h);
+        hash_f64(&mut h, r.bounds_phys.0);
+        hash_f64(&mut h, r.bounds_phys.1);
+        hash_f64(&mut h, r.bounds_phys.2);
+        hash_f64(&mut h, r.bounds_phys.3);
         r.camera_armed.hash(&mut h);
         r.color_alternate.hash(&mut h);
     }
@@ -421,7 +424,7 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
         hash_f64(&mut h, m.at);
         hash_f64(&mut h, m.start);
         hash_f64(&mut h, m.end);
-        m.len_phys.hash(&mut h);
+        hash_f64(&mut h, m.len_phys);
         hash_f64(&mut h, m.pill_offset.0);
         hash_f64(&mut h, m.pill_offset.1);
         m.color_alternate.hash(&mut h);
@@ -1424,24 +1427,23 @@ fn draw_remove_x_badge(
 /// Draw the live measure crosshair: axis lines through the cursor with
 /// tick caps where edges were detected, plus the white `+` cursor
 /// marker on top, and a W×H pill in the lower-right of the cursor.
-/// Physical-pixel length between a `near` edge and a `far` edge,
-/// applying the pixel-perfect inclusive/exclusive rule:
+/// Physical-pixel length between a `near` edge boundary and a `far`
+/// edge boundary.
 ///
-/// - Both ends are real content edges (`Some`) → both inclusive →
-///   length is `far - near + 1`.
-/// - An end is `None` → it falls back to the screen border, an
-///   EXCLUSIVE buffer extent → that side drops its `+1`.
+/// Edge boundaries are already the half-pixel lines bracketing the
+/// content (see [`HudEdge::pos_phys`]), so the span is simply
+/// `far - near` — no fence-post `+1`. A missing end falls back to the
+/// screen border boundary (`near_fallback` / `far_fallback`), which
+/// the caller supplies as a half-pixel line too.
 fn inclusive_span_phys(
-    near: Option<i32>,
-    near_fallback: i32,
-    far: Option<i32>,
-    far_fallback: i32,
-) -> i32 {
+    near: Option<f64>,
+    near_fallback: f64,
+    far: Option<f64>,
+    far_fallback: f64,
+) -> f64 {
     let near_pos = near.unwrap_or(near_fallback);
     let far_pos = far.unwrap_or(far_fallback);
-    // `+1` only when BOTH bounds are inclusive content pixels.
-    let plus_one = i32::from(near.is_some() && far.is_some());
-    (far_pos - near_pos).abs() + plus_one
+    (far_pos - near_pos).abs()
 }
 
 fn draw_hover_indicators(
@@ -1592,28 +1594,25 @@ fn draw_hover_indicators(
         }
 
         // Width / height as EXACT physical-pixel integers, computed
-        // from each edge's `pos_phys` (its true integer content
-        // pixel). Inclusivity rule:
-        //
-        // - Both ends are real detected/guide edges → both inclusive
-        //   content pixels → span is `last - first + 1`.
-        // - An end is missing → it falls back to the screen border,
-        //   an EXCLUSIVE buffer extent → drop that side's `+1`.
+        // from each edge's `pos_phys` (its localized half-pixel
+        // boundary). The span between two boundaries is `far - near`
+        // directly; a missing end falls back to the buffer's far/near
+        // border boundary (`±0.5` outside the 0..extent-1 pixels).
         //
         // The single physical→logical conversion + rounding happens
         // inside `format_wh_phys`, so the live and committed readouts
         // can't drift.
         let w_phys = inclusive_span_phys(
             left.map(|e| e.pos_phys.0),
-            0,
+            -0.5,
             right.map(|e| e.pos_phys.0),
-            buf_w.round() as i32,
+            buf_w as f64 - 0.5,
         );
         let h_phys = inclusive_span_phys(
             up.map(|e| e.pos_phys.1),
-            0,
+            -0.5,
             down.map(|e| e.pos_phys.1),
-            buf_h.round() as i32,
+            buf_h as f64 - 0.5,
         );
         let text = fmt.format_wh_phys(w_phys, h_phys);
         let px_size = TEXT_LOGICAL_PX * scale_f;
@@ -1684,8 +1683,8 @@ fn draw_hover_indicators(
             // Aspect ratio is dimensionless — the physical-pixel
             // counts give the same ratio as logical, so use them
             // directly (clamped to non-negative for the u32 cast).
-            let aw = w_phys.max(0) as u32;
-            let ah = h_phys.max(0) as u32;
+            let aw = w_phys.max(0.0) as u32;
+            let ah = h_phys.max(0.0) as u32;
             if let Some(aspect_text) = estimate_aspect_text(aw, ah, fmt.aspect_mode) {
                 let atext_w = if let Some(font) = hud_font() {
                     measure_text_width(font, &aspect_text, px_size)
@@ -1771,25 +1770,26 @@ fn draw_area_rect(
             pixmap.stroke_path(&path, line_paint, stroke, Transform::identity(), None);
         }
     }
-    // W×H text: from EXACT physical-pixel bounds when this is a
-    // committed/snapped rect (`right - left + 1`), routed through the
-    // single rounding point `format_wh_phys`. The live free-drag rect
-    // has no exact bounds — its corners track an integer logical
-    // cursor — so it falls back to the logical-span estimate; that
-    // imprecision is inherent and documented on `AreaRect::bounds_phys`.
+    // W×H text: from EXACT physical-pixel edge boundaries when this is
+    // a committed/snapped rect (`right - left`, no fence-post `+1`),
+    // routed through the single rounding point `format_wh_phys`. The
+    // live free-drag rect has no exact bounds — its corners track an
+    // integer logical cursor — so it falls back to the logical-span
+    // estimate; that imprecision is inherent and documented on
+    // `AreaRect::bounds_phys`.
     let w_logical_f = (rw / scale_f) as f64;
     let h_logical_f = (rh / scale_f) as f64;
     let (dim_text, w_logical, h_logical) = match area.bounds_phys {
         Some((l, t, r, b)) => {
-            let w_phys = r - l + 1;
-            let h_phys = b - t + 1;
+            let w_phys = r - l;
+            let h_phys = b - t;
             // `w_logical`/`h_logical` feed the layout heuristic +
             // aspect pill; aspect is dimensionless so physical px
             // give the same ratio.
             (
                 fmt.format_wh_phys(w_phys, h_phys),
-                w_phys.max(0) as u32,
-                h_phys.max(0) as u32,
+                w_phys.max(0.0) as u32,
+                h_phys.max(0.0) as u32,
             )
         }
         None => (
@@ -2786,7 +2786,7 @@ mod tests {
         hud.held_rects.push(HeldRect {
             rect_start: (10.0, 10.0),
             rect_end: (60.0, 60.0),
-            bounds_phys: (10, 10, 60, 60),
+            bounds_phys: (10.0, 10.0, 60.0, 60.0),
             camera_armed: false,
             color_alternate: false,
         });
@@ -2801,7 +2801,7 @@ mod tests {
             at: 110.0,
             start: 10.0,
             end: 90.0,
-            len_phys: 80,
+            len_phys: 80.0,
             pill_offset: (0.0, 0.0),
             color_alternate: false,
             hovered: false,
@@ -2827,7 +2827,7 @@ mod tests {
         hud.held_rects.push(HeldRect {
             rect_start: (10.0, 10.0),
             rect_end: (60.0, 60.0),
-            bounds_phys: (10, 10, 60, 60),
+            bounds_phys: (10.0, 10.0, 60.0, 60.0),
             camera_armed: false,
             color_alternate: false,
         });
@@ -2842,7 +2842,7 @@ mod tests {
             at: 80.0,
             start: 10.0,
             end: 90.0,
-            len_phys: 80,
+            len_phys: 80.0,
             pill_offset: (0.0, 0.0),
             color_alternate: false,
             hovered: false,
@@ -3008,7 +3008,7 @@ mod tests {
                 Some(HudEdge {
                     axis: crate::HudAxis::Left,
                     position: (5.0, 5.0),
-                    pos_phys: (5, 5),
+                    pos_phys: (5.0, 5.0),
                     distance_px: 10,
                 }),
                 None,
@@ -3037,7 +3037,7 @@ mod tests {
         more_rects.held_rects.push(HeldRect {
             rect_start: (70.0, 70.0),
             rect_end: (80.0, 80.0),
-            bounds_phys: (70, 70, 80, 80),
+            bounds_phys: (70.0, 70.0, 80.0, 80.0),
             camera_armed: false,
             color_alternate: false,
         });
@@ -3074,7 +3074,7 @@ mod tests {
             at: 150.0,
             start: 10.0,
             end: 200.0,
-            len_phys: 190,
+            len_phys: 190.0,
             pill_offset: (0.0, 0.0),
             color_alternate: false,
             hovered: false,

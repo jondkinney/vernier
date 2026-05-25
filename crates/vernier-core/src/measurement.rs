@@ -10,7 +10,7 @@ use crate::geometry::Px;
 
 /// One end of a measurement: where the user clicked, plus optionally
 /// the edge their cursor was snapped to.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SnapPoint {
     /// Pixel actually used (after snapping). Equal to `cursor` when
     /// no edge was applied.
@@ -33,7 +33,7 @@ impl SnapPoint {
 
 /// A finished measurement spanning two snap points. Geometry helpers
 /// compute distances in cardinal/diagonal terms.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Measurement {
     pub start: SnapPoint,
     pub end: SnapPoint,
@@ -165,6 +165,7 @@ mod tests {
             anchor_color: Rgba::WHITE,
             edge_color: Rgba::BLACK,
             strength: 100,
+            edge_phys: 0.0,
         }
     }
 

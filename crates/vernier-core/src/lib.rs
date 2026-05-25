@@ -14,8 +14,8 @@ pub mod settings;
 pub use aspect::{CommonRatio, Mode as AspectMode, Ratio, classify as classify_aspect};
 pub use color::Rgba;
 pub use edge::{
-    Direction, EdgeCandidate, EdgeQuad, Tolerance, detect_edges, shrink_to_content,
-    shrink_to_content_with_bg,
+    Direction, EdgeBias, EdgeCandidate, EdgeQuad, Tolerance, detect_edges, shrink_to_content,
+    shrink_to_content_frac, shrink_to_content_with_bg, shrink_to_content_with_bg_frac,
 };
 pub use frame::FrameView;
 pub use geometry::{Px, PxRect};
