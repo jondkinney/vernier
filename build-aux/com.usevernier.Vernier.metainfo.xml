@@ -37,6 +37,25 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.4.0" date="2026-05-26">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>record chords through the daemon + bundle Adwaita Sans</li>
+          <li>soft-edge localization with edge-bias control</li>
+          <li>render the overlay at the true fractional display scale</li>
+        </ul>
+        <p>Fixed:</p>
+        <ul>
+          <li>pixel-perfect measurement — exact physical-pixel pipeline</li>
+          <li>scale HUD strokes to the display + track monitor changes live</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>fix cargo fmt + macOS clippy on the chord-recording PR</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-05-21">
       <description>
         <p>Added:</p>
