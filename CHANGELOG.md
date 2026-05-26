@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/jondkinney/vernier/compare/v0.3.0...v0.4.0) - 2026-05-26
+
+### Added
+
+- *(prefs)* record chords through the daemon + bundle Adwaita Sans
+- *(core)* soft-edge localization with edge-bias control
+- *(linux)* render the overlay at the true fractional display scale
+
+### Fixed
+
+- pixel-perfect measurement — exact physical-pixel pipeline
+- scale HUD strokes to the display + track monitor changes live
+
+### Other
+
+- fix cargo fmt + macOS clippy on the chord-recording PR
+
 ## [0.3.0](https://github.com/jondkinney/vernier/compare/v0.2.6...v0.3.0) - 2026-05-21
 
 ### Added
