@@ -118,7 +118,7 @@ pub fn rasterize_png(png_bytes: &[u8], size: u32) -> Option<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]

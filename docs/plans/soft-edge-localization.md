@@ -1,7 +1,42 @@
 # Plan: consistent soft-edge localization across measurement modes
 
-**Status:** draft — follow-up to the pixel-perfect-measurement work
-(PR #23, merged 2026-05-22).
+**Status:** done (2026-05-22) — follow-up to the pixel-perfect-
+measurement work (PR #23). Both modes now route through the shared
+`edge.rs::localize_edge` helper; positions are carried as fractional
+edge boundaries end-to-end, so a soft edge localises to its gradient
+midpoint and a crisp edge stays byte-identical.
+
+Refined beyond the original sketch: **detection and localization are
+fully decoupled.** The user's `Tolerance` governs only phase-1
+detection (whether a transition registers as an edge). Localization is
+the sub-pixel 50%-brightness crossing between the two plateau colours
+— computed with a fixed `PLATEAU_EPS`, independent of tolerance — so
+adjusting the tolerance pref never moves a measurement, only changes
+which edges snap. A thin-feature (`outside ≈ inside`) fallback uses
+the geometric centre.
+
+**Live-test passed.** A 2560×1600 target with two boxes of true size
+400×300 — one crisp, one with a 16px anti-aliased ramp — measured
+identically across both modes: crosshair and area-rectangle both
+reported 400 × 300 on both boxes (versus the old code's ~384/~416
+straddle on the soft box).
+
+**Edge-bias control added.** An `EdgeBias` parameter
+(`Inner` / `Midpoint` / `Outer`) is threaded through the localizer so
+the user can pick where on a soft edge the measurement lands:
+`Midpoint` (default) = the 50%-brightness crossing; `Inner` = the
+inside-plateau edge of the ramp; `Outer` = the outside-plateau edge.
+On a *crisp* edge all three biases collapse to the same half-pixel
+boundary — the crisp-invariant property holds. Surfaced as:
+
+- `[edge_bias] default = "Inner|Midpoint|Outer"` in `settings.toml`
+  (reload via `vernier reload-settings`).
+- An `E` hotkey that cycles bias live during measurement
+  (`shortcuts.bias_cycle`), with a HUD toast on each press.
+- A `--bias` flag on `vernier detect-edges` for ad-hoc spot-checks.
+
+Live-verified on the same 16px-ramp target: Inner reports 385, Midpoint
+400, Outer 415; crisp reports 400 at every bias.
 
 ## Problem
 

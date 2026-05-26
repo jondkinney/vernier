@@ -268,7 +268,7 @@ impl HudMeasurementFormat {
     /// [`HudRounding::ScreenPixels`] is special-cased to return the
     /// physical integer verbatim — no ÷scale/×scale round-trip — so an
     /// N-physical-pixel target reads exactly `N`.
-    pub fn format_number_phys(&self, len_phys: i32) -> String {
+    pub fn format_number_phys(&self, len_phys: f64) -> String {
         let divisor = if self.dimension_divisor > 0.0 {
             self.dimension_divisor
         } else {
@@ -278,11 +278,11 @@ impl HudMeasurementFormat {
             HudRounding::ScreenPixels => {
                 // Physical pixels already — apply only the Figma
                 // divisor, skipping the scale round-trip entirely.
-                let value = len_phys as f64 / divisor;
+                let value = len_phys / divisor;
                 format!("{}", value.round() as i64)
             }
             HudRounding::Points => {
-                let value = (len_phys as f64 / self.scale_factor) / divisor;
+                let value = (len_phys / self.scale_factor) / divisor;
                 let r = (value * 10.0).round() / 10.0;
                 if (r - r.round()).abs() < f64::EPSILON {
                     format!("{}", r as i64)
@@ -291,7 +291,7 @@ impl HudMeasurementFormat {
                 }
             }
             HudRounding::PointsRounded => {
-                let value = (len_phys as f64 / self.scale_factor) / divisor;
+                let value = (len_phys / self.scale_factor) / divisor;
                 format!("{}", value.round() as i64)
             }
         }
@@ -299,7 +299,7 @@ impl HudMeasurementFormat {
 
     /// [`format_number_phys`](Self::format_number_phys) with the
     /// configured unit suffix appended.
-    pub fn format_value_phys(&self, len_phys: i32) -> String {
+    pub fn format_value_phys(&self, len_phys: f64) -> String {
         format!("{}{}", self.format_number_phys(len_phys), self.unit_suffix)
     }
 
@@ -307,7 +307,7 @@ impl HudMeasurementFormat {
     /// pixel-perfect counterpart to [`format_wh`](Self::format_wh).
     /// Each value goes through [`format_number_phys`](Self::format_number_phys),
     /// the single rounding point.
-    pub fn format_wh_phys(&self, w_phys: i32, h_phys: i32) -> String {
+    pub fn format_wh_phys(&self, w_phys: f64, h_phys: f64) -> String {
         if self.wh_indicators {
             format!(
                 "W: {}{} \u{00D7} H: {}{}",
@@ -419,13 +419,16 @@ pub struct HeldRect {
     pub rect_start: (f64, f64),
     /// The opposite corner in logical pixels — DRAWING ONLY.
     pub rect_end: (f64, f64),
-    /// INCLUSIVE physical-pixel bounds `(left, top, right, bottom)` of
+    /// Physical-pixel edge *boundaries* `(left, top, right, bottom)` of
     /// the rect's content — the value measurements are computed from.
-    /// Width is `right - left + 1`, height is `bottom - top + 1`. For
-    /// snapped/shrunk rects these come straight from `shrink_to_content`
-    /// (exact); for sessions restored from disk they're derived from
-    /// the logical corners (best-effort, pre-pixel-perfect saves).
-    pub bounds_phys: (i32, i32, i32, i32),
+    /// These are fractional half-pixel lines bracketing the content, so
+    /// width is `right - left` and height `bottom - top` (NO `+1`). On
+    /// a crisp edge a boundary lands on `content_pixel ∓ 0.5`; on a
+    /// soft/anti-aliased edge it is the gradient's perceptual midpoint.
+    /// For snapped/shrunk rects these come straight from
+    /// `shrink_to_content_frac` (exact); for sessions restored from
+    /// disk they're derived from the logical corners (best-effort).
+    pub bounds_phys: (f64, f64, f64, f64),
     pub camera_armed: bool,
     /// Foreground variant snapshotted at the moment this rect was
     /// placed. `false` uses `appearance.primary_color`, `true` uses
@@ -453,10 +456,10 @@ pub struct StuckMeasurement {
     pub start: f64,
     /// End of the measured span in logical px. DRAWING ONLY.
     pub end: f64,
-    /// The measured length in EXACT physical pixels. This is the
-    /// value rendered in the pill — fed straight to
-    /// [`HudMeasurementFormat::format_value_phys`].
-    pub len_phys: i32,
+    /// The measured length in physical pixels — a midpoint-to-midpoint
+    /// span, fractional on soft edges. Rendered in the pill, fed
+    /// straight to [`HudMeasurementFormat::format_value_phys`].
+    pub len_phys: f64,
     /// User-applied translation of the value pill, in logical px,
     /// from its computed default anchor. Clamped to ±50 in each
     /// axis at the input layer (click-and-drag on the pill). The
@@ -594,11 +597,12 @@ pub struct HudEdge {
     /// (the crosshair "step back one pixel") so the line stops short
     /// of the detected border; it must never be used to measure.
     pub position: (f64, f64),
-    /// True integer physical-pixel coordinate of this edge — the
-    /// inclusive content pixel the scan landed on. This is the value
-    /// measurements are computed from (`right - left + 1`, etc.). No
-    /// inset, no rounding noise.
-    pub pos_phys: (i32, i32),
+    /// Physical-pixel edge *boundary* of this edge — the localized
+    /// half-pixel line the measurement is computed from. Fractional:
+    /// `content_pixel ∓ 0.5` on a crisp edge, the gradient midpoint on
+    /// a soft one. A span between two boundaries is `far - near` with
+    /// no `+1`. No draw inset, no rounding noise.
+    pub pos_phys: (f64, f64),
     pub distance_px: u32,
 }
 
@@ -934,13 +938,29 @@ mod tests {
             rounding: HudRounding::PointsRounded,
             ..base.clone()
         };
-        assert_eq!(pts.format_wh_phys(400, 400), "250px \u{00D7} 250px");
+        assert_eq!(pts.format_wh_phys(400.0, 400.0), "250px \u{00D7} 250px");
 
         // ScreenPixels: physical integer passes through verbatim.
         let screen = HudMeasurementFormat {
             rounding: HudRounding::ScreenPixels,
             ..base
         };
-        assert_eq!(screen.format_wh_phys(400, 400), "400px \u{00D7} 400px");
+        assert_eq!(screen.format_wh_phys(400.0, 400.0), "400px \u{00D7} 400px");
+    }
+
+    /// Soft-edge measurements arrive as FRACTIONAL physical spans
+    /// (midpoint-to-midpoint). They must round sensibly, and a
+    /// whole-number span must still render exactly — the crisp guard.
+    #[test]
+    fn format_wh_phys_handles_fractional_soft_edge_spans() {
+        let screen = HudMeasurementFormat {
+            scale_factor: 1.0,
+            rounding: HudRounding::ScreenPixels,
+            ..HudMeasurementFormat::default()
+        };
+        // A fractional span rounds to the nearest whole pixel.
+        assert_eq!(screen.format_wh_phys(249.6, 250.4), "250px \u{00D7} 250px");
+        // A whole-number span is byte-identical to the crisp result.
+        assert_eq!(screen.format_wh_phys(400.0, 400.0), "400px \u{00D7} 400px");
     }
 }

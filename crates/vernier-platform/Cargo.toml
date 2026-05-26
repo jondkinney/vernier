@@ -37,6 +37,12 @@ pipewire = "0.9"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = "0.3"
 libc = "0.2"
+# Chord-recording in prefs: read raw key events from /dev/input
+# regardless of which surface is focused. egui-winit drops Super
+# from its translated `Modifiers` on Linux, so prefs alone cannot
+# honestly capture SUPER-containing chords.
+evdev = "0.13"
+xkbcommon = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"

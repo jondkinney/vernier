@@ -18,6 +18,7 @@ pub struct Settings {
     pub general: GeneralSettings,
     pub screenshots: ScreenshotSettings,
     pub tolerance: ToleranceSettings,
+    pub edge_bias: EdgeBiasSettings,
     pub appearance: AppearanceSettings,
     pub integrations: IntegrationSettings,
     pub shortcuts: ShortcutSettings,
@@ -240,6 +241,14 @@ impl ToleranceSettings {
             ToleranceLevel::High => self.high_value,
         }
     }
+}
+
+/// Default soft-edge bias used by the localizer when entering measure
+/// mode. See [`crate::EdgeBias`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgeBiasSettings {
+    pub default: crate::EdgeBias,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +531,10 @@ pub struct ShortcutSettings {
     pub tolerance_up: String,
     /// Bump tolerance down one level.
     pub tolerance_down: String,
+    /// Cycle the soft-edge bias: Inner → Midpoint → Outer → Inner.
+    /// See [`crate::EdgeBias`]; useful for dialing the measurement on
+    /// a soft edge live.
+    pub bias_cycle: String,
     /// Nudge the hovered held rect 1 px left (10 px with Shift).
     pub nudge_left: String,
     /// Nudge the hovered held rect 1 px right (10 px with Shift).
@@ -555,6 +568,7 @@ impl Default for ShortcutSettings {
             refresh_capture: "R".to_string(),
             tolerance_up: "EQUAL".to_string(),
             tolerance_down: "MINUS".to_string(),
+            bias_cycle: "E".to_string(),
             nudge_left: "LEFT".to_string(),
             nudge_right: "RIGHT".to_string(),
             nudge_up: "UP".to_string(),
