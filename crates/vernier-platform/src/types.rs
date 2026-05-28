@@ -703,15 +703,17 @@ impl Accelerator {
         })
     }
 
-    /// Render back to a stable text form (`SHIFT+CTRL+ALT+SUPER+KEY`)
-    /// — handy for prefs UI display and round-trip tests.
+    /// Render back to a stable text form (`CTRL+SHIFT+ALT+SUPER+KEY`)
+    /// — handy for prefs UI display and round-trip tests. Ordering
+    /// matches macOS native menus (⌃⇧⌥⌘) so the chip reads the same
+    /// on every platform.
     pub fn to_string_key(&self) -> String {
         let mut parts = Vec::new();
-        if self.modifiers.contains(Modifiers::SHIFT) {
-            parts.push("SHIFT".to_string());
-        }
         if self.modifiers.contains(Modifiers::CTRL) {
             parts.push("CTRL".to_string());
+        }
+        if self.modifiers.contains(Modifiers::SHIFT) {
+            parts.push("SHIFT".to_string());
         }
         if self.modifiers.contains(Modifiers::ALT) {
             parts.push("ALT".to_string());

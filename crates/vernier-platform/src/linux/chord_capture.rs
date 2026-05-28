@@ -6,7 +6,7 @@
 //! its own. This module sidesteps the egui-winit pipeline entirely:
 //! it opens evdev keyboards, derives the keysym + modifier mask via
 //! xkbcommon, and returns the first non-modifier press as a chord
-//! string in the same `SHIFT+CTRL+ALT+SUPER+KEY` form the rest of
+//! string in the same `CTRL+SHIFT+ALT+SUPER+KEY` form the rest of
 //! vernier already understands.
 //!
 //! The daemon (vernier-app) calls [`record_chord`] from its IPC
@@ -212,17 +212,17 @@ fn chord_from_state(state: &xkb::State, keycode: xkb::Keycode) -> Option<String>
         return None;
     }
     let key_token = chord_key_token(sym)?;
-    // Canonical order: SHIFT, CTRL, ALT, SUPER — matches the
-    // left-to-right modifier layout on a typical keyboard and the
-    // order the chip renderer expects when it splits this string
-    // for display.
+    // Canonical order: CTRL, SHIFT, ALT, SUPER — matches macOS
+    // native menus (⌃⇧⌥⌘) and the Electron `CommandOrControl`
+    // convention. The chip renderer reads this order when it splits
+    // the string for display.
     let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
     let mut parts: Vec<&str> = Vec::new();
-    if active(xkb::MOD_NAME_SHIFT) {
-        parts.push("SHIFT");
-    }
     if active(xkb::MOD_NAME_CTRL) {
         parts.push("CTRL");
+    }
+    if active(xkb::MOD_NAME_SHIFT) {
+        parts.push("SHIFT");
     }
     if active(xkb::MOD_NAME_ALT) {
         parts.push("ALT");

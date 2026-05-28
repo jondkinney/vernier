@@ -2843,15 +2843,17 @@ fn launch_in_terminal(argv: &[String]) -> bool {
 }
 
 /// Render an egui key + modifier combo into the same
-/// `SHIFT+CTRL+ALT+SUPER+KEY` text the platform Accelerator parser
-/// already understands.
+/// `CTRL+SHIFT+ALT+SUPER+KEY` text the platform Accelerator parser
+/// already understands. Order matches macOS native menus (⌃⇧⌥⌘) so
+/// the chord chip reads consistently across vernier/hyprcorrect/
+/// mousehop.
 fn format_accelerator(key: egui::Key, modifiers: egui::Modifiers) -> String {
     let mut parts: Vec<&'static str> = Vec::new();
-    if modifiers.shift {
-        parts.push("SHIFT");
-    }
     if modifiers.ctrl {
         parts.push("CTRL");
+    }
+    if modifiers.shift {
+        parts.push("SHIFT");
     }
     if modifiers.alt {
         parts.push("ALT");
