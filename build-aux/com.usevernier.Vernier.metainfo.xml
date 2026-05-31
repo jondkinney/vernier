@@ -37,6 +37,14 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.4.1" date="2026-05-31">
+      <description>
+        <p>Other:</p>
+        <ul>
+          <li>canonical modifier order CTRL/SHIFT/ALT/SUPER</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-05-26">
       <description>
         <p>Added:</p>
