@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 authors = ["Jon Kinney <jon@headway.io>"]
 license = "MIT OR Apache-2.0"
@@ -21,9 +21,9 @@ rust-version = "1.85"
 # bare `vernier` / `vernier-core` names are taken by an unrelated
 # crate. The `package` rename keeps the in-tree Rust names
 # (`vernier_core`, …) unchanged, so no source edits are needed.
-vernier-core = { package = "vernier-rs-core", path = "crates/vernier-core", version = "0.4.2" }
-vernier-platform = { package = "vernier-rs-platform", path = "crates/vernier-platform", version = "0.4.2" }
-vernier-ui = { package = "vernier-rs-ui", path = "crates/vernier-ui", version = "0.4.2" }
+vernier-core = { package = "vernier-rs-core", path = "crates/vernier-core", version = "0.4.3" }
+vernier-platform = { package = "vernier-rs-platform", path = "crates/vernier-platform", version = "0.4.3" }
+vernier-ui = { package = "vernier-rs-ui", path = "crates/vernier-ui", version = "0.4.3" }
 
 anyhow = "1"
 thiserror = "2"
