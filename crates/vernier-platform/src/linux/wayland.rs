@@ -794,10 +794,13 @@ impl WaylandState {
             }
         };
         let surface = inst.layer.wl_surface().clone();
-        // The region is in surface-local coords; let the compositor
-        // free us when the surface loses input focus (`Persistent`
-        // would keep it reapplying on every refocus, which is more
-        // than we need for a single drag gesture).
+        // The region is in surface-local coords; `Oneshot` lets the
+        // compositor free the constraint when the surface loses input
+        // focus. `Persistent` would keep reapplying it on every
+        // refocus — more than a single drag gesture needs, and it
+        // survives as a live constraint if the drag never delivers its
+        // matching `release_overlay_pointer_confine`, leaving the
+        // cursor pinned with no way back short of restarting vernier.
         let region = Region::new(&self.compositor).ok().inspect(|r| {
             r.add(x, y, w, h);
         });
@@ -806,7 +809,7 @@ impl WaylandState {
             &surface,
             &pointer,
             region_ref,
-            PointerLifetime::Persistent,
+            PointerLifetime::Oneshot,
             &self.qh,
         ) {
             Ok(cp) => {
