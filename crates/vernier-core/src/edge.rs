@@ -441,6 +441,42 @@ fn round_bounds((l, t, r, b): (f64, f64, f64, f64)) -> (i32, i32, i32, i32) {
     )
 }
 
+/// Return the midpoint of every contiguous foreground run in an
+/// inclusive one-dimensional range. Area-rectangle edge localization
+/// uses these points as representative probes for disconnected content
+/// (for example, separate glyphs or punctuation) without rescanning the
+/// full perpendicular axis once for every foreground pixel.
+fn foreground_run_midpoints(
+    start: i32,
+    end: i32,
+    mut is_foreground: impl FnMut(i32) -> bool,
+) -> Vec<i32> {
+    let mut midpoints = Vec::new();
+    let mut pos = start;
+
+    while pos <= end {
+        while !is_foreground(pos) {
+            if pos == end {
+                return midpoints;
+            }
+            pos += 1;
+        }
+
+        let run_start = pos;
+        while pos < end && is_foreground(pos + 1) {
+            pos += 1;
+        }
+        midpoints.push(run_start + (pos - run_start) / 2);
+
+        if pos == end {
+            break;
+        }
+        pos += 1;
+    }
+
+    midpoints
+}
+
 /// Shrink the rectangle `(x0, y0, x1, y1)` to the content bounding box
 /// within `frame`. Walks inward from each side until hitting the first
 /// row/column with pixels that differ from the rect's top-left corner
@@ -520,26 +556,15 @@ pub fn shrink_to_content_with_bg_frac(
     };
     let tol = tolerance.0;
 
-    let row_has_content = |y: i32, x_start: i32, x_end: i32| -> bool {
-        for x in x_start..=x_end {
-            if let Some(p) = frame.pixel(x as u32, y as u32) {
-                if bg.rgb_delta(p) > tol {
-                    return true;
-                }
-            }
-        }
-        false
+    let is_content = |x: i32, y: i32| -> bool {
+        frame
+            .pixel(x as u32, y as u32)
+            .is_some_and(|p| bg.rgb_delta(p) > tol)
     };
-    let col_has_content = |x: i32, y_start: i32, y_end: i32| -> bool {
-        for y in y_start..=y_end {
-            if let Some(p) = frame.pixel(x as u32, y as u32) {
-                if bg.rgb_delta(p) > tol {
-                    return true;
-                }
-            }
-        }
-        false
-    };
+    let row_has_content =
+        |y: i32, x_start: i32, x_end: i32| -> bool { (x_start..=x_end).any(|x| is_content(x, y)) };
+    let col_has_content =
+        |x: i32, y_start: i32, y_end: i32| -> bool { (y_start..=y_end).any(|y| is_content(x, y)) };
 
     let mut new_top = cy0;
     for y in cy0..=cy1 {
@@ -574,22 +599,28 @@ pub fn shrink_to_content_with_bg_frac(
         return fallback;
     }
 
-    // Refine each integer side to its soft-edge midpoint by running the
-    // shared localizer along a single probe line through the content
-    // box's centre. The localizer walks inward from `bg`; if the probe
-    // line misses the content (it never trips tolerance) — or the
-    // rect's clamp already sits inside content, so the probe can't even
-    // start on the background plateau — fall back to the crisp integer
-    // boundary `pixel ∓ 0.5`.
-    let mid_x = (new_left + new_right) / 2;
-    let mid_y = (new_top + new_bot) / 2;
+    // Refine each integer side to its soft-edge midpoint. Probe through
+    // every disconnected foreground run that actually witnesses that
+    // side's global extremum, then keep the outermost localized result.
+    //
+    // A single probe through the content box's centre is not sufficient:
+    // for text it can cross only a lowercase glyph's x-height and replace
+    // the correct global top/bottom with that local silhouette, clipping
+    // capitals, ascenders, descenders, or detached punctuation. Probing
+    // the extremal runs preserves the complete foreground envelope while
+    // still routing soft edges through the shared localizer.
+    //
+    // The localizer walks inward from `bg`; if every probe fails (it
+    // never trips tolerance), or the rect's clamp already sits inside
+    // content so a probe cannot start on the background plateau, fall
+    // back to the crisp integer boundary `pixel ∓ 0.5`.
     // True only if `p` is a real background pixel the probe can anchor
     // on. A probe whose start pixel is already content has no clean
     // edge to localise.
     let on_bg = |p: Option<Rgba>| matches!(p, Some(p) if bg.rgb_delta(p) <= tol);
     // Horizontal probe: walk along row `at_y` from `start_x` stepping
     // `step` (+1 inward from the left side, -1 inward from the right).
-    let probe_h = |start_x: i32, at_y: i32, step: i32, fallback: f64| -> f64 {
+    let probe_h = |start_x: i32, at_y: i32, step: i32| -> Option<f64> {
         let sample = |k: i32| -> Option<Rgba> {
             let x = start_x + step * k;
             if x < 0 || at_y < 0 {
@@ -598,14 +629,12 @@ pub fn shrink_to_content_with_bg_frac(
             frame.pixel(x as u32, at_y as u32)
         };
         if !on_bg(sample(0)) {
-            return fallback;
+            return None;
         }
-        match localize_edge(sample, bg, tol, bias) {
-            Some((_, _, boundary)) => start_x as f64 + step as f64 * boundary,
-            None => fallback,
-        }
+        localize_edge(sample, bg, tol, bias)
+            .map(|(_, _, boundary)| start_x as f64 + step as f64 * boundary)
     };
-    let probe_v = |at_x: i32, start_y: i32, step: i32, fallback: f64| -> f64 {
+    let probe_v = |at_x: i32, start_y: i32, step: i32| -> Option<f64> {
         let sample = |k: i32| -> Option<Rgba> {
             let y = start_y + step * k;
             if y < 0 || at_x < 0 {
@@ -614,18 +643,32 @@ pub fn shrink_to_content_with_bg_frac(
             frame.pixel(at_x as u32, y as u32)
         };
         if !on_bg(sample(0)) {
-            return fallback;
+            return None;
         }
-        match localize_edge(sample, bg, tol, bias) {
-            Some((_, _, boundary)) => start_y as f64 + step as f64 * boundary,
-            None => fallback,
-        }
+        localize_edge(sample, bg, tol, bias)
+            .map(|(_, _, boundary)| start_y as f64 + step as f64 * boundary)
     };
 
-    let left = probe_h(cx0, mid_y, 1, new_left as f64 - 0.5);
-    let right = probe_h(cx1, mid_y, -1, new_right as f64 + 0.5);
-    let top = probe_v(mid_x, cy0, 1, new_top as f64 - 0.5);
-    let bottom = probe_v(mid_x, cy1, -1, new_bot as f64 + 0.5);
+    let left = foreground_run_midpoints(new_top, new_bot, |y| is_content(new_left, y))
+        .into_iter()
+        .filter_map(|y| probe_h(cx0, y, 1))
+        .reduce(f64::min)
+        .unwrap_or(new_left as f64 - 0.5);
+    let right = foreground_run_midpoints(new_top, new_bot, |y| is_content(new_right, y))
+        .into_iter()
+        .filter_map(|y| probe_h(cx1, y, -1))
+        .reduce(f64::max)
+        .unwrap_or(new_right as f64 + 0.5);
+    let top = foreground_run_midpoints(new_left, new_right, |x| is_content(x, new_top))
+        .into_iter()
+        .filter_map(|x| probe_v(x, cy0, 1))
+        .reduce(f64::min)
+        .unwrap_or(new_top as f64 - 0.5);
+    let bottom = foreground_run_midpoints(new_left, new_right, |x| is_content(x, new_bot))
+        .into_iter()
+        .filter_map(|x| probe_v(x, cy1, -1))
+        .reduce(f64::max)
+        .unwrap_or(new_bot as f64 + 0.5);
     (left, top, right, bottom)
 }
 
@@ -799,6 +842,65 @@ mod tests {
         let (x0, y0, x1, y1) =
             shrink_to_content(&frame, 5, 5, 28, 28, Tolerance::DEFAULT, EdgeBias::Midpoint);
         assert_eq!((x0, y0, x1, y1), (12, 14, 19, 21));
+    }
+
+    #[test]
+    fn shrink_uses_full_text_envelope_instead_of_centre_glyph() {
+        // Three crisp silhouettes model a capital, a lowercase glyph at
+        // the bounding box's horizontal centre, and a descender. A single
+        // vertical centre probe sees only the lowercase x-height (8..=15)
+        // and would clip the true top (4) and bottom (20).
+        let mut buf = solid(32, 24, Rgba::WHITE);
+        for y in 4..=18 {
+            for x in 6..=8 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        for y in 8..=15 {
+            for x in 14..=20 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        for y in 8..=20 {
+            for x in 24..=26 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        let frame = FrameView::packed(&buf, 32, 24).unwrap();
+
+        for bias in [EdgeBias::Inner, EdgeBias::Midpoint, EdgeBias::Outer] {
+            let bounds = shrink_to_content_frac(&frame, 2, 2, 29, 22, Tolerance::DEFAULT, bias);
+            assert_eq!(bounds, (5.5, 3.5, 26.5, 20.5));
+        }
+    }
+
+    #[test]
+    fn shrink_keeps_detached_text_marks_and_descenders() {
+        // A detached two-pixel-high dot sits above the main x-height;
+        // a narrow descender extends below it. Neither intersects the
+        // content box's centre probe, but both are visible content and
+        // must participate in the outer envelope.
+        let mut buf = solid(32, 28, Rgba::WHITE);
+        for y in 10..=18 {
+            for x in 8..=23 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        for y in 5..=6 {
+            for x in 12..=13 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        for y in 19..=22 {
+            for x in 20..=22 {
+                put(&mut buf, 32, x, y, Rgba::BLACK);
+            }
+        }
+        let frame = FrameView::packed(&buf, 32, 28).unwrap();
+
+        let bounds =
+            shrink_to_content_frac(&frame, 3, 2, 28, 25, Tolerance::DEFAULT, EdgeBias::Midpoint);
+        assert_eq!(bounds, (7.5, 4.5, 23.5, 22.5));
     }
 
     #[test]
