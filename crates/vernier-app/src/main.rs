@@ -533,6 +533,11 @@ fn run_daemon() -> Result<()> {
     // committed lines. Once entered, pending mode is sticky: clicks
     // place a guide and stay in pending; ESC exits.
     let mut guides: Vec<Guide> = Vec::new();
+    // Which guide(s) captured the leading corner of an in-flight
+    // rectangle. Content hugging runs at release, but these locks are
+    // applied afterward so a deliberately guide-aligned side remains
+    // authoritative instead of jumping inward to nearby content.
+    let mut drawing_start_guide_snap = GuidePointSnap::default();
     let mut pending_guide: Option<GuideAxis> = None;
     // Has the user released SHIFT at least once since entering pending
     // mode? Entry via SHIFT+H / SHIFT+V starts with `false` (the trigger
@@ -938,9 +943,9 @@ fn run_daemon() -> Result<()> {
                         }
                     }
                 }
-                if let Some(op) = resizing {
+                if let Some(op) = resizing.as_mut() {
                     if let Some(rect) = held_rects.get_mut(op.rect_idx) {
-                        apply_resize(rect, &op, (x, y), &guides, alt_held);
+                        apply_resize(rect, op, (x, y), &guides, alt_held);
                     }
                 }
                 if last_hud_redraw.elapsed() >= REDRAW_INTERVAL {
@@ -948,7 +953,7 @@ fn run_daemon() -> Result<()> {
                     refresh_frame_if_live(capture_worker.as_ref(), &mut frozen_frame);
                     // Active resize wins; otherwise compute the
                     // handle the cursor is hovering on any held rect.
-                    let active_handle = resizing.map(|op| op.handle).or_else(|| {
+                    let active_handle = resizing.map(|op| op.effective_handle).or_else(|| {
                         held_rects.iter().find_map(|r| {
                             let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
                             let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
@@ -1359,7 +1364,7 @@ fn run_daemon() -> Result<()> {
                     // before falling through to other release paths.
                     if !pressed && resizing.is_some() {
                         log::info!("resize released");
-                        let op = resizing.take().unwrap();
+                        let mut op = resizing.take().unwrap();
                         // Snap only the side(s) the handle dragged
                         // back to the nearest content boundary.
                         // snap_shrink_resize samples bg from outside
@@ -1368,21 +1373,31 @@ fn run_daemon() -> Result<()> {
                         // own top-left can land inside content after
                         // a few iterations and would otherwise pin
                         // the wrong reference color).
-                        if !alt_held {
-                            if let Some(rect) = held_rects.get_mut(op.rect_idx) {
+                        if let Some(rect) = held_rects.get_mut(op.rect_idx) {
+                            // Apply the release coordinate too: a button
+                            // event need not be preceded by a final motion
+                            // event, and this also records the exact guide
+                            // provenance for the release position.
+                            apply_resize(rect, &mut op, (x, y), &guides, alt_held);
+                            if !alt_held {
                                 let lo_x = rect.rect_start.0.min(rect.rect_end.0);
                                 let hi_x = rect.rect_start.0.max(rect.rect_end.0);
                                 let lo_y = rect.rect_start.1.min(rect.rect_end.1);
                                 let hi_y = rect.rect_start.1.max(rect.rect_end.1);
-                                let (snapped_lo, snapped_hi, snapped_bounds) = snap_shrink_resize(
-                                    frozen_frame.as_ref(),
-                                    (lo_x, lo_y),
-                                    (hi_x, hi_y),
-                                    op.handle,
-                                    current_tol_value(tol_level),
-                                    edge_bias,
-                                    rect.bounds_phys,
-                                );
+                                let (snapped_lo, snapped_hi, snapped_bounds) =
+                                    apply_guide_locks_to_snapped_rect(
+                                        snap_shrink_resize(
+                                            frozen_frame.as_ref(),
+                                            (lo_x, lo_y),
+                                            (hi_x, hi_y),
+                                            op.effective_handle,
+                                            current_tol_value(tol_level),
+                                            edge_bias,
+                                            rect.bounds_phys,
+                                        ),
+                                        op.guide_locks,
+                                        frozen_frame.as_ref(),
+                                    );
                                 rect.rect_start = snapped_lo;
                                 rect.rect_end = snapped_hi;
                                 rect.bounds_phys = snapped_bounds;
@@ -1696,9 +1711,12 @@ fn run_daemon() -> Result<()> {
                                 resizing = Some(ResizeOp {
                                     rect_idx: idx,
                                     handle,
+                                    effective_handle: handle,
                                     initial_start: rect.rect_start,
                                     initial_end: rect.rect_end,
+                                    initial_bounds_phys: rect.bounds_phys,
                                     initial_cursor: (x, y),
+                                    guide_locks: GuideSideLocks::default(),
                                 });
                                 log::info!("resize start: rect={idx} handle={:?}", handle);
                                 started_resize = true;
@@ -1832,6 +1850,7 @@ fn run_daemon() -> Result<()> {
                             stuck_measurements: &mut stuck_measurements,
                             held_rects: &mut held_rects,
                             nudge_selection: &mut nudge_selection,
+                            drawing_start_guide_snap: &mut drawing_start_guide_snap,
                         },
                         PointerButtonFlags {
                             color_alternate,
@@ -1848,7 +1867,7 @@ fn run_daemon() -> Result<()> {
                     // run here too.
                     {
                         let cursor_px = Px::new(x as i32, y as i32);
-                        let active_handle = resizing.map(|op| op.handle).or_else(|| {
+                        let active_handle = resizing.map(|op| op.effective_handle).or_else(|| {
                             held_rects.iter().find_map(|r| {
                                 let rs = Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
                                 let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
@@ -2146,18 +2165,22 @@ fn run_daemon() -> Result<()> {
                         if let Some((px_x, px_y)) = last_pointer_xy {
                             if alt_changed {
                                 let cursor_px = Px::new(px_x as i32, px_y as i32);
-                                let active_handle = resizing.map(|op| op.handle).or_else(|| {
-                                    held_rects.iter().find_map(|r| {
-                                        let rs =
-                                            Px::new(r.rect_start.0 as i32, r.rect_start.1 as i32);
-                                        let re = Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
-                                        if cursor_over_pill(cursor_px, rs, re) {
-                                            None
-                                        } else {
-                                            cursor_over_rect_handle(cursor_px, rs, re)
-                                        }
-                                    })
-                                });
+                                let active_handle =
+                                    resizing.map(|op| op.effective_handle).or_else(|| {
+                                        held_rects.iter().find_map(|r| {
+                                            let rs = Px::new(
+                                                r.rect_start.0 as i32,
+                                                r.rect_start.1 as i32,
+                                            );
+                                            let re =
+                                                Px::new(r.rect_end.0 as i32, r.rect_end.1 as i32);
+                                            if cursor_over_pill(cursor_px, rs, re) {
+                                                None
+                                            } else {
+                                                cursor_over_rect_handle(cursor_px, rs, re)
+                                            }
+                                        })
+                                    });
                                 let want = want_system_pointer(
                                     cursor_px,
                                     MeasurementView {
@@ -5003,6 +5026,7 @@ struct MeasurementEdit<'a> {
     stuck_measurements: &'a mut [StuckMeasurement],
     held_rects: &'a mut Vec<HeldRect>,
     nudge_selection: &'a mut Option<NudgeSelection>,
+    drawing_start_guide_snap: &'a mut GuidePointSnap,
 }
 
 /// Small appearance flags read by the pointer-button path: the
@@ -6318,6 +6342,141 @@ mod menu_shortcut_tests {
     }
 }
 
+#[cfg(test)]
+mod guide_lock_tests {
+    use super::*;
+
+    const CONTENT_HUG: SnappedRect = ((20.0, 30.0), (80.0, 70.0), (39.5, 59.5, 160.5, 140.5));
+
+    fn held_rect() -> HeldRect {
+        HeldRect {
+            rect_start: (10.0, 20.0),
+            rect_end: (30.0, 40.0),
+            bounds_phys: (19.25, 39.25, 60.75, 80.75),
+            camera_armed: false,
+            color_alternate: false,
+        }
+    }
+
+    fn resize_op(handle: ResizeHandle) -> ResizeOp {
+        let rect = held_rect();
+        ResizeOp {
+            rect_idx: 0,
+            handle,
+            effective_handle: handle,
+            initial_start: rect.rect_start,
+            initial_end: rect.rect_end,
+            initial_bounds_phys: rect.bounds_phys,
+            initial_cursor: (10.0, 20.0),
+            guide_locks: GuideSideLocks::default(),
+        }
+    }
+
+    #[test]
+    fn guide_sides_override_hugged_content_individually() {
+        let locked = apply_guide_locks_with_scale(
+            CONTENT_HUG,
+            GuideSideLocks {
+                left: Some(10.0),
+                right: Some(90.0),
+                ..GuideSideLocks::default()
+            },
+            2.0,
+            2.0,
+        );
+
+        assert_eq!(locked.0, (10.0, 30.0));
+        assert_eq!(locked.1, (90.0, 70.0));
+        assert_eq!(locked.2, (19.5, 59.5, 180.5, 140.5));
+    }
+
+    #[test]
+    fn all_four_guide_sides_beat_inner_content_at_fractional_scale() {
+        let locked = apply_guide_locks_with_scale(
+            CONTENT_HUG,
+            GuideSideLocks {
+                left: Some(10.2),
+                top: Some(11.4),
+                right: Some(90.2),
+                bottom: Some(81.4),
+            },
+            1.5,
+            1.25,
+        );
+
+        assert_eq!(locked.0, (10.2, 11.4));
+        assert_eq!(locked.1, (90.2, 81.4));
+        assert_eq!(locked.2, (14.5, 13.5, 135.5, 102.5));
+    }
+
+    #[test]
+    fn reverse_drag_maps_endpoint_hits_to_normalized_sides() {
+        let locks = guide_side_locks_for_drag(
+            (90.0, 80.0),
+            (10.0, 12.0),
+            GuidePointSnap {
+                x: Some(90.0),
+                y: Some(80.0),
+            },
+            GuidePointSnap {
+                x: Some(10.0),
+                y: Some(12.0),
+            },
+        );
+
+        assert_eq!(
+            locks,
+            GuideSideLocks {
+                left: Some(10.0),
+                top: Some(12.0),
+                right: Some(90.0),
+                bottom: Some(80.0),
+            }
+        );
+    }
+
+    #[test]
+    fn no_guide_hit_leaves_shrink_result_byte_for_byte_unchanged() {
+        let reversed: SnappedRect = ((80.0, 70.0), (20.0, 30.0), (39.5, 59.5, 160.5, 140.5));
+
+        assert_eq!(
+            apply_guide_locks_with_scale(reversed, GuideSideLocks::default(), 2.0, 2.0,),
+            reversed
+        );
+    }
+
+    #[test]
+    fn crossed_resize_flips_the_effective_side_and_corner() {
+        let mut side_rect = held_rect();
+        let mut side = resize_op(ResizeHandle::Left);
+        apply_resize(&mut side_rect, &mut side, (35.0, 20.0), &[], true);
+        assert_eq!(side.effective_handle, ResizeHandle::Right);
+        assert_eq!(side_rect.rect_start, (30.0, 20.0));
+        assert_eq!(side_rect.rect_end, (35.0, 40.0));
+        assert_eq!(side_rect.bounds_phys.1, side.initial_bounds_phys.1);
+        assert_eq!(side_rect.bounds_phys.3, side.initial_bounds_phys.3);
+
+        let mut corner_rect = held_rect();
+        let mut corner = resize_op(ResizeHandle::TopLeft);
+        apply_resize(&mut corner_rect, &mut corner, (35.0, 45.0), &[], true);
+        assert_eq!(corner.effective_handle, ResizeHandle::BottomRight);
+        assert_eq!(corner_rect.rect_start, (30.0, 40.0));
+        assert_eq!(corner_rect.rect_end, (35.0, 45.0));
+    }
+
+    #[test]
+    fn no_motion_resize_preserves_fractional_physical_bounds() {
+        let mut rect = held_rect();
+        let mut op = resize_op(ResizeHandle::TopLeft);
+        let cursor = op.initial_cursor;
+
+        apply_resize(&mut rect, &mut op, cursor, &[], true);
+
+        assert_eq!(rect.bounds_phys, op.initial_bounds_phys);
+        assert_eq!(op.effective_handle, ResizeHandle::TopLeft);
+    }
+}
+
 fn toggle_measurement(
     session: &mut MeasureSession,
     content: MeasurementView,
@@ -6748,7 +6907,7 @@ fn refresh_hud(overlay: &mut vernier_platform::OverlayHandle, scene: &HudScene, 
             let mut hud = Hud::hover((x, y));
             hud.foreground = fg;
             populate_hud_appearance(&mut hud, alt_held);
-            if has_drag_distance(start.pixel, cursor_px) {
+            if has_drag_distance(start.cursor, cursor_px) {
                 let start_pos = (start.pixel.x as f64, start.pixel.y as f64);
                 // Snap the moving end of the rect to nearby guides on
                 // each axis. Alt disables snap for free placement.
@@ -6895,41 +7054,71 @@ const SNAP_PX_DEFAULT: f64 = 8.0;
 /// (matches Figma/Sketch's "snap zone" for object creation).
 const SNAP_PX_START_DRAG: f64 = 30.0;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GuideAxisSnap {
+    value: f64,
+    guide: Option<f64>,
+}
+
 /// Snap an x coordinate to the nearest vertical guide within
 /// `threshold_px` logical px. No-op when `general.snap_to_guides`
 /// is off. Used while drawing or resizing held rects so edges align
 /// cleanly with reference guides.
-fn snap_x_to_guides_within(x: f64, guides: &[Guide], threshold_px: f64) -> f64 {
+fn snap_x_to_guides_within_hit(x: f64, guides: &[Guide], threshold_px: f64) -> GuideAxisSnap {
     if !current_settings().general.snap_to_guides {
-        return x;
+        return GuideAxisSnap {
+            value: x,
+            guide: None,
+        };
     }
     let mut best = x;
     let mut best_d = threshold_px;
+    let mut hit = None;
     for g in guides.iter().filter(|g| g.axis == GuideAxis::Vertical) {
         let d = (x - g.position as f64).abs();
         if d < best_d {
             best_d = d;
             best = g.position as f64;
+            hit = Some(best);
         }
     }
-    best
+    GuideAxisSnap {
+        value: best,
+        guide: hit,
+    }
+}
+
+fn snap_x_to_guides_within(x: f64, guides: &[Guide], threshold_px: f64) -> f64 {
+    snap_x_to_guides_within_hit(x, guides, threshold_px).value
 }
 
 /// Mirror of [`snap_x_to_guides_within`] for horizontal guides.
-fn snap_y_to_guides_within(y: f64, guides: &[Guide], threshold_px: f64) -> f64 {
+fn snap_y_to_guides_within_hit(y: f64, guides: &[Guide], threshold_px: f64) -> GuideAxisSnap {
     if !current_settings().general.snap_to_guides {
-        return y;
+        return GuideAxisSnap {
+            value: y,
+            guide: None,
+        };
     }
     let mut best = y;
     let mut best_d = threshold_px;
+    let mut hit = None;
     for g in guides.iter().filter(|g| g.axis == GuideAxis::Horizontal) {
         let d = (y - g.position as f64).abs();
         if d < best_d {
             best_d = d;
             best = g.position as f64;
+            hit = Some(best);
         }
     }
-    best
+    GuideAxisSnap {
+        value: best,
+        guide: hit,
+    }
+}
+
+fn snap_y_to_guides_within(y: f64, guides: &[Guide], threshold_px: f64) -> f64 {
+    snap_y_to_guides_within_hit(y, guides, threshold_px).value
 }
 
 /// Convenience: default-threshold (`SNAP_PX_DEFAULT`) snap. Used by
@@ -6940,6 +7129,33 @@ fn snap_x_to_guides(x: f64, guides: &[Guide]) -> f64 {
 
 fn snap_y_to_guides(y: f64, guides: &[Guide]) -> f64 {
     snap_y_to_guides_within(y, guides, SNAP_PX_DEFAULT)
+}
+
+/// Assign endpoint guide hits to normalized rectangle sides. This is
+/// deliberately based on the snapped endpoint positions, so reverse
+/// drags preserve the correct left/right and top/bottom provenance.
+fn guide_side_locks_for_drag(
+    start: (f64, f64),
+    end: (f64, f64),
+    start_guides: GuidePointSnap,
+    end_guides: GuidePointSnap,
+) -> GuideSideLocks {
+    let (left, right) = if start.0 <= end.0 {
+        (start_guides.x, end_guides.x)
+    } else {
+        (end_guides.x, start_guides.x)
+    };
+    let (top, bottom) = if start.1 <= end.1 {
+        (start_guides.y, end_guides.y)
+    } else {
+        (end_guides.y, start_guides.y)
+    };
+    GuideSideLocks {
+        left,
+        top,
+        right,
+        bottom,
+    }
 }
 
 /// Snapshot the current axis distance into a [`StuckMeasurement`].
@@ -7302,7 +7518,7 @@ fn cursor_over_stuck_pill_at(cursor: Px, bbox: vernier_platform::placement::Pill
     cx >= bbox.x && cx <= bbox.x + bbox.w && cy >= bbox.y && cy <= bbox.y + bbox.h
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResizeHandle {
     Top,
     Right,
@@ -7314,13 +7530,68 @@ enum ResizeHandle {
     BottomRight,
 }
 
+fn flip_resize_handle_x(handle: ResizeHandle) -> ResizeHandle {
+    use ResizeHandle::*;
+    match handle {
+        Left => Right,
+        Right => Left,
+        TopLeft => TopRight,
+        TopRight => TopLeft,
+        BottomLeft => BottomRight,
+        BottomRight => BottomLeft,
+        Top | Bottom => handle,
+    }
+}
+
+fn flip_resize_handle_y(handle: ResizeHandle) -> ResizeHandle {
+    use ResizeHandle::*;
+    match handle {
+        Top => Bottom,
+        Bottom => Top,
+        TopLeft => BottomLeft,
+        TopRight => BottomRight,
+        BottomLeft => TopLeft,
+        BottomRight => TopRight,
+        Left | Right => handle,
+    }
+}
+
+/// A guide captured on each axis at one drag endpoint. Keeping this
+/// provenance separate from the snapped coordinate matters when the
+/// pointer lands exactly on the guide (snapped and raw values are then
+/// equal, but the guide must still outrank content hugging).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct GuidePointSnap {
+    x: Option<f64>,
+    y: Option<f64>,
+}
+
+/// Guide-authoritative sides after normalizing a rectangle to
+/// left/top/right/bottom order.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct GuideSideLocks {
+    left: Option<f64>,
+    top: Option<f64>,
+    right: Option<f64>,
+    bottom: Option<f64>,
+}
+
+impl GuideSideLocks {
+    fn is_empty(self) -> bool {
+        self.left.is_none() && self.top.is_none() && self.right.is_none() && self.bottom.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResizeOp {
     rect_idx: usize,
     handle: ResizeHandle,
+    effective_handle: ResizeHandle,
     initial_start: (f64, f64),
     initial_end: (f64, f64),
+    initial_bounds_phys: (f64, f64, f64, f64),
     initial_cursor: (f64, f64),
+    guide_locks: GuideSideLocks,
 }
 
 /// Hit-test the cursor against a held rect's resize handles. Corners
@@ -7474,7 +7745,7 @@ fn want_system_pointer(
 /// `cursor` based on which handle is being dragged.
 fn apply_resize(
     rect: &mut HeldRect,
-    op: &ResizeOp,
+    op: &mut ResizeOp,
     cursor: (f64, f64),
     guides: &[Guide],
     alt_held: bool,
@@ -7489,6 +7760,7 @@ fn apply_resize(
     let mut hi_x = initial_hi_x;
     let mut lo_y = initial_lo_y;
     let mut hi_y = initial_hi_y;
+    op.guide_locks = GuideSideLocks::default();
     use ResizeHandle::*;
     match op.handle {
         Top => lo_y += dy,
@@ -7514,31 +7786,107 @@ fn apply_resize(
     }
     // Snap the moving edges to nearby guides — corner handles move
     // both axes, side handles only move one. Alt disables snap.
+    let mut x_guide = None;
+    let mut y_guide = None;
     if !alt_held {
         match op.handle {
-            Top | TopLeft | TopRight => lo_y = snap_y_to_guides(lo_y, guides),
-            Bottom | BottomLeft | BottomRight => hi_y = snap_y_to_guides(hi_y, guides),
+            Top | TopLeft | TopRight => {
+                let snap = snap_y_to_guides_within_hit(lo_y, guides, SNAP_PX_DEFAULT);
+                lo_y = snap.value;
+                y_guide = snap.guide;
+            }
+            Bottom | BottomLeft | BottomRight => {
+                let snap = snap_y_to_guides_within_hit(hi_y, guides, SNAP_PX_DEFAULT);
+                hi_y = snap.value;
+                y_guide = snap.guide;
+            }
             _ => {}
         }
         match op.handle {
-            Left | TopLeft | BottomLeft => lo_x = snap_x_to_guides(lo_x, guides),
-            Right | TopRight | BottomRight => hi_x = snap_x_to_guides(hi_x, guides),
+            Left | TopLeft | BottomLeft => {
+                let snap = snap_x_to_guides_within_hit(lo_x, guides, SNAP_PX_DEFAULT);
+                lo_x = snap.value;
+                x_guide = snap.guide;
+            }
+            Right | TopRight | BottomRight => {
+                let snap = snap_x_to_guides_within_hit(hi_x, guides, SNAP_PX_DEFAULT);
+                hi_x = snap.value;
+                x_guide = snap.guide;
+            }
             _ => {}
         }
     }
-    if lo_x > hi_x {
+    let crossed_x = lo_x > hi_x;
+    let crossed_y = lo_y > hi_y;
+    if crossed_x {
         std::mem::swap(&mut lo_x, &mut hi_x);
     }
-    if lo_y > hi_y {
+    if crossed_y {
         std::mem::swap(&mut lo_y, &mut hi_y);
+    }
+    op.effective_handle = op.handle;
+    if crossed_x {
+        op.effective_handle = flip_resize_handle_x(op.effective_handle);
+    }
+    if crossed_y {
+        op.effective_handle = flip_resize_handle_y(op.effective_handle);
+    }
+    // Handles are allowed to cross the opposite edge. Assign a guide
+    // hit after normalization so it follows the actually moved side,
+    // not the handle's original left/right or top/bottom name.
+    if let Some(guide) = x_guide {
+        if (guide - lo_x).abs() <= f64::EPSILON {
+            op.guide_locks.left = Some(guide);
+        } else {
+            op.guide_locks.right = Some(guide);
+        }
+    }
+    if let Some(guide) = y_guide {
+        if (guide - lo_y).abs() <= f64::EPSILON {
+            op.guide_locks.top = Some(guide);
+        } else {
+            op.guide_locks.bottom = Some(guide);
+        }
     }
     rect.rect_start = (lo_x, lo_y);
     rect.rect_end = (hi_x, hi_y);
-    // Mid-resize the rect tracks the cursor (an integer logical pixel),
-    // so the bounds can only be best-effort here — derived from the
-    // logical corners. The release handler (`snap_shrink_resize`)
-    // restores exact physical bounds from `shrink_to_content`.
-    rect.bounds_phys = logical_corners_to_phys_bounds((lo_x, lo_y), (hi_x, hi_y));
+    // Preserve untouched fractional/soft-edge boundaries from the
+    // initial rectangle. Only the actively moved sides use a logical
+    // round-trip while dragging; release restores those from content
+    // localization. If a handle crosses the opposite side, both bounds
+    // on that axis change roles and must be re-derived.
+    let derived = logical_corners_to_phys_bounds((lo_x, lo_y), (hi_x, hi_y));
+    let initial = op.initial_bounds_phys;
+    let moves_left = matches!(op.effective_handle, Left | TopLeft | BottomLeft);
+    let moves_right = matches!(op.effective_handle, Right | TopRight | BottomRight);
+    let moves_top = matches!(op.effective_handle, Top | TopLeft | TopRight);
+    let moves_bottom = matches!(op.effective_handle, Bottom | BottomLeft | BottomRight);
+    let left_changed = (lo_x - initial_lo_x).abs() > f64::EPSILON;
+    let right_changed = (hi_x - initial_hi_x).abs() > f64::EPSILON;
+    let top_changed = (lo_y - initial_lo_y).abs() > f64::EPSILON;
+    let bottom_changed = (hi_y - initial_hi_y).abs() > f64::EPSILON;
+    rect.bounds_phys = (
+        if crossed_x || (moves_left && left_changed) {
+            derived.0
+        } else {
+            initial.0
+        },
+        if crossed_y || (moves_top && top_changed) {
+            derived.1
+        } else {
+            initial.1
+        },
+        if crossed_x || (moves_right && right_changed) {
+            derived.2
+        } else {
+            initial.2
+        },
+        if crossed_y || (moves_bottom && bottom_changed) {
+            derived.3
+        } else {
+            initial.3
+        },
+    );
 }
 
 /// True when `cursor` (logical pixels) is inside the held rectangle.
@@ -7652,6 +8000,7 @@ fn handle_pointer_button(
     let stuck_measurements: &mut [StuckMeasurement] = &mut *content.stuck_measurements;
     let held_rects: &mut Vec<HeldRect> = &mut *content.held_rects;
     let nudge_selection: &mut Option<NudgeSelection> = &mut *content.nudge_selection;
+    let drawing_start_guide_snap: &mut GuidePointSnap = &mut *content.drawing_start_guide_snap;
     let PointerButtonFlags {
         color_alternate,
         alt_held,
@@ -7704,15 +8053,25 @@ fn handle_pointer_button(
             // during the drag.
             //
             // Alt disables snap (same modifier as the release-snap).
-            let snapped_start = if alt_held {
-                cursor_px
+            let (snapped_start, start_guide_snap) = if alt_held {
+                (cursor_px, GuidePointSnap::default())
             } else {
-                Px::new(
-                    snap_x_to_guides_within(x, guides, SNAP_PX_START_DRAG).round() as i32,
-                    snap_y_to_guides_within(y, guides, SNAP_PX_START_DRAG).round() as i32,
+                let sx = snap_x_to_guides_within_hit(x, guides, SNAP_PX_START_DRAG);
+                let sy = snap_y_to_guides_within_hit(y, guides, SNAP_PX_START_DRAG);
+                (
+                    Px::new(sx.value.round() as i32, sy.value.round() as i32),
+                    GuidePointSnap {
+                        x: sx.guide,
+                        y: sy.guide,
+                    },
                 )
             };
-            let snap = SnapPoint::loose(snapped_start);
+            *drawing_start_guide_snap = start_guide_snap;
+            let snap = SnapPoint {
+                pixel: snapped_start,
+                cursor: cursor_px,
+                edge: None,
+            };
             log::info!(
                 "drag started at ({},{}) (raw cursor ({},{}))",
                 snapped_start.x,
@@ -7742,8 +8101,9 @@ fn handle_pointer_button(
         }
     } else if let InteractionMode::Drawing { start, .. } = mode {
         // Click-without-drag: short-circuit back to Hover.
-        if !has_drag_distance(start.pixel, cursor_px) {
+        if !has_drag_distance(start.cursor, cursor_px) {
             log::info!("click without drag — no measurement");
+            *drawing_start_guide_snap = GuidePointSnap::default();
             *mode = InteractionMode::Hover { cursor: cursor_px };
             let edges = edges_for_hud(frozen_frame, x, y, tolerance, bias, guides, held_rects);
             let mut hud = Hud::hover((x, y));
@@ -7763,14 +8123,33 @@ fn handle_pointer_button(
         // Snap the moving end of the rect to nearby guides on release
         // so the committed rect aligns with whatever guide the user
         // saw it snap to mid-drag. Alt disables snap.
-        let raw_end = if alt_held {
-            (x, y)
+        let (raw_end, end_guide_snap) = if alt_held {
+            ((x, y), GuidePointSnap::default())
         } else {
-            (snap_x_to_guides(x, guides), snap_y_to_guides(y, guides))
+            let sx = snap_x_to_guides_within_hit(x, guides, SNAP_PX_DEFAULT);
+            let sy = snap_y_to_guides_within_hit(y, guides, SNAP_PX_DEFAULT);
+            (
+                (sx.value, sy.value),
+                GuidePointSnap {
+                    x: sx.guide,
+                    y: sy.guide,
+                },
+            )
         };
-        // Snap-shrink to fit content.
-        let (snapped_start, snapped_end, bounds_phys) =
-            snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance, bias);
+        let side_locks = guide_side_locks_for_drag(
+            raw_start,
+            raw_end,
+            std::mem::take(drawing_start_guide_snap),
+            end_guide_snap,
+        );
+        // Content-hug first, then restore any guide-owned sides. This
+        // lets unlocked sides still tighten around content while a
+        // deliberate guide alignment remains exact.
+        let (snapped_start, snapped_end, bounds_phys) = apply_guide_locks_to_snapped_rect(
+            snap_shrink_logical_rect(frozen_frame, raw_start, raw_end, tolerance, bias),
+            side_locks,
+            frozen_frame,
+        );
         let measurement = Measurement::new(
             SnapPoint::loose(Px::new(
                 snapped_start.0.round() as i32,
@@ -7897,6 +8276,71 @@ fn logical_corners_to_phys_bounds(a: (f64, f64), b: (f64, f64)) -> (f64, f64, f6
         ay.min(by) - 0.5,
         ax.max(bx) + 0.5,
         ay.max(by) + 0.5,
+    )
+}
+
+/// Re-apply guide-authoritative sides after content hugging. Logical
+/// guide coordinates stay exact for drawing; physical bounds use the
+/// same inclusive-pixel half-boundary convention as the rest of the
+/// measurement pipeline, so dimensions remain pixel-exact on HiDPI.
+fn apply_guide_locks_to_snapped_rect(
+    snapped: SnappedRect,
+    locks: GuideSideLocks,
+    frame: Option<&vernier_platform::NativeFrame>,
+) -> SnappedRect {
+    if locks.is_empty() {
+        return snapped;
+    }
+    let fallback_scale = primary_scale_factor();
+    let (scale_x, scale_y) = frame
+        .filter(|frame| frame.bounds.w > 0 && frame.bounds.h > 0)
+        .map(|frame| {
+            (
+                frame.width as f64 / frame.bounds.w as f64,
+                frame.height as f64 / frame.bounds.h as f64,
+            )
+        })
+        .unwrap_or((fallback_scale, fallback_scale));
+    apply_guide_locks_with_scale(snapped, locks, scale_x, scale_y)
+}
+
+fn apply_guide_locks_with_scale(
+    snapped: SnappedRect,
+    locks: GuideSideLocks,
+    scale_x: f64,
+    scale_y: f64,
+) -> SnappedRect {
+    if locks.is_empty() {
+        return snapped;
+    }
+    let ((ax, ay), (bx, by), (mut left_phys, mut top_phys, mut right_phys, mut bottom_phys)) =
+        snapped;
+    let mut left = ax.min(bx);
+    let mut right = ax.max(bx);
+    let mut top = ay.min(by);
+    let mut bottom = ay.max(by);
+
+    if let Some(guide) = locks.left {
+        left = guide;
+        left_phys = (guide * scale_x).round() - 0.5;
+    }
+    if let Some(guide) = locks.top {
+        top = guide;
+        top_phys = (guide * scale_y).round() - 0.5;
+    }
+    if let Some(guide) = locks.right {
+        right = guide;
+        right_phys = (guide * scale_x).round() + 0.5;
+    }
+    if let Some(guide) = locks.bottom {
+        bottom = guide;
+        bottom_phys = (guide * scale_y).round() + 0.5;
+    }
+
+    (
+        (left, top),
+        (right, bottom),
+        (left_phys, top_phys, right_phys, bottom_phys),
     )
 }
 
