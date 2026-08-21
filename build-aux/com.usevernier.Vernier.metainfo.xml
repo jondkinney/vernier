@@ -37,6 +37,15 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.4.4" date="2026-08-21">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>register toggle hotkey via hyprctl eval on Hyprland Lua configs</li>
+          <li>type stroke widths for current Rust</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-08-19">
       <description>
         <p>Fixed:</p>
