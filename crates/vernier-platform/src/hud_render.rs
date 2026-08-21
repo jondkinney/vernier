@@ -326,19 +326,22 @@ pub(crate) fn render_hud_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: 
 }
 
 /// Rasterize only the layer that's invariant under cursor movement —
-/// held rects, stuck measurements, guides — into a fresh transparent
-/// canvas. Pair with [`static_hash`] so the backend can skip this
-/// call entirely when the static-affecting inputs haven't changed.
+/// held rects and stuck measurements — into a fresh transparent canvas.
+/// Pair with [`static_hash`] so the backend can skip this call entirely
+/// when the static-affecting inputs haven't changed. Guides deliberately
+/// live in the dynamic layer: pending placement and guide dragging move a
+/// guide on every pointer event and must not invalidate the full-screen
+/// static cache.
 pub(crate) fn render_static_into(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, hud: &Hud) {
     canvas.fill(0);
     render_static_layer(canvas, buf_w, buf_h, scale, hud);
 }
 
-/// Rasterize only the cursor-driven layer — live drag rect / Held
-/// overlay, crosshair, move/resize cursor, toast, context menu,
-/// corner indicator — into a fresh transparent canvas. Re-run every
-/// time `set_hud` fires; the backend composites this on top of the
-/// cached static buffer.
+/// Rasterize only the cursor-driven layer — guides, live drag rect / Held
+/// overlay, crosshair, move/resize cursor, toast, context menu, and
+/// corner indicator — into a fresh transparent canvas. Re-run every time
+/// `set_hud` fires; the backend composites this on top of the cached
+/// static buffer.
 pub(crate) fn render_dynamic_into(
     canvas: &mut [u8],
     buf_w: u32,
@@ -407,17 +410,6 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
         r.color_alternate.hash(&mut h);
     }
 
-    hud.guides.len().hash(&mut h);
-    for g in &hud.guides {
-        // Guide has no floats so it could `derive(Hash)`, but keeping
-        // the hashing explicit here matches the rest of the function
-        // and avoids the per-type `Hash` derive boilerplate.
-        g.axis.hash(&mut h);
-        g.position.hash(&mut h);
-        g.color_alternate.hash(&mut h);
-        g.hovered.hash(&mut h);
-    }
-
     hud.stuck_measurements.len().hash(&mut h);
     for m in &hud.stuck_measurements {
         m.axis.hash(&mut h);
@@ -431,9 +423,6 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
         m.hovered.hash(&mut h);
     }
 
-    hud.align_mode.hash(&mut h);
-    hud.guide_color.hash(&mut h);
-    hud.alternative_guide_color.hash(&mut h);
     hud.primary_fg.hash(&mut h);
     hud.alternate_fg.hash(&mut h);
 
@@ -504,9 +493,9 @@ fn render_dynamic_layer(canvas: &mut [u8], buf_w: u32, buf_h: u32, scale: f32, h
     }
 }
 
-/// Rasterize the static stroke pass — held rects, stuck measurements,
-/// and guides — and return the corresponding pill layouts so the
-/// caller can run the glyph pass.
+/// Rasterize the static stroke pass — held rects and stuck measurements
+/// — and return the corresponding pill layouts so the caller can run the
+/// glyph pass.
 fn render_static_strokes(
     canvas: &mut [u8],
     buf_w: u32,
@@ -604,45 +593,12 @@ fn render_static_strokes(
         );
     }
 
-    if !hud.guides.is_empty() {
-        // Cursor is needed by `draw_guides` only as a comment-anchor
-        // hint; the function ignores it today. Pass it through so the
-        // signature stays unchanged if hovered-X behavior moves back
-        // to the cursor later.
-        let cursor = match &hud.kind {
-            HudKind::Hover { cursor, .. } => Some(*cursor),
-            HudKind::Drawing { cursor, .. } => Some(*cursor),
-            HudKind::Held { cursor, .. } => Some(*cursor),
-            HudKind::None => None,
-        };
-        let ctx = DrawCtx {
-            buf: BufSize {
-                w: buf_w as f32,
-                h: buf_h as f32,
-            },
-            scale,
-            fmt: &hud.measurement_format,
-        };
-        draw_guides(
-            &mut pixmap,
-            &mut pills,
-            &hud.guides,
-            cursor,
-            GuideStyle {
-                color: hud.guide_color,
-                alternate: hud.alternative_guide_color,
-                align_mode: hud.align_mode,
-            },
-            &ctx,
-        );
-    }
-
     pills
 }
 
-/// Rasterize the dynamic stroke pass — live drag rect, Held overlay,
-/// crosshair, custom cursors, toast, context menu, corner indicator —
-/// and return the corresponding pill layouts.
+/// Rasterize the dynamic stroke pass — guides, live drag rect, Held
+/// overlay, crosshair, custom cursors, toast, context menu, and corner
+/// indicator — and return the corresponding pill layouts.
 fn render_dynamic_strokes(
     canvas: &mut [u8],
     buf_w: u32,
@@ -684,6 +640,37 @@ fn render_dynamic_strokes(
         stroke: &stroke,
         tick_stroke: &tick_stroke,
     };
+
+    // Guides are pointer-driven while being placed or dragged, so they
+    // belong in the dynamic layer even after they become persistent.
+    // Draw them first to preserve the old layer order: guides remain
+    // above held/stuck static content but below the live rectangle and
+    // crosshair. Keeping all guides together also lets inter-guide
+    // distance pills update atomically while one line moves.
+    if !hud.guides.is_empty() {
+        // Cursor is needed by `draw_guides` only as a comment-anchor
+        // hint; the function ignores it today. Pass it through so the
+        // signature stays unchanged if hovered-X behavior moves back
+        // to the cursor later.
+        let cursor = match &hud.kind {
+            HudKind::Hover { cursor, .. } => Some(*cursor),
+            HudKind::Drawing { cursor, .. } => Some(*cursor),
+            HudKind::Held { cursor, .. } => Some(*cursor),
+            HudKind::None => None,
+        };
+        draw_guides(
+            &mut pixmap,
+            &mut pills,
+            &hud.guides,
+            cursor,
+            GuideStyle {
+                color: hud.guide_color,
+                alternate: hud.alternative_guide_color,
+                align_mode: hud.align_mode,
+            },
+            &ctx,
+        );
+    }
 
     // Live drag rect — drawn before the cursor so the crosshair sits
     // on top.
@@ -1245,8 +1232,9 @@ fn draw_pill_tether(
 }
 
 /// Draw persistent reference guides — 1 physical-pixel blue lines
-/// spanning the full buffer along each guide's axis. Drawn after the
-/// rest of the HUD so the guides sit on top of measurement strokes.
+/// spanning the full buffer along each guide's axis. The dynamic pass
+/// draws them above persistent measurements and below the live
+/// rectangle/crosshair.
 /// When a guide is `hovered` and we have a `cursor`, draw a small dark
 /// "X" badge on the line at the cursor's free axis to signal removal.
 fn draw_guides(
@@ -2771,13 +2759,13 @@ mod tests {
         StuckMeasurement,
     };
 
-    /// Static-heavy fixture WITHOUT a crosshair. Held rect, guide, and
-    /// stuck measurement live in the upper portion; toast + corner
-    /// indicator live far away in the dynamic layer. Designed so no
-    /// pixel is painted by BOTH a static and a dynamic stroke — the
-    /// composite path then matches the single-pass render byte-for-byte
-    /// even though `composite_glyph` and tiny-skia's `draw_pixmap` use
-    /// slightly different SrcOver rounding.
+    /// Static-heavy fixture WITHOUT a crosshair. Held rect and stuck
+    /// measurement live in the upper portion; toast and corner indicator
+    /// live far away in the dynamic layer. Designed so no pixel is painted
+    /// by BOTH a static and a dynamic stroke — the composite path then
+    /// matches the single-pass render byte-for-byte even though
+    /// `composite_glyph` and tiny-skia's `draw_pixmap` use slightly
+    /// different SrcOver rounding.
     fn fixture_no_overlap() -> Hud {
         let mut hud = Hud::hover((0.0, 0.0));
         // No crosshair → no full-surface axis lines that would touch
@@ -2789,12 +2777,6 @@ mod tests {
             bounds_phys: (10.0, 10.0, 60.0, 60.0),
             camera_armed: false,
             color_alternate: false,
-        });
-        hud.guides.push(Guide {
-            axis: GuideAxis::Horizontal,
-            position: 80,
-            color_alternate: false,
-            hovered: false,
         });
         hud.stuck_measurements.push(StuckMeasurement {
             axis: GuideAxis::Horizontal,
@@ -2811,13 +2793,13 @@ mod tests {
         hud
     }
 
-    /// Wider fixture with a live crosshair whose axis lines DO sweep
-    /// across the static guide. Used to catch catastrophic drift
-    /// (e.g. a stroke disappearing from a layer would put hundreds of
-    /// pixels off), while tolerating a handful of 1-ULP rounding
-    /// differences at stroke intersections — `composite_glyph`'s
-    /// integer SrcOver and tiny-skia's float SrcOver round differently
-    /// in the last byte.
+    /// Wider fixture with a live crosshair whose axis lines sweep across
+    /// the dynamic guide. Used to catch catastrophic drift (e.g. a stroke
+    /// disappearing from a layer would put hundreds of pixels off), while
+    /// tolerating a handful of 1-ULP rounding differences where dynamic
+    /// strokes overlap static content — `composite_glyph`'s integer
+    /// SrcOver and tiny-skia's float SrcOver round differently in the
+    /// last byte.
     fn fixture_with_crosshair() -> Hud {
         let mut hud = Hud::hover((180.0, 180.0));
         hud.kind = HudKind::Hover {
@@ -2935,6 +2917,37 @@ mod tests {
         );
     }
 
+    /// Guides must be absent from the static cache and react only in the
+    /// dynamic layer when their pointer-driven position changes.
+    #[test]
+    fn moving_a_guide_only_changes_the_dynamic_layer() {
+        let (w, h, scale) = (240u32, 240u32, 1.0f32);
+        let mut hud = Hud::hover((0.0, 0.0));
+        hud.kind = HudKind::None;
+        hud.guides.push(Guide {
+            axis: GuideAxis::Horizontal,
+            position: 80,
+            color_alternate: false,
+            hovered: false,
+        });
+
+        let mut static_before = vec![0u8; (w * h * 4) as usize];
+        render_static_into(&mut static_before, w, h, scale, &hud);
+        let mut dynamic_before = vec![0u8; (w * h * 4) as usize];
+        render_dynamic_into(&mut dynamic_before, w, h, scale, &hud);
+
+        hud.guides[0].position += 1;
+        let mut static_after = vec![0u8; (w * h * 4) as usize];
+        render_static_into(&mut static_after, w, h, scale, &hud);
+        let mut dynamic_after = vec![0u8; (w * h * 4) as usize];
+        render_dynamic_into(&mut dynamic_after, w, h, scale, &hud);
+
+        assert_eq!(static_before, static_after);
+        assert!(static_before.iter().all(|byte| *byte == 0));
+        assert!(dynamic_before.iter().any(|byte| *byte != 0));
+        assert_ne!(dynamic_before, dynamic_after);
+    }
+
     /// Hash must be stable across mutations to dynamic-only fields.
     /// If it isn't, the static cache invalidates on every cursor
     /// move, defeating the whole optimization.
@@ -2999,6 +3012,47 @@ mod tests {
             "background change leaked into static hash"
         );
 
+        let mut moved_guide = hud.clone();
+        moved_guide.guides[0].position += 1;
+        assert_eq!(
+            static_hash(&moved_guide),
+            base,
+            "moving a guide changed static hash"
+        );
+
+        let mut hovered_guide = hud.clone();
+        hovered_guide.guides[0].hovered = !hovered_guide.guides[0].hovered;
+        assert_eq!(
+            static_hash(&hovered_guide),
+            base,
+            "guide hover changed static hash"
+        );
+
+        let mut alternate_guide = hud.clone();
+        alternate_guide.guides[0].color_alternate = !alternate_guide.guides[0].color_alternate;
+        assert_eq!(
+            static_hash(&alternate_guide),
+            base,
+            "guide color selection changed static hash"
+        );
+
+        let mut guide_color = hud.clone();
+        guide_color.guide_color = Color::rgba(2, 2, 2, 255);
+        guide_color.alternative_guide_color = Color::rgba(3, 3, 3, 255);
+        assert_eq!(
+            static_hash(&guide_color),
+            base,
+            "guide palette changed static hash"
+        );
+
+        let mut align = hud.clone();
+        align.align_mode = !align.align_mode;
+        assert_eq!(
+            static_hash(&align),
+            base,
+            "alignment mode changed static hash"
+        );
+
         let mut held_kind = hud.clone();
         held_kind.kind = HudKind::Held {
             rect_start: (1.0, 2.0),
@@ -3055,19 +3109,6 @@ mod tests {
             "moving a held rect must invalidate"
         );
 
-        let mut more_guides = hud.clone();
-        more_guides.guides.push(Guide {
-            axis: GuideAxis::Horizontal,
-            position: 120,
-            color_alternate: false,
-            hovered: false,
-        });
-        assert_ne!(
-            static_hash(&more_guides),
-            base,
-            "adding a guide must invalidate"
-        );
-
         let mut more_stuck = hud.clone();
         more_stuck.stuck_measurements.push(StuckMeasurement {
             axis: GuideAxis::Vertical,
@@ -3083,14 +3124,6 @@ mod tests {
             static_hash(&more_stuck),
             base,
             "adding a stuck must invalidate"
-        );
-
-        let mut align = hud.clone();
-        align.align_mode = !align.align_mode;
-        assert_ne!(
-            static_hash(&align),
-            base,
-            "align_mode toggle must invalidate"
         );
 
         let mut units = hud.clone();
@@ -3118,14 +3151,6 @@ mod tests {
             static_hash(&primary),
             base,
             "primary_fg change must invalidate"
-        );
-
-        let mut guide_color = hud.clone();
-        guide_color.guide_color = Color::rgba(2, 2, 2, 255);
-        assert_ne!(
-            static_hash(&guide_color),
-            base,
-            "guide_color change must invalidate"
         );
     }
 

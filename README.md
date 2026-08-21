@@ -170,9 +170,9 @@ crates/
 `vernier-platform` exposes a `Platform` trait the rest of the
 codebase binds against. The HUD is rasterized in `vernier-platform`
 via `tiny-skia` and split into a cached **static** layer (held
-rects, guides, stuck pills) and a **dynamic** layer (live crosshair,
-cursor, toast) so most frames skip the expensive stroke pass — only
-the small dynamic layer re-renders when the cursor moves.
+rects and stuck pills) and a **dynamic** layer (guides, live
+crosshair, cursor, toast) so pointer-driven guide placement never
+rebuilds the full-screen static cache.
 
 Linux backend autoselects Wayland when `$WAYLAND_DISPLAY` is set;
 the X11 fallback isn't implemented yet.

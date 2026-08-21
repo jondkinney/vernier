@@ -554,9 +554,10 @@ struct OverlayInst {
     /// strokes go on top in-place — so the per-frame cost is one
     /// full-buffer copy + the (sparse) dynamic stroke set, instead
     /// of bg-fill + two full-buffer SrcOver composites. Rebuilt
-    /// only when [`combined_cache_key`] changes (held rects /
-    /// guides / stuck measurements / colors / measurement format /
-    /// background tint). Length matches `pixmap_buf_w *
+    /// only when [`combined_cache_key`] changes (held rects / stuck
+    /// measurements / their colors / measurement format / background
+    /// tint). Guides are dynamic so placement and dragging do not
+    /// rebuild this full-screen cache. Length matches `pixmap_buf_w *
     /// pixmap_buf_h * 4`; empty before the first hud-bearing draw.
     ///
     /// On a 4K HiDPI surface (~42 MB buffer) each full-buffer pass

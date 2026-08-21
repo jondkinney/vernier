@@ -19,17 +19,19 @@ use vernier_platform::{
 mod capture_worker;
 use capture_worker::CaptureWorker;
 
-/// Minimum gap between HUD redraws / wl_buffer commits.
-/// ~120Hz — enough headroom over typical display refresh that the
-/// compositor always has a fresh frame, but not so high that we
-/// flood the Wayland connection. Used by both the live cursor
-/// redraws and the nudge auto-repeat throttle.
-// 16ms (~60 Hz) caps surface commits at a rate Hyprland tolerates
-// without `wl_surface.frame()` callback backpressure. Sustained
-// commits faster than this (we used to throttle at 8ms / 125 Hz)
-// caused the compositor to close the wayland socket — surfacing as
-// "Broken pipe (os error 32)" and a dead overlay — when the user
-// held an arrow key long enough for nudge auto-repeat to accumulate.
+/// Pointer-driven HUD redraw ceiling. Linux forwards every pointer
+/// state: the Wayland backend uses `wl_surface.frame()` as the
+/// authoritative compositor backpressure and coalesces updates until
+/// the compositor requests another frame. That preserves the final
+/// sample of a motion burst instead of leaving the crosshair one event
+/// behind. Other backends retain the conservative 60 Hz cap.
+#[cfg(target_os = "linux")]
+const HUD_POINTER_REDRAW_INTERVAL: Duration = Duration::ZERO;
+#[cfg(not(target_os = "linux"))]
+const HUD_POINTER_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Nudge redraws remain capped at ~60 Hz. Position updates are never
+/// dropped; only their buffer commits are coalesced.
 const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 // How long the `R` refresh-capture blinks the overlay transparent
@@ -508,7 +510,7 @@ fn run_daemon() -> Result<()> {
     // intentional during the brief measurement session: we want a fresh
     // frame ready whenever the compositor pulls one. Outside of
     // measurement mode we don't redraw at all.
-    const REDRAW_INTERVAL: Duration = HUD_REDRAW_INTERVAL;
+    const REDRAW_INTERVAL: Duration = HUD_POINTER_REDRAW_INTERVAL;
     // Edge-detection tolerance — discrete levels (Zero / Low / Medium
     // / High) cycled with +/-. Each level maps to a sum-of-channel
     // delta that the edge-detection scan uses to ignore minor color
