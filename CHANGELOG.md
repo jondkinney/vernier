@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/jondkinney/vernier/compare/v0.4.3...v0.4.4) - 2026-08-21
+
+### Fixed
+
+- *(linux)* register toggle hotkey via hyprctl eval on Hyprland Lua configs
+- *(ui)* type stroke widths for current Rust
+
 ## [0.4.3](https://github.com/jondkinney/vernier/compare/v0.4.2...v0.4.3) - 2026-08-19
 
 ### Fixed
