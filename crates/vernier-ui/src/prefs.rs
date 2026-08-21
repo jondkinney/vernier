@@ -675,7 +675,10 @@ impl App for PrefsApp {
                 .frame(
                     egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(60, 32, 32))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(170, 80, 70)))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgb(170, 80, 70),
+                        ))
                         .inner_margin(egui::Margin::symmetric(20, 12)),
                 )
                 .show(ctx, |ui| {
@@ -871,7 +874,7 @@ fn paint_daemon_dead_modal(ctx: &egui::Context, last_probe: &mut Instant) {
         .show(ctx, |ui| {
             egui::Frame::group(ui.style())
                 .fill(egui::Color32::from_gray(34))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)))
                 .corner_radius(egui::CornerRadius::same(10))
                 .inner_margin(egui::Margin::symmetric(24, 22))
                 .show(ui, |ui| {
@@ -1536,7 +1539,7 @@ fn paint_handoff_card(
     };
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_gray(34))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
         .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(18, 16))
         .show(ui, |ui| {
@@ -1830,7 +1833,7 @@ fn tick_slider(
     // snap, just reference).
     let notch_color = egui::Color32::from_gray(115);
     let half_notch = 4.0;
-    let notch_stroke = egui::Stroke::new(1.0, notch_color);
+    let notch_stroke = egui::Stroke::new(1.0_f32, notch_color);
     for i in 0..ticks {
         let t = if ticks > 1 {
             i as f32 / (ticks - 1) as f32
@@ -1981,7 +1984,7 @@ fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
 fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_gray(34))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
         .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(18, 16))
         .show(ui, |ui| {
@@ -2108,7 +2111,7 @@ fn shortcuts_section(
         egui::Frame::NONE
             .fill(egui::Color32::from_rgb(60, 48, 16))
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgb(180, 140, 50),
             ))
             .corner_radius(egui::CornerRadius::same(8))
@@ -2950,7 +2953,7 @@ fn about_section(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
             egui::TextFormat {
                 font_id: egui::FontId::proportional(12.0),
                 color: egui::Color32::from_rgb(0x4f, 0xa3, 0xff),
-                underline: egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4f, 0xa3, 0xff)),
+                underline: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4f, 0xa3, 0xff)),
                 ..Default::default()
             },
         );
