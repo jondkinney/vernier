@@ -4330,6 +4330,45 @@ fn accel_to_hyprland(accel: &Accelerator) -> (String, String) {
     (mods.join(" "), key)
 }
 
+/// Convert an `Accelerator` to the `MOD + MOD + KEY` string Hyprland's
+/// Lua config manager expects for `hl.bind`/`hl.unbind`
+/// (e.g. `"SUPER + CTRL + ALT + SHIFT + F"`). Reuses the canonical
+/// modifier ordering and key naming of [`accel_to_hyprland`].
+fn accel_to_hyprland_lua(accel: &Accelerator) -> String {
+    let (mods, key) = accel_to_hyprland(accel);
+    if mods.is_empty() {
+        key
+    } else {
+        // `accel_to_hyprland` space-joins modifiers; Lua wants ` + `.
+        format!("{} + {}", mods.replace(' ', " + "), key)
+    }
+}
+
+/// Run `hyprctl [-i <sig>] <args...>` and capture its output.
+fn hyprctl_cmd(instance: Option<&str>, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new("hyprctl");
+    if let Some(sig) = instance {
+        cmd.args(["-i", sig]);
+    }
+    cmd.args(args);
+    cmd.output()
+}
+
+/// True when a `hyprctl keyword` call was rejected because the active
+/// config uses Hyprland's newer (non-legacy) Lua parser, which only
+/// accepts dynamic edits through `hyprctl eval`. Hyprland answers such
+/// calls with `keyword can't work with non-legacy parsers. Use eval.`
+fn hyprctl_output_needs_lua_eval(out: &std::process::Output) -> bool {
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text.contains("non-legacy") || text.contains("Use eval")
+}
+
+/// Escape a string for embedding inside a Lua double-quoted literal.
+fn lua_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Register the toggle accelerator as a runtime Hyprland bind
 /// that runs `vernier toggle` (the IPC client command). Returns
 /// `false` if the spawn or hyprctl call failed.
@@ -4352,39 +4391,75 @@ fn register_hyprland_toggle_for(accel: &Accelerator, instance: Option<&str>) -> 
     // bind instead of stacking. `keyword unbind` is a no-op when
     // nothing's bound.
     let unbind_arg = format!("unbind = {mods}, {key}");
-    {
-        let mut prev = std::process::Command::new("hyprctl");
-        if let Some(sig) = instance {
-            prev.args(["-i", sig]);
-        }
-        prev.args(["keyword", &unbind_arg]);
-        let _ = prev.output();
-    }
+    let _ = hyprctl_cmd(instance, &["keyword", &unbind_arg]);
     let arg = format!("bind = {mods}, {key}, exec, {exe} toggle");
-    let mut cmd = std::process::Command::new("hyprctl");
-    if let Some(sig) = instance {
-        cmd.args(["-i", sig]);
-    }
-    cmd.args(["keyword", &arg]);
-    match cmd.output() {
-        Ok(out) => {
-            if !out.status.success() {
-                log::warn!(
-                    "hyprctl bind exit={:?} stdout={} stderr={}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr),
-                );
-                return false;
-            }
+    match hyprctl_cmd(instance, &["keyword", &arg]) {
+        // Newer Hyprland whose config is Lua rejects `keyword` with
+        // "can't work with non-legacy parsers. Use eval." — but still
+        // *exits 0*, so this must be checked before the success arm.
+        // Register the bind through the `hl.bind` Lua API via
+        // `hyprctl eval` instead.
+        Ok(out) if hyprctl_output_needs_lua_eval(&out) => {
+            register_hyprland_toggle_via_eval(accel, &exe, instance)
+        }
+        Ok(out) if out.status.success() => {
             log::info!(
                 "hyprctl bind: {mods}, {key} → {exe} toggle ({})",
                 accel.to_string_key()
             );
             true
         }
+        Ok(out) => {
+            log::warn!(
+                "hyprctl bind exit={:?} stdout={} stderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            false
+        }
         Err(e) => {
             log::warn!("hyprctl bind spawn: {e:#}");
+            false
+        }
+    }
+}
+
+/// Register the toggle bind through Hyprland's Lua config manager
+/// (`hyprctl eval` + the `hl.bind` API). The counterpart to the legacy
+/// `keyword` path, used when `~/.config/hypr` is a Lua config. Unbinds
+/// then binds in one eval so repeated calls don't stack duplicates.
+fn register_hyprland_toggle_via_eval(
+    accel: &Accelerator,
+    exe: &str,
+    instance: Option<&str>,
+) -> bool {
+    let keys = accel_to_hyprland_lua(accel);
+    let cmd = format!("{exe} toggle");
+    let lua = format!(
+        "hl.unbind(\"{k}\"); hl.bind(\"{k}\", hl.dsp.exec_cmd(\"{c}\"), {{description = \"Vernier toggle\"}})",
+        k = lua_escape(&keys),
+        c = lua_escape(&cmd),
+    );
+    match hyprctl_cmd(instance, &["eval", &lua]) {
+        Ok(out) if out.status.success() => {
+            log::info!(
+                "hyprctl eval hl.bind: {keys} → {exe} toggle ({})",
+                accel.to_string_key()
+            );
+            true
+        }
+        Ok(out) => {
+            log::warn!(
+                "hyprctl eval hl.bind exit={:?} stdout={} stderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("hyprctl eval spawn: {e:#}");
             false
         }
     }
@@ -4396,10 +4471,15 @@ fn register_hyprland_toggle_for(accel: &Accelerator, instance: Option<&str>) -> 
 fn unregister_hyprland_toggle(accel: &Accelerator) -> bool {
     let (mods, key) = accel_to_hyprland(accel);
     let arg = format!("unbind = {mods}, {key}");
-    match std::process::Command::new("hyprctl")
-        .args(["keyword", &arg])
-        .output()
-    {
+    match hyprctl_cmd(None, &["keyword", &arg]) {
+        // Lua config: `keyword` is rejected, so drop the bind via the
+        // `hl.unbind` Lua API instead (mirrors the register path).
+        Ok(out) if hyprctl_output_needs_lua_eval(&out) => {
+            let keys = accel_to_hyprland_lua(accel);
+            let lua = format!("hl.unbind(\"{}\")", lua_escape(&keys));
+            let _ = hyprctl_cmd(None, &["eval", &lua]);
+            true
+        }
         Ok(_) => true,
         Err(e) => {
             log::warn!("hyprctl unbind spawn: {e:#}");
