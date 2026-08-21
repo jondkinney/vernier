@@ -6,7 +6,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use vernier_core::{
     EdgeBias, EdgeQuad, FrameView, InteractionMode, Measurement, Px, RoundingMode, Settings,
-    SnapPoint, Tolerance, classify_aspect, detect_edges, shrink_to_content_frac,
+    ShortcutSettings, SnapPoint, Tolerance, classify_aspect, detect_edges, shrink_to_content_frac,
     shrink_to_content_with_bg_frac,
 };
 use vernier_platform::{
@@ -5615,75 +5615,96 @@ enum MenuAction {
 
 struct MenuItemDef {
     label: &'static str,
-    /// Shortcut hint as a list of segments (modifiers + key). Joined
-    /// with a single space at render time so each modifier sits
-    /// uniformly apart from the next one and from the trailing key —
-    /// regardless of whether the SUPER token resolves to a single
-    /// glyph (⌘ / Omarchy logo) or a multi-char word ("Super" /
-    /// "Win"). Use the literal `"SUPER"` sentinel here; it gets
-    /// substituted by `super_glyph_for_menu()` per-platform.
-    shortcut: Option<&'static [&'static str]>,
+    /// Which live preference supplies this row's shortcut hint.
+    /// The renderer resolves it from the daemon's current settings
+    /// every time the menu is drawn, so rebinding in Preferences
+    /// cannot leave a stale label here.
+    shortcut: Option<MenuShortcut>,
     icon: HudContextMenuIcon,
     action: MenuAction,
     divider_after: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MenuShortcut {
+    Toggle,
+    RestoreSession,
+    GuideHorizontal,
+    GuideVertical,
+    StuckHorizontal,
+    StuckVertical,
+    TakeNormalScreenshot,
+}
+
+impl MenuShortcut {
+    fn configured_value(self, shortcuts: &ShortcutSettings) -> &str {
+        match self {
+            Self::Toggle => &shortcuts.toggle,
+            Self::RestoreSession => &shortcuts.restore_session,
+            Self::GuideHorizontal => &shortcuts.guide_horizontal,
+            Self::GuideVertical => &shortcuts.guide_vertical,
+            Self::StuckHorizontal => &shortcuts.stuck_horizontal,
+            Self::StuckVertical => &shortcuts.stuck_vertical,
+            Self::TakeNormalScreenshot => &shortcuts.take_normal_screenshot,
+        }
+    }
+}
+
 const MENU_ITEMS: &[MenuItemDef] = &[
     MenuItemDef {
         label: "Add Horizontal Guide",
-        shortcut: Some(&["\u{21E7}", "H"]),
+        shortcut: Some(MenuShortcut::GuideHorizontal),
         icon: HudContextMenuIcon::GuideH,
         action: MenuAction::AddHorizontalGuide,
         divider_after: false,
     },
     MenuItemDef {
         label: "Add Vertical Guide",
-        shortcut: Some(&["\u{21E7}", "V"]),
+        shortcut: Some(MenuShortcut::GuideVertical),
         icon: HudContextMenuIcon::GuideV,
         action: MenuAction::AddVerticalGuide,
         divider_after: true,
     },
     MenuItemDef {
         label: "Hold Horizontal Distance",
-        shortcut: Some(&["H"]),
+        shortcut: Some(MenuShortcut::StuckHorizontal),
         icon: HudContextMenuIcon::StuckH,
         action: MenuAction::HoldHorizontalDistance,
         divider_after: false,
     },
     MenuItemDef {
         label: "Hold Vertical Distance",
-        shortcut: Some(&["V"]),
+        shortcut: Some(MenuShortcut::StuckVertical),
         icon: HudContextMenuIcon::StuckV,
         action: MenuAction::HoldVerticalDistance,
         divider_after: true,
     },
     MenuItemDef {
         label: "Take Normal Screenshot",
-        shortcut: Some(&["\u{2303}", "S"]),
+        shortcut: Some(MenuShortcut::TakeNormalScreenshot),
         icon: HudContextMenuIcon::Camera,
         action: MenuAction::OpenScreenshotTool,
         divider_after: false,
     },
     MenuItemDef {
         label: "Enter Background Mode",
-        shortcut: Some(&["\u{2303}", "\u{21E7}", "SUPER", "F"]),
+        shortcut: Some(MenuShortcut::Toggle),
         icon: HudContextMenuIcon::Background,
         action: MenuAction::EnterBackgroundMode,
         divider_after: false,
     },
     MenuItemDef {
         label: "Restore Last Session",
-        shortcut: Some(&["\u{21E7}", "R"]),
+        shortcut: Some(MenuShortcut::RestoreSession),
         icon: HudContextMenuIcon::Restore,
         action: MenuAction::RestoreLastSession,
         divider_after: true,
     },
     MenuItemDef {
         // Shortcut hint is intentionally None — the actual binding
-        // is Cmd+, on macOS and Ctrl+, elsewhere; the MENU_ITEMS
-        // const can't easily express that platform-conditional. The
-        // user gets the label only; the keyboard shortcut still
-        // works system-wide regardless.
+        // is Cmd+, on macOS and Ctrl+, elsewhere, and is not a user
+        // preference. The keyboard shortcut still works while the
+        // overlay is active.
         label: "Preferences…",
         shortcut: None,
         icon: HudContextMenuIcon::Settings,
@@ -6124,22 +6145,60 @@ pkill -KILL -x hyprpicker 2>/dev/null
 }
 
 fn build_hud_menu_items() -> Vec<HudContextMenuItem> {
-    let sup = super_glyph_for_menu();
+    let shortcuts = current_settings().shortcuts;
+    build_hud_menu_items_from_settings(&shortcuts, super_glyph_for_menu())
+}
+
+fn build_hud_menu_items_from_settings(
+    shortcuts: &ShortcutSettings,
+    super_glyph: &str,
+) -> Vec<HudContextMenuItem> {
     MENU_ITEMS
         .iter()
         .map(|it| HudContextMenuItem {
             label: it.label.into(),
-            shortcut: it.shortcut.map(|tokens| {
-                tokens
-                    .iter()
-                    .map(|t| if *t == "SUPER" { sup } else { *t })
-                    .collect::<Vec<_>>()
-                    .join(" ")
+            shortcut: it.shortcut.and_then(|shortcut| {
+                format_menu_shortcut(shortcut.configured_value(shortcuts), super_glyph)
             }),
             icon: it.icon,
             divider_after: it.divider_after,
         })
         .collect()
+}
+
+/// Render a configured accelerator using compact platform-appropriate
+/// glyphs. Parsing first is important: an empty or invalid setting has
+/// no active binding, so the menu must show no hint rather than
+/// advertising a shortcut that cannot fire.
+fn format_menu_shortcut(stored: &str, super_glyph: &str) -> Option<String> {
+    let canonical = Accelerator::parse(stored)?.to_string_key();
+    Some(
+        canonical
+            .split('+')
+            .map(|token| match token {
+                "CTRL" => "\u{2303}",  // ⌃
+                "SHIFT" => "\u{21E7}", // ⇧
+                "ALT" => "\u{2325}",   // ⌥
+                "SUPER" => super_glyph,
+                "ENTER" => "\u{21B5}",     // ↵
+                "ESC" => "\u{238B}",       // ⎋
+                "TAB" => "\u{21E5}",       // ⇥
+                "BACKSPACE" => "\u{232B}", // ⌫
+                "DELETE" => "\u{2326}",    // ⌦
+                "UP" => "\u{2191}",        // ↑
+                "DOWN" => "\u{2193}",      // ↓
+                "LEFT" => "\u{2190}",      // ←
+                "RIGHT" => "\u{2192}",     // →
+                "SPACE" => "\u{2423}",     // ␣
+                "PLUS" => "+",
+                "MINUS" => "-",
+                "EQUAL" => "=",
+                "UNDERSCORE" => "_",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// Glyph (or short text) used for the SUPER / META / "command" key in
@@ -6174,6 +6233,89 @@ fn omarchy_font_present() -> bool {
         .map(|h| std::path::PathBuf::from(h).join(".local/share/fonts/omarchy.ttf"))
         .map(|p| p.exists())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod menu_shortcut_tests {
+    use super::*;
+
+    fn hint<'a>(items: &'a [HudContextMenuItem], label: &str) -> Option<&'a str> {
+        items
+            .iter()
+            .find(|item| item.label == label)
+            .and_then(|item| item.shortcut.as_deref())
+    }
+
+    #[test]
+    fn menu_hints_follow_every_configured_shortcut() {
+        let shortcuts = ShortcutSettings {
+            toggle: "CTRL+SHIFT+ALT+SUPER+F".into(),
+            restore_session: "ESC".into(),
+            guide_horizontal: "CTRL+A".into(),
+            guide_vertical: "ALT+B".into(),
+            stuck_horizontal: "SUPER+C".into(),
+            stuck_vertical: "SHIFT+D".into(),
+            take_normal_screenshot: "CTRL+F12".into(),
+            ..ShortcutSettings::default()
+        };
+
+        let items = build_hud_menu_items_from_settings(&shortcuts, "META");
+
+        assert_eq!(hint(&items, "Add Horizontal Guide"), Some("⌃ A"));
+        assert_eq!(hint(&items, "Add Vertical Guide"), Some("⌥ B"));
+        assert_eq!(hint(&items, "Hold Horizontal Distance"), Some("META C"));
+        assert_eq!(hint(&items, "Hold Vertical Distance"), Some("⇧ D"));
+        assert_eq!(hint(&items, "Take Normal Screenshot"), Some("⌃ F12"));
+        assert_eq!(hint(&items, "Enter Background Mode"), Some("⌃ ⇧ ⌥ META F"));
+        assert_eq!(hint(&items, "Restore Last Session"), Some("⎋"));
+        assert_eq!(hint(&items, "Preferences…"), None);
+    }
+
+    #[test]
+    fn empty_or_invalid_binding_has_no_menu_hint() {
+        let shortcuts = ShortcutSettings {
+            guide_horizontal: String::new(),
+            stuck_horizontal: "NOT_A_KEY".into(),
+            ..ShortcutSettings::default()
+        };
+
+        let items = build_hud_menu_items_from_settings(&shortcuts, "META");
+
+        assert_eq!(hint(&items, "Add Horizontal Guide"), None);
+        assert_eq!(hint(&items, "Hold Horizontal Distance"), None);
+    }
+
+    #[test]
+    fn menu_shortcut_formats_special_keys() {
+        assert_eq!(
+            format_menu_shortcut("CTRL+PLUS", "META").as_deref(),
+            Some("⌃ +")
+        );
+        assert_eq!(
+            format_menu_shortcut("SHIFT+LEFT", "META").as_deref(),
+            Some("⇧ ←")
+        );
+        assert_eq!(
+            format_menu_shortcut("ALT+SPACE", "META").as_deref(),
+            Some("⌥ ␣")
+        );
+    }
+
+    #[test]
+    fn rebuilding_menu_reflects_new_settings() {
+        let before = ShortcutSettings {
+            guide_horizontal: "SHIFT+H".into(),
+            ..ShortcutSettings::default()
+        };
+        let mut after = before.clone();
+        after.guide_horizontal = "SHIFT+B".into();
+
+        let before_items = build_hud_menu_items_from_settings(&before, "META");
+        let after_items = build_hud_menu_items_from_settings(&after, "META");
+
+        assert_eq!(hint(&before_items, "Add Horizontal Guide"), Some("⇧ H"));
+        assert_eq!(hint(&after_items, "Add Horizontal Guide"), Some("⇧ B"));
+    }
 }
 
 fn toggle_measurement(
