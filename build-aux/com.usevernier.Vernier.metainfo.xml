@@ -37,6 +37,20 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.4.5" date="2026-08-21">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>prioritize guide-snapped bounds</li>
+          <li>show live shortcuts in context menu</li>
+          <li>preserve full text envelope when hugging</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>smooth pointer and guide rendering</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.4" date="2026-08-21">
       <description>
         <p>Fixed:</p>
