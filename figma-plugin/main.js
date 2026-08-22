@@ -44,6 +44,16 @@ figma.ui.onmessage = (message) => {
 
   if (message.type === "request-zoom") {
     reportZoom();
+    return;
+  }
+
+  // The panel must stay open while measuring (Figma stops a plugin when
+  // its window closes), so the UI offers a compact mode instead. Bounds
+  // keep a confused UI from producing an unusable window.
+  if (message.type === "resize") {
+    const width = Math.min(Math.max(Number(message.width) || 0, 200), 400);
+    const height = Math.min(Math.max(Number(message.height) || 0, 44), 600);
+    figma.ui.resize(width, height);
   }
 };
 

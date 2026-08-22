@@ -38,8 +38,10 @@ test("manifest is publishable, narrowly scoped, and supports Design and Dev Mode
 test("sandbox answers UI zoom requests without relying on sandbox timers", () => {
   const messages = [];
   let showUIOptions = null;
+  const resizes = [];
   const context = {
     __html__: "<html></html>",
+    Math,
     Number,
     figma: {
       editorType: "figma",
@@ -51,6 +53,9 @@ test("sandbox answers UI zoom requests without relying on sandbox timers", () =>
         onmessage: null,
         postMessage(message) {
           messages.push(message);
+        },
+        resize(width, height) {
+          resizes.push({ width, height });
         },
       },
     },
@@ -89,6 +94,14 @@ test("sandbox answers UI zoom requests without relying on sandbox timers", () =>
   context.figma.viewport.zoom = Number.NaN;
   context.figma.ui.onmessage({ type: "request-zoom" });
   assert.deepEqual(messages, []);
+
+  // Compact-mode resizes are honored but clamped to a usable window.
+  context.figma.ui.onmessage({ type: "resize", width: 240, height: 46 });
+  context.figma.ui.onmessage({ type: "resize", width: 20, height: 5000 });
+  assert.deepEqual(resizes, [
+    { width: 240, height: 46 },
+    { width: 200, height: 600 },
+  ]);
 });
 
 class FakeElement {
@@ -206,6 +219,8 @@ function loadUi() {
     "zoom",
     "mode",
     "retry",
+    "collapse",
+    "compact-zoom",
   ];
   const elements = Object.fromEntries(
     elementIds.map((id) => [id, new FakeElement()]),
@@ -449,6 +464,27 @@ test("UI keeps the connection fed when the sandbox never answers", () => {
     editorType: "figma",
     active: true,
   });
+});
+
+test("UI compact mode resizes the window and mirrors the zoom", () => {
+  const ui = loadUi();
+  ui.sendPluginMessage({ type: "context", editorType: "figma" });
+  ui.sendPluginMessage({ type: "zoom", value: 1.9674 });
+  assert.equal(ui.elements["compact-zoom"].textContent, "196.74%");
+
+  ui.elements.collapse.emit("click");
+  assert.deepEqual(plain(ui.parentMessages.at(-1)), {
+    message: { pluginMessage: { type: "resize", width: 240, height: 46 } },
+    origin: "*",
+  });
+  assert.equal(ui.elements["compact-zoom"].hidden, false);
+
+  ui.elements.collapse.emit("click");
+  assert.deepEqual(plain(ui.parentMessages.at(-1)), {
+    message: { pluginMessage: { type: "resize", width: 360, height: 360 } },
+    origin: "*",
+  });
+  assert.equal(ui.elements["compact-zoom"].hidden, true);
 });
 
 test("UI leases inactive when the sandbox stops answering zoom requests", () => {

@@ -38,6 +38,7 @@
 
       h1 {
         margin: 0;
+        flex: 1;
         font-size: 14px;
         font-weight: 600;
         line-height: 20px;
@@ -62,6 +63,35 @@
       .badge.waiting {
         color: var(--figma-color-text-warning, #8a4b08);
         background: var(--figma-color-bg-warning-tertiary, #fff1d6);
+      }
+
+      #collapse {
+        flex: none;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid var(--figma-color-border, #e5e5e5);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--figma-color-text-secondary, #6e6e6e);
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      #compact-zoom {
+        flex: none;
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+      }
+
+      body.compact main {
+        gap: 0;
+        padding: 12px 16px;
+      }
+
+      body.compact main > :not(header) {
+        display: none;
       }
 
       .connection {
@@ -214,7 +244,16 @@
     <main>
       <header>
         <h1>Vernier Bridge</h1>
+        <span id="compact-zoom" hidden></span>
         <span id="badge" class="badge">Connecting</span>
+        <button
+          id="collapse"
+          type="button"
+          title="Toggle compact view"
+          aria-label="Toggle compact view"
+        >
+          &#8211;
+        </button>
       </header>
 
       <section class="connection" role="status" aria-live="polite">
@@ -279,6 +318,8 @@
         const zoomOutput = document.getElementById("zoom");
         const modeOutput = document.getElementById("mode");
         const retryButton = document.getElementById("retry");
+        const collapseButton = document.getElementById("collapse");
+        const compactZoom = document.getElementById("compact-zoom");
 
         let socket = null;
         let helloTimer = null;
@@ -311,7 +352,39 @@
         function showZoom(zoom) {
           const percent = Math.round(zoom * 10000) / 100;
           zoomOutput.textContent = `${percent}%`;
+          compactZoom.textContent = `${percent}%`;
         }
+
+        // The panel must stay open while measuring — Figma stops the
+        // plugin when its window closes — so offer a compact strip
+        // (status badge + zoom) as the polite alternative.
+        const FULL_SIZE = { width: 360, height: 360 };
+        const COMPACT_SIZE = { width: 240, height: 46 };
+        let compactMode = false;
+
+        function applyCompactMode() {
+          if (document.body) {
+            document.body.classList.toggle("compact", compactMode);
+          }
+          compactZoom.hidden = !compactMode;
+          collapseButton.textContent = compactMode ? "+" : "–";
+          const size = compactMode ? COMPACT_SIZE : FULL_SIZE;
+          parent.postMessage(
+            {
+              pluginMessage: {
+                type: "resize",
+                width: size.width,
+                height: size.height,
+              },
+            },
+            "*",
+          );
+        }
+
+        collapseButton.addEventListener("click", () => {
+          compactMode = !compactMode;
+          applyCompactMode();
+        });
 
         function sendZoom(force = false) {
           // Recompute visibility at send time: Figma tab switches do not
