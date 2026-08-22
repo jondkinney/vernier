@@ -65,6 +65,37 @@ use crate::{
     PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
 };
 
+/// Derive the compositor's physical/logical output scale without confusing a
+/// raw mode's axes with Wayland's already-transformed logical dimensions.
+/// Keep the historical width-ratio behavior for unrotated outputs; 90°/270°
+/// transforms use the raw mode height because it becomes logical width.
+fn derive_output_scale_factor(
+    logical_size: Option<(u32, u32)>,
+    raw_mode_size: Option<(i32, i32)>,
+    transform: wl_output::Transform,
+    fallback_scale: i32,
+) -> f64 {
+    let Some((logical_width, _)) = logical_size else {
+        return f64::from(fallback_scale);
+    };
+    let Some((raw_width, raw_height)) = raw_mode_size else {
+        return f64::from(fallback_scale);
+    };
+    let axes_swapped = matches!(
+        transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    );
+    let physical_width = if axes_swapped { raw_height } else { raw_width };
+    if logical_width == 0 || physical_width <= 0 {
+        f64::from(fallback_scale)
+    } else {
+        f64::from(physical_width) / f64::from(logical_width)
+    }
+}
+
 pub(crate) fn init() -> Result<(Box<dyn Platform>, EventReceiver)> {
     let (events_tx, events_rx) = std::sync::mpsc::channel::<PlatformEvent>();
     let (cmd_tx, cmd_rx) = calloop::channel::channel::<Cmd>();
@@ -1243,12 +1274,12 @@ impl WaylandState {
             // logical size are known, derive the true (fractional)
             // scale from their ratio; otherwise fall back to the
             // rounded integer.
-            let scale_factor = match (logical, current_mode) {
-                (Some((log_w, _)), Some(m)) if log_w > 0 && m.dimensions.0 > 0 => {
-                    m.dimensions.0 as f64 / log_w as f64
-                }
-                _ => info.scale_factor as f64,
-            };
+            let scale_factor = derive_output_scale_factor(
+                logical,
+                current_mode.map(|mode| mode.dimensions),
+                info.transform,
+                info.scale_factor,
+            );
             vec.push(MonitorInfo {
                 id,
                 name: info
@@ -1874,5 +1905,103 @@ fn video_format_to_pixel_format(
         _other => Err(PlatformError::Unsupported {
             what: "unrecognized PipeWire video format",
         }),
+    }
+}
+
+#[cfg(test)]
+mod monitor_scale_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_width_ratio_for_unrotated_and_half_turn_transforms() {
+        let raw = Some((2560, 1440));
+        let logical = Some((1280, 720));
+        for transform in [
+            wl_output::Transform::Normal,
+            wl_output::Transform::_180,
+            wl_output::Transform::Flipped,
+            wl_output::Transform::Flipped180,
+        ] {
+            assert_eq!(derive_output_scale_factor(logical, raw, transform, 1), 2.0);
+        }
+
+        // Preserve the previous width-only result even if height metadata is
+        // inconsistent; this helper fixes axis selection, not policy.
+        assert_eq!(
+            derive_output_scale_factor(
+                Some((1280, 500)),
+                Some((2560, 3000)),
+                wl_output::Transform::Normal,
+                1,
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn swaps_raw_mode_axes_for_quarter_turn_and_flipped_quarter_turns() {
+        let raw = Some((2560, 1440));
+        let transformed_logical = Some((720, 1280));
+        for transform in [
+            wl_output::Transform::_90,
+            wl_output::Transform::_270,
+            wl_output::Transform::Flipped90,
+            wl_output::Transform::Flipped270,
+        ] {
+            assert_eq!(
+                derive_output_scale_factor(transformed_logical, raw, transform, 1),
+                2.0
+            );
+        }
+    }
+
+    #[test]
+    fn falls_back_when_required_geometry_is_missing_or_invalid() {
+        let fallback = 3;
+        assert_eq!(
+            derive_output_scale_factor(
+                None,
+                Some((2560, 1440)),
+                wl_output::Transform::Normal,
+                fallback,
+            ),
+            3.0
+        );
+        assert_eq!(
+            derive_output_scale_factor(
+                Some((1280, 720)),
+                None,
+                wl_output::Transform::Normal,
+                fallback,
+            ),
+            3.0
+        );
+        assert_eq!(
+            derive_output_scale_factor(
+                Some((0, 720)),
+                Some((2560, 1440)),
+                wl_output::Transform::Normal,
+                fallback,
+            ),
+            3.0
+        );
+        assert_eq!(
+            derive_output_scale_factor(
+                Some((1280, 720)),
+                Some((0, 1440)),
+                wl_output::Transform::Normal,
+                fallback,
+            ),
+            3.0
+        );
+        assert_eq!(
+            derive_output_scale_factor(
+                Some((720, 1280)),
+                Some((2560, 0)),
+                wl_output::Transform::_90,
+                fallback,
+            ),
+            3.0
+        );
     }
 }
