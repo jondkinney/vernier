@@ -40,6 +40,57 @@ Three flavors:
 paru -S vernier-bin    # or `yay -S vernier-bin`
 ```
 
+### Omarchy Shell companion
+
+The companion is optional. Vernier still exposes a standard
+`StatusNotifierItem` for non-Quickshell tray hosts such as Waybar and KDE.
+Omarchy 4.0+ users running its Quickshell-based shell can instead add Vernier
+as a native bar widget. This requires an active Wayland/UWSM session and
+network access for the Git clone; using the panel's first-launch installer
+also requires AUR access and a terminal in which package-manager prompts can
+be answered.
+
+```bash
+omarchy plugin add https://github.com/jondkinney/vernier.git --enable
+```
+
+Omarchy asks you to approve the third-party, unsandboxed plugin before cloning
+and enabling it. The widget is placed on the right side of the bar by default.
+
+Left-click the V to open its control panel. If Vernier is not installed yet,
+the panel offers **Install Vernier** and opens a visible terminal for the AUR
+install, including any required prompts. It installs and verifies
+`vernier-bin` (available for x86_64 and aarch64), hands the daemon to UWSM, and
+the widget connects when the daemon is ready. Nothing is installed just
+because the widget loads.
+
+With a companion-aware Vernier release connected, middle-click toggles
+measuring and right-click opens Preferences. The panel also shows the current
+mode and live counts for held rectangles, guides, and pinned measurements.
+Clicking **Clear** removes that content without leaving measure mode; the
+shortcut displayed beside it is the configured **Clear & Exit** shortcut and
+does leave measure mode when pressed. Older Vernier releases retain basic
+toggle, Preferences, and quit controls in legacy mode.
+
+Update only this companion with its plugin id:
+
+```bash
+omarchy plugin update com.jondkinney.vernier
+```
+
+Remove it with:
+
+```bash
+omarchy plugin remove com.jondkinney.vernier
+```
+
+Removing the companion does not stop or uninstall Vernier; its portable tray
+item returns automatically. The normal `omarchy update` flow updates an
+AUR-installed Vernier package.
+
+See [packaging/omarchy/README.md](packaging/omarchy/README.md) for behavior,
+security boundaries, and development details.
+
 ### Cargo (any Linux distro)
 
 For distros without a native package, install from crates.io:
@@ -118,10 +169,15 @@ daemon being `LSUIElement`.
 
 ## Hyprland setup
 
-The tray icon registers as a `StatusNotifierItem`. waybar's `tray`
-module renders it; the default Omarchy waybar config is already
-wired up — the V appears in the *tray-expander* group on the right
-side. Left-click for the menu (Preferences, Quit).
+The Linux tray icon registers as a standard `StatusNotifierItem`, so a tray
+host such as Omarchy Shell, Waybar, or KDE can render it. Left-click opens
+Preferences; right-click exposes Vernier's tray menu.
+
+When the optional Omarchy companion is loaded against a companion-aware
+Vernier release, it renews a short lease with the daemon and the generic item
+becomes passive, avoiding duplicate V icons.
+If Quickshell exits, reloads, or loses contact, the lease expires after 15
+seconds and the generic tray item returns automatically.
 
 If your waybar lacks the tray module:
 
@@ -153,6 +209,11 @@ bind = SHIFT CTRL ALT SUPER, F, exec, vernier toggle
 
 `vernier toggle` talks to the running daemon over a Unix domain
 socket at `$XDG_RUNTIME_DIR/vernier.sock` — no portal required.
+
+Shell integrations can use `vernier status` for a versioned JSON snapshot,
+`vernier activate` / `vernier deactivate` for idempotent control, and
+`vernier clear` to remove all held measurements without changing the active
+mode. `vernier start` starts the daemon only when it is not already responsive.
 
 ## Layout
 
