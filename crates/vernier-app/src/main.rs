@@ -1194,6 +1194,10 @@ fn run_daemon() -> Result<()> {
     // reference. Everything else still goes through &*platform via
     // deref coercion — the trait-object API is unchanged.
     let platform: Arc<dyn Platform> = Arc::from(platform);
+    #[cfg(target_os = "macos")]
+    if initial_settings.integrations.figma_zoom_correction {
+        spawn_focused_app_watcher(Arc::clone(&platform));
+    }
     let monitors = platform.monitors()?;
     log::info!("monitors detected: {}", monitors.len());
     for m in &monitors {
@@ -1263,15 +1267,18 @@ fn run_daemon() -> Result<()> {
             );
         }
     }
-    if on_hyprland {
+    if on_hyprland && initial_settings.integrations.figma_zoom_correction {
         // Active-window watcher backs the Figma plugin integration:
         // we need to know when a Figma tab is focused so we apply
         // the zoom-correction divisor only there.
         spawn_active_window_watcher();
     }
-    if initial_settings.integrations.figma_zoom_correction {
-        vernier_platform::figma_bridge::spawn(initial_settings.integrations.figma_bridge_port);
-    }
+    vernier_platform::figma_bridge::configure(
+        initial_settings
+            .integrations
+            .figma_zoom_correction
+            .then_some(initial_settings.integrations.figma_bridge_port),
+    );
 
     let mut current_hotkey: Option<HotkeyId> = None;
     if let Some(accel) = initial_accel_opt {
@@ -4525,6 +4532,22 @@ fn run_daemon() -> Result<()> {
                             }
                             current_accel = new_accel_opt;
                         }
+                        // The bridge manager applies this idempotently:
+                        // disabling closes the listener, and changing
+                        // the configured port invalidates old clients
+                        // before rebinding.
+                        if s.integrations.figma_zoom_correction {
+                            #[cfg(target_os = "macos")]
+                            spawn_focused_app_watcher(Arc::clone(&platform));
+                            if on_hyprland {
+                                spawn_active_window_watcher();
+                            }
+                        }
+                        vernier_platform::figma_bridge::configure(
+                            s.integrations
+                                .figma_zoom_correction
+                                .then_some(s.integrations.figma_bridge_port),
+                        );
                         let was_frozen = effective_freeze_screen();
                         replace_settings(s);
                         let is_frozen = effective_freeze_screen();
@@ -4853,6 +4876,7 @@ fn run_daemon() -> Result<()> {
             let _ = unregister_hyprland_toggle(&accel);
         }
     }
+    vernier_platform::figma_bridge::stop();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
@@ -4927,7 +4951,7 @@ fn current_measurement_format() -> HudMeasurementFormat {
     } else {
         String::new()
     };
-    let (dimension_divisor, _) = current_figma_correction(&s);
+    let (dimension_divisor, figma_indicator) = current_figma_correction(&s);
     HudMeasurementFormat {
         unit_suffix,
         rounding: match s.general.rounding_mode {
@@ -4941,6 +4965,7 @@ fn current_measurement_format() -> HudMeasurementFormat {
         aspect_in_distance: s.general.aspect_in_distance_tool,
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
+        canvas_coordinates: figma_indicator.is_some(),
     }
 }
 
@@ -5030,6 +5055,7 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
         aspect_in_distance: s.general.aspect_in_distance_tool,
         aspect_mode: s.general.aspect_mode,
         dimension_divisor,
+        canvas_coordinates: corner_indicator.is_some(),
     };
     // Momentary cursor-hide: holding ALT suppresses Vernier's own
     // crosshair so the user can read the pixels under it when
@@ -5781,15 +5807,15 @@ fn spawn_hyprland_bind_watcher() {
         .ok();
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ActiveWindow {
     class: String,
     title: String,
 }
 
-/// Last-known focused window from Hyprland's `activewindow>>` event
-/// stream. Updated by `spawn_active_window_watcher`; read by the HUD
-/// code path to decide whether Figma zoom-correction should fire.
+/// Last-known focused window from Hyprland's event stream. Updated by
+/// `spawn_active_window_watcher`; read by the HUD code path to decide
+/// whether Figma zoom-correction should fire.
 fn active_window_lock() -> &'static std::sync::RwLock<ActiveWindow> {
     static SLOT: std::sync::OnceLock<std::sync::RwLock<ActiveWindow>> = std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::RwLock::new(ActiveWindow::default()))
@@ -5802,18 +5828,129 @@ fn current_active_window() -> ActiveWindow {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActiveWindowEvent {
+    Replace(ActiveWindow),
+    Refresh,
+}
+
+/// Parse only the Hyprland events that can change the active window's class or
+/// title. Browser tab switches often keep the same Wayland window and emit a
+/// title event instead of `activewindow`, so those events require a fresh
+/// authoritative `hyprctl activewindow` query.
+fn parse_active_window_event(line: &str) -> Option<ActiveWindowEvent> {
+    if let Some(rest) = line.strip_prefix("activewindow>>") {
+        // Titles can contain commas, so split on the first one only.
+        let (class, title) = match rest.split_once(',') {
+            Some((class, title)) => (class.to_string(), title.to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        return Some(ActiveWindowEvent::Replace(ActiveWindow { class, title }));
+    }
+    if line.starts_with("windowtitle>>") || line.starts_with("windowtitlev2>>") {
+        return Some(ActiveWindowEvent::Refresh);
+    }
+    None
+}
+
+fn cache_active_window(window: ActiveWindow) {
+    if let Ok(mut cached) = active_window_lock().write() {
+        *cached = window;
+    }
+}
+
+fn focused_app_lock() -> &'static std::sync::RwLock<Option<vernier_platform::AppIdentity>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<vernier_platform::AppIdentity>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn current_focused_app() -> Option<vernier_platform::AppIdentity> {
+    focused_app_lock().read().ok().and_then(|app| app.clone())
+}
+
+/// Poll the native frontmost-application API on macOS. Vernier's
+/// overlay windows are non-activating, so Figma Desktop remains the
+/// frontmost application while the user measures over it.
+#[cfg(target_os = "macos")]
+fn spawn_focused_app_watcher(platform: Arc<dyn Platform>) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("vernier-focused-app".into())
+        .spawn(move || {
+            loop {
+                if !current_settings().integrations.figma_zoom_correction {
+                    if let Ok(mut cached) = focused_app_lock().write() {
+                        *cached = None;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                match platform.focused_app() {
+                    Ok(app) => {
+                        if let Ok(mut cached) = focused_app_lock().write() {
+                            *cached = app;
+                        }
+                    }
+                    Err(e) => {
+                        // Do not retain a possibly-Figma identity after
+                        // focus discovery fails; false negatives are safer
+                        // than scaling another application's measurements.
+                        if let Ok(mut cached) = focused_app_lock().write() {
+                            *cached = None;
+                        }
+                        log::debug!("figma focus watcher: {e}");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })
+    {
+        STARTED.store(false, std::sync::atomic::Ordering::Release);
+        log::warn!("spawn Figma focused-app watcher: {e}");
+    }
+}
+
 /// Subscribe to Hyprland's `socket2.sock` event stream and keep
-/// `active_window_lock()` in sync with `activewindow>>` events. The
-/// daemon uses this read-only — there's no main-thread blocking on
+/// `active_window_lock()` in sync with active-window and title events.
+/// The daemon uses this read-only — there's no main-thread blocking on
 /// the cache, so a sluggish Hyprland event stream just delays the
 /// Figma-detection decision by one frame.
 fn spawn_active_window_watcher() {
     use std::io::{BufRead, BufReader};
     use std::time::Duration;
-    std::thread::Builder::new()
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
         .name("vernier-active-window".into())
         .spawn(|| {
             loop {
+                if !current_settings().integrations.figma_zoom_correction {
+                    cache_active_window(ActiveWindow::default());
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
                 let path = match current_hyprland_instance() {
                     Some((_, p)) => p,
                     None => {
@@ -5832,30 +5969,37 @@ fn spawn_active_window_watcher() {
                 // first poll after Hyprland restart still sees the old
                 // window class.
                 if let Some(initial) = read_active_window_via_hyprctl() {
-                    if let Ok(mut g) = active_window_lock().write() {
-                        *g = initial;
-                    }
+                    cache_active_window(initial);
                 }
                 let reader = BufReader::new(stream);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
-                    // `activewindow>>CLASS,TITLE` — note that titles
-                    // can contain commas, so split on the first one
-                    // only and treat the rest as title.
-                    if let Some(rest) = line.strip_prefix("activewindow>>") {
-                        let (class, title) = match rest.split_once(',') {
-                            Some((c, t)) => (c.to_string(), t.to_string()),
-                            None => (rest.to_string(), String::new()),
-                        };
-                        if let Ok(mut g) = active_window_lock().write() {
-                            *g = ActiveWindow { class, title };
+                    if !current_settings().integrations.figma_zoom_correction {
+                        break;
+                    }
+                    match parse_active_window_event(&line) {
+                        Some(ActiveWindowEvent::Replace(window)) => cache_active_window(window),
+                        Some(ActiveWindowEvent::Refresh) => {
+                            if let Some(window) = read_active_window_via_hyprctl() {
+                                cache_active_window(window);
+                            } else {
+                                cache_active_window(ActiveWindow::default());
+                            }
                         }
+                        None => {}
                     }
                 }
+                // Never retain a Figma title across a compositor restart or a
+                // broken event stream. A false negative until reconnect is safer
+                // than scaling another application's measurements.
+                cache_active_window(ActiveWindow::default());
                 std::thread::sleep(Duration::from_millis(500));
             }
         })
-        .ok();
+    {
+        STARTED.store(false, std::sync::atomic::Ordering::Release);
+        log::warn!("spawn Figma active-window watcher: {e}");
+    }
 }
 
 /// One-shot query of the focused window via `hyprctl activewindow`.
@@ -5887,6 +6031,39 @@ fn read_active_window_via_hyprctl() -> Option<ActiveWindow> {
 /// the bridge's cached zoom + the user's settings. Returns the divisor
 /// to apply (1.0 means no correction) and an indicator string for the
 /// corner pill (`None` if no correction).
+fn configured_figma_window_matches(settings: &Settings, window: &ActiveWindow) -> bool {
+    let class_match = settings
+        .integrations
+        .figma_browser_classes
+        .iter()
+        .any(|class| class.eq_ignore_ascii_case(&window.class));
+    let suffix = &settings.integrations.figma_title_suffix;
+    let title_match = !suffix.trim().is_empty() && window.title.ends_with(suffix);
+    class_match && title_match
+}
+
+fn native_figma_app_matches(app: &vernier_platform::AppIdentity) -> bool {
+    if app.id.eq_ignore_ascii_case("com.figma.Desktop") {
+        return true;
+    }
+    let executable_is_figma = app
+        .executable
+        .as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("figma"));
+    app.display_name.trim().eq_ignore_ascii_case("figma") && executable_is_figma
+}
+
+fn figma_context_is_active(
+    settings: &Settings,
+    window: &ActiveWindow,
+    focused_app: Option<&vernier_platform::AppIdentity>,
+) -> bool {
+    configured_figma_window_matches(settings, window)
+        || focused_app.is_some_and(native_figma_app_matches)
+}
+
 fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
     if !settings.integrations.figma_zoom_correction {
         return (1.0, None);
@@ -5895,20 +6072,102 @@ fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
         Some(z) if z > 0.0 => z,
         _ => return (1.0, None),
     };
-    let win = current_active_window();
-    let class_match = settings
-        .integrations
-        .figma_browser_classes
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(&win.class));
-    let title_match = win
-        .title
-        .contains(&settings.integrations.figma_title_suffix);
-    if !(class_match && title_match) {
+    if !figma_context_is_active(
+        settings,
+        &current_active_window(),
+        current_focused_app().as_ref(),
+    ) {
         return (1.0, None);
     }
     let pct = (zoom * 100.0).round() as i64;
     (zoom, Some(format!("F \u{00B7} {pct}%")))
+}
+
+#[cfg(test)]
+mod figma_activation_tests {
+    use super::*;
+
+    fn app(id: &str, name: &str, executable: Option<&str>) -> vernier_platform::AppIdentity {
+        vernier_platform::AppIdentity {
+            id: id.into(),
+            display_name: name.into(),
+            executable: executable.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn hyprland_requires_configured_class_and_figma_title() {
+        let settings = Settings::default();
+        let figma = ActiveWindow {
+            class: "Google-chrome".into(),
+            title: "Example Design \u{2013} Figma".into(),
+        };
+        assert!(figma_context_is_active(&settings, &figma, None));
+
+        let unrelated = ActiveWindow {
+            class: "Google-chrome".into(),
+            title: "Documentation".into(),
+        };
+        assert!(!figma_context_is_active(&settings, &unrelated, None));
+
+        let embedded_suffix = ActiveWindow {
+            class: "Google-chrome".into(),
+            title: "Example Design – Figma – Documentation".into(),
+        };
+        assert!(!figma_context_is_active(&settings, &embedded_suffix, None,));
+
+        let mut empty_suffix = settings.clone();
+        empty_suffix.integrations.figma_title_suffix.clear();
+        assert!(!figma_context_is_active(&empty_suffix, &figma, None,));
+    }
+
+    #[test]
+    fn macos_accepts_only_a_native_figma_identity() {
+        let settings = Settings::default();
+        let no_window = ActiveWindow::default();
+        let figma = app(
+            "com.figma.Desktop",
+            "Figma",
+            Some("/Applications/Figma.app/Contents/MacOS/Figma"),
+        );
+        assert!(figma_context_is_active(&settings, &no_window, Some(&figma)));
+
+        let impostor = app("com.example.Figma", "Figma", Some("/usr/bin/not-figma"));
+        assert!(!figma_context_is_active(
+            &settings,
+            &no_window,
+            Some(&impostor),
+        ));
+    }
+
+    #[test]
+    fn missing_focus_api_fails_closed() {
+        assert!(!figma_context_is_active(
+            &Settings::default(),
+            &ActiveWindow::default(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn parses_hyprland_title_changes_and_titles_with_commas() {
+        assert_eq!(
+            parse_active_window_event("activewindow>>google-chrome,Diagram, v2 – Vernier – Figma"),
+            Some(ActiveWindowEvent::Replace(ActiveWindow {
+                class: "google-chrome".into(),
+                title: "Diagram, v2 – Vernier – Figma".into(),
+            }))
+        );
+        assert_eq!(
+            parse_active_window_event("windowtitle>>0x123"),
+            Some(ActiveWindowEvent::Refresh)
+        );
+        assert_eq!(
+            parse_active_window_event("windowtitlev2>>0x123,Untitled – Figma"),
+            Some(ActiveWindowEvent::Refresh)
+        );
+        assert_eq!(parse_active_window_event("workspace>>2"), None);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6854,6 +7113,17 @@ fn ipc_loop(
                     // needed since the build_id is a process-lifetime
                     // constant captured at daemon startup.
                     let _ = writer.write_all(format!("{}\n", vernier_core::build_id()).as_bytes());
+                }
+                "figma-status" => {
+                    // Preferences runs as a separate process, so it
+                    // cannot read the daemon's process-local active
+                    // zoom lease directly. Answer from this IPC thread.
+                    let status = if vernier_platform::figma_bridge::current_figma_zoom().is_some() {
+                        b"active\n".as_slice()
+                    } else {
+                        b"inactive\n".as_slice()
+                    };
+                    let _ = writer.write_all(status);
                 }
                 #[cfg(target_os = "linux")]
                 "capture-chord" => {

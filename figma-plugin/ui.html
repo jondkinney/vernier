@@ -1,59 +1,585 @@
-<!DOCTYPE html>
-<html>
-  <head><meta charset="utf-8" /></head>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vernier Bridge</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        font-size: 12px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 0;
+        color: var(--figma-color-text, #1e1e1e);
+        background: var(--figma-color-bg, #ffffff);
+      }
+
+      main {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        line-height: 20px;
+      }
+
+      .badge {
+        flex: none;
+        border-radius: 999px;
+        padding: 3px 8px;
+        color: var(--figma-color-text-secondary, #6e6e6e);
+        background: var(--figma-color-bg-secondary, #f5f5f5);
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 16px;
+      }
+
+      .badge.connected {
+        color: var(--figma-color-text-success, #146c43);
+        background: var(--figma-color-bg-success-tertiary, #e7f8ee);
+      }
+
+      .badge.waiting {
+        color: var(--figma-color-text-warning, #8a4b08);
+        background: var(--figma-color-bg-warning-tertiary, #fff1d6);
+      }
+
+      .connection {
+        display: grid;
+        grid-template-columns: 10px minmax(0, 1fr);
+        gap: 10px;
+        align-items: start;
+        min-height: 62px;
+        border: 1px solid var(--figma-color-border, #e5e5e5);
+        border-radius: 6px;
+        padding: 12px;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        margin-top: 4px;
+        border-radius: 50%;
+        background: var(--figma-color-icon-secondary, #8c8c8c);
+      }
+
+      .dot.connecting {
+        background: var(--figma-color-icon-brand, #0d99ff);
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+
+      .dot.connected {
+        background: var(--figma-color-icon-success, #14ae5c);
+      }
+
+      .dot.waiting {
+        background: var(--figma-color-icon-warning, #e8a317);
+      }
+
+      @keyframes pulse {
+        50% {
+          opacity: 0.35;
+        }
+      }
+
+      .connection strong,
+      .connection p {
+        display: block;
+        margin: 0;
+      }
+
+      .connection strong {
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 16px;
+      }
+
+      .connection p {
+        margin-top: 4px;
+        color: var(--figma-color-text-secondary, #6e6e6e);
+        line-height: 16px;
+      }
+
+      dl {
+        display: grid;
+        gap: 0;
+        margin: 0;
+        border-top: 1px solid var(--figma-color-border, #e5e5e5);
+        border-bottom: 1px solid var(--figma-color-border, #e5e5e5);
+      }
+
+      dl div {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 34px;
+        gap: 12px;
+      }
+
+      dl div + div {
+        border-top: 1px solid var(--figma-color-border, #e5e5e5);
+      }
+
+      dt {
+        color: var(--figma-color-text-secondary, #6e6e6e);
+      }
+
+      dd {
+        overflow: hidden;
+        margin: 0;
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+      }
+
+      .privacy {
+        margin: 0;
+        color: var(--figma-color-text-secondary, #6e6e6e);
+        line-height: 16px;
+      }
+
+      footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      footer span {
+        min-width: 0;
+        color: var(--figma-color-text-secondary, #6e6e6e);
+        line-height: 16px;
+      }
+
+      button {
+        flex: none;
+        min-height: 28px;
+        border: 1px solid var(--figma-color-border-strong, #b3b3b3);
+        border-radius: 5px;
+        padding: 4px 10px;
+        color: var(--figma-color-text, #1e1e1e);
+        background: var(--figma-color-bg, #ffffff);
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+      }
+
+      button:hover {
+        border-color: var(--figma-color-border-brand, #0d99ff);
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--figma-color-border-brand, #0d99ff);
+        outline-offset: 2px;
+      }
+
+      button[hidden] {
+        display: none;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .dot.connecting {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
   <body>
+    <main>
+      <header>
+        <h1>Vernier Bridge</h1>
+        <span id="badge" class="badge">Connecting</span>
+      </header>
+
+      <section class="connection" role="status" aria-live="polite">
+        <span id="status-dot" class="dot connecting" aria-hidden="true"></span>
+        <div>
+          <strong id="status-title">Connecting to Vernier…</strong>
+          <p id="status-detail">
+            Vernier must be running locally with Figma integration enabled.
+          </p>
+        </div>
+      </section>
+
+      <dl>
+        <div>
+          <dt>Canvas zoom</dt>
+          <dd id="zoom">Waiting…</dd>
+        </div>
+        <div>
+          <dt>Mode</dt>
+          <dd id="mode">Detecting…</dd>
+        </div>
+        <div>
+          <dt>Local endpoint</dt>
+          <dd><code>127.0.0.1:8765</code></dd>
+        </div>
+      </dl>
+
+      <p class="privacy">
+        Zoom and active-editor context stay on this computer.
+      </p>
+
+      <footer>
+        <span>Keep this plugin open while measuring.</span>
+        <button id="retry" type="button" hidden>Retry now</button>
+      </footer>
+    </main>
+
     <script>
-      const URL = "ws://127.0.0.1:8765";
-      const RECONNECT_MS = 2000;
+      (() => {
+        "use strict";
 
-      let ws = null;
-      let pendingReconnect = null;
-      let lastZoom = -1;
+        const SOCKET_URL = "ws://127.0.0.1:8765";
+        const PROTOCOL_VERSION = 1;
+        const HELLO_TIMEOUT_MS = 2000;
+        const ZOOM_POLL_MS = 100;
+        const HEARTBEAT_MS = 750;
+        const ZOOM_EPSILON = 0.0001;
+        const INITIAL_RECONNECT_MS = 1000;
+        const MAX_RECONNECT_MS = 5000;
 
-      function send(zoom) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        try {
-          ws.send(JSON.stringify({ type: "zoom", value: zoom }));
-        } catch (e) {
-          // ignore — onclose will follow
+        const badge = document.getElementById("badge");
+        const statusDot = document.getElementById("status-dot");
+        const statusTitle = document.getElementById("status-title");
+        const statusDetail = document.getElementById("status-detail");
+        const zoomOutput = document.getElementById("zoom");
+        const modeOutput = document.getElementById("mode");
+        const retryButton = document.getElementById("retry");
+
+        let socket = null;
+        let helloTimer = null;
+        let reconnectTimer = null;
+        let reconnectAttempt = 0;
+        let editorType = null;
+        let verified = false;
+        let active = document.visibilityState === "visible";
+        let awaitingFreshZoom = false;
+        let lastZoom = null;
+        let lastSentZoom = null;
+        let lastSentActive = null;
+        let zoomPollTimer = null;
+        let heartbeatTimer = null;
+
+        function setStatus(kind, label, title, detail) {
+          badge.className = `badge ${kind}`;
+          badge.textContent = label;
+          statusDot.className = `dot ${kind}`;
+          statusTitle.textContent = title;
+          statusDetail.textContent = detail;
+          retryButton.hidden = kind === "connected" || kind === "connecting";
         }
-      }
 
-      function connect() {
-        try {
-          ws = new WebSocket(URL);
-        } catch (e) {
-          scheduleReconnect();
-          return;
+        function validZoom(value) {
+          return typeof value === "number" && Number.isFinite(value) && value > 0;
         }
-        ws.onopen = () => {
-          if (lastZoom >= 0) send(lastZoom);
-        };
-        ws.onclose = () => {
-          ws = null;
-          scheduleReconnect();
-        };
-        ws.onerror = () => {
-          // onclose follows.
-        };
-      }
 
-      function scheduleReconnect() {
-        if (pendingReconnect != null) return;
-        pendingReconnect = setTimeout(() => {
-          pendingReconnect = null;
+        function showZoom(zoom) {
+          const percent = Math.round(zoom * 10000) / 100;
+          zoomOutput.textContent = `${percent}%`;
+        }
+
+        function sendZoom(force = false) {
+          if (
+            !socket ||
+            socket.readyState !== WebSocket.OPEN ||
+            !verified ||
+            (active && awaitingFreshZoom) ||
+            !validZoom(lastZoom)
+          ) {
+            return;
+          }
+
+          const changed =
+            lastSentZoom == null ||
+            Math.abs(lastZoom - lastSentZoom) > ZOOM_EPSILON;
+          const activityChanged = lastSentActive !== active;
+          if (!force && !changed && !activityChanged) return;
+
+          try {
+            socket.send(
+              JSON.stringify({
+                type: "zoom",
+                value: lastZoom,
+                protocol: PROTOCOL_VERSION,
+                client: "figma",
+                editorType,
+                active,
+              }),
+            );
+            lastSentZoom = lastZoom;
+            lastSentActive = active;
+          } catch (_error) {
+            // The socket's close event owns reconnection and user-visible state.
+          }
+        }
+
+        function scheduleReconnect(failure = null) {
+          if (reconnectTimer != null) return;
+
+          const exponent = Math.min(reconnectAttempt, 3);
+          const delay = Math.min(
+            INITIAL_RECONNECT_MS * 2 ** exponent,
+            MAX_RECONNECT_MS,
+          );
+          reconnectAttempt += 1;
+
+          const label = failure ? failure.label : "Waiting";
+          const title = failure ? failure.title : "Vernier isn’t reachable";
+          const guidance = failure
+            ? failure.guidance
+            : "Start Vernier and allow Figma local-network access.";
+          setStatus(
+            "waiting",
+            label,
+            title,
+            `${guidance} Retrying in ${delay / 1000}s.`,
+          );
+
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            connect();
+          }, delay);
+        }
+
+        function connect() {
+          if (editorType == null) return;
+
+          if (
+            socket &&
+            (socket.readyState === WebSocket.CONNECTING ||
+              socket.readyState === WebSocket.OPEN)
+          ) {
+            return;
+          }
+
+          setStatus(
+            "connecting",
+            "Connecting",
+            "Connecting to Vernier…",
+            "Vernier must be running locally with Figma integration enabled.",
+          );
+
+          let nextSocket;
+          let failure = null;
+          try {
+            nextSocket = new WebSocket(SOCKET_URL);
+          } catch (_error) {
+            scheduleReconnect({
+              label: "Blocked",
+              title: "Local connection was blocked",
+              guidance: "Allow Figma local-network access.",
+            });
+            return;
+          }
+
+          socket = nextSocket;
+          verified = false;
+
+          nextSocket.addEventListener("open", () => {
+            if (socket !== nextSocket) return;
+            setStatus(
+              "connecting",
+              "Verifying",
+              "Verifying Vernier…",
+              "Confirming that the local service is the Vernier bridge.",
+            );
+
+            try {
+              nextSocket.send(
+                JSON.stringify({
+                  type: "hello",
+                  protocol: PROTOCOL_VERSION,
+                  client: "figma",
+                  editorType,
+                }),
+              );
+            } catch (_error) {
+              nextSocket.close();
+              return;
+            }
+
+            helloTimer = window.setTimeout(() => {
+              if (socket !== nextSocket || verified) return;
+              failure = {
+                label: "Unverified",
+                title: "That service isn’t Vernier",
+                guidance: "Another process may be using port 8765.",
+              };
+              nextSocket.close();
+            }, HELLO_TIMEOUT_MS);
+          });
+
+          nextSocket.addEventListener("message", (event) => {
+            if (socket !== nextSocket || verified) return;
+
+            let message;
+            try {
+              message = JSON.parse(event.data);
+            } catch (_error) {
+              return;
+            }
+
+            if (
+              !message ||
+              message.type !== "hello" ||
+              message.protocol !== PROTOCOL_VERSION ||
+              message.server !== "vernier"
+            ) {
+              return;
+            }
+
+            verified = true;
+            reconnectAttempt = 0;
+            if (helloTimer != null) {
+              window.clearTimeout(helloTimer);
+              helloTimer = null;
+            }
+
+            const version =
+              typeof message.version === "string" && message.version.length > 0
+                ? ` ${message.version}`
+                : "";
+            setStatus(
+              "connected",
+              "Connected",
+              "Connected to Vernier",
+              `Vernier${version} confirmed. Measurements now use canvas pixels.`,
+            );
+            lastSentZoom = null;
+            lastSentActive = null;
+            sendZoom(true);
+          });
+
+          nextSocket.addEventListener("error", () => {
+            if (socket !== nextSocket) return;
+            failure = {
+              label: "Waiting",
+              title: "Vernier isn’t reachable",
+              guidance:
+                "Start Vernier or check Figma’s local-network permission.",
+            };
+            setStatus(
+              "waiting",
+              failure.label,
+              failure.title,
+              failure.guidance,
+            );
+          });
+
+          nextSocket.addEventListener("close", () => {
+            if (socket !== nextSocket) return;
+            if (helloTimer != null) {
+              window.clearTimeout(helloTimer);
+              helloTimer = null;
+            }
+            socket = null;
+            verified = false;
+            scheduleReconnect(failure);
+          });
+        }
+
+        function retryNow() {
+          if (reconnectTimer != null) {
+            window.clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
+
+          const previousSocket = socket;
+          socket = null;
+          verified = false;
+          if (helloTimer != null) {
+            window.clearTimeout(helloTimer);
+            helloTimer = null;
+          }
+          if (previousSocket) previousSocket.close();
+          reconnectAttempt = 0;
           connect();
-        }, RECONNECT_MS);
-      }
+        }
 
-      window.onmessage = (event) => {
-        const msg = event.data && event.data.pluginMessage;
-        if (!msg || msg.type !== "zoom") return;
-        lastZoom = msg.value;
-        send(msg.value);
-      };
+        retryButton.addEventListener("click", retryNow);
 
-      connect();
+        function requestZoom() {
+          parent.postMessage({ pluginMessage: { type: "request-zoom" } }, "*");
+        }
+
+        document.addEventListener("visibilitychange", () => {
+          active = document.visibilityState === "visible";
+
+          if (!active) {
+            awaitingFreshZoom = false;
+            // Revoke this tab's lease immediately so another visible Figma tab
+            // can become authoritative without waiting for expiry.
+            sendZoom(true);
+            return;
+          }
+
+          // Do not reactivate with a potentially stale zoom. Force the next
+          // response from the sandbox to publish a fresh active lease.
+          awaitingFreshZoom = true;
+          lastSentActive = null;
+          requestZoom();
+        });
+
+        window.addEventListener("message", (event) => {
+          const message = event.data && event.data.pluginMessage;
+          if (!message || typeof message !== "object") return;
+
+          if (message.type === "zoom" && validZoom(message.value)) {
+            lastZoom = message.value;
+            showZoom(message.value);
+            if (active && awaitingFreshZoom) awaitingFreshZoom = false;
+            sendZoom();
+            return;
+          }
+
+          if (message.type === "context") {
+            editorType = message.editorType === "dev" ? "dev" : "figma";
+            modeOutput.textContent =
+              editorType === "dev" ? "Dev Mode" : "Design Mode";
+            connect();
+          }
+        });
+
+        window.addEventListener("beforeunload", () => {
+          if (helloTimer != null) window.clearTimeout(helloTimer);
+          if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
+          if (zoomPollTimer != null) window.clearInterval(zoomPollTimer);
+          if (heartbeatTimer != null) window.clearInterval(heartbeatTimer);
+          if (socket) socket.close();
+        });
+
+        // Ask the sandbox to replay state after this iframe's listeners exist.
+        parent.postMessage({ pluginMessage: { type: "ui-ready" } }, "*");
+        zoomPollTimer = window.setInterval(requestZoom, ZOOM_POLL_MS);
+        heartbeatTimer = window.setInterval(() => sendZoom(true), HEARTBEAT_MS);
+      })();
     </script>
   </body>
 </html>

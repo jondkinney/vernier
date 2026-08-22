@@ -144,6 +144,10 @@ struct PrefsApp {
     /// IPC. `None` if the probe failed or the daemon is older than
     /// the `version` command. Refreshed alongside `daemon_alive`.
     daemon_build_id: Option<String>,
+    /// Whether the daemon has a fresh zoom lease from an active plugin tab.
+    /// The preferences window has its own process-local bridge state,
+    /// so reading current_figma_zoom here would always be disconnected.
+    figma_tab_active: bool,
     /// Cached macOS Screen Recording authorization — `false` drives
     /// the permission banner shown above every pane. Starts optimistic
     /// (`true`) and is corrected by the first async probe result a few
@@ -229,6 +233,7 @@ impl PrefsApp {
             prefs_started_at: now,
             my_build_id: vernier_core::build_id(),
             daemon_build_id: None,
+            figma_tab_active: false,
             // Optimistic until the first async probe lands — avoids a
             // banner flash on the common authorized path. `update`
             // resolves the probe and re-arms it while unauthorized.
@@ -394,6 +399,7 @@ impl App for PrefsApp {
         {
             self.daemon_alive = is_daemon_responsive();
             self.daemon_build_id = query_daemon_build_id();
+            self.figma_tab_active = query_daemon_figma_tab_active();
             self.last_daemon_probe = Instant::now();
         }
         ctx.request_repaint_after(probe_interval);
@@ -747,9 +753,11 @@ impl App for PrefsApp {
                         ),
                         Section::Tolerance => tolerance_section(ui, &mut self.edited.tolerance),
                         Section::Appearance => appearance_section(ui, &mut self.edited.appearance),
-                        Section::Integrations => {
-                            integrations_section(ui, &mut self.edited.integrations)
-                        }
+                        Section::Integrations => integrations_section(
+                            ui,
+                            &mut self.edited.integrations,
+                            self.figma_tab_active,
+                        ),
                         Section::Shortcuts => shortcuts_section(
                             ui,
                             &mut self.edited.shortcuts,
@@ -803,6 +811,32 @@ fn query_daemon_build_id() -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Query active zoom-lease state from the daemon that owns the WebSocket listener.
+/// This must cross IPC because preferences is a separate process.
+fn query_daemon_figma_tab_active() -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let path = daemon_socket_path();
+    if !path.exists() {
+        return false;
+    }
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
+        return false;
+    };
+    let timeout = Some(Duration::from_millis(500));
+    if stream.set_read_timeout(timeout).is_err()
+        || stream.set_write_timeout(timeout).is_err()
+        || stream.write_all(b"figma-status\n").is_err()
+        || stream.shutdown(std::net::Shutdown::Write).is_err()
+    {
+        return false;
+    }
+    BufReader::new(stream)
+        .lines()
+        .next()
+        .and_then(|line| line.ok())
+        .is_some_and(|line| line.trim() == "active")
 }
 
 /// Tell the running daemon to quit, wait briefly for it to release
@@ -1970,18 +2004,18 @@ fn appearance_section(ui: &mut egui::Ui, s: &mut AppearanceSettings) {
     }
 }
 
-fn integrations_section(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
-    paint_figma_card(ui, s);
+fn integrations_section(
+    ui: &mut egui::Ui,
+    settings: &mut IntegrationSettings,
+    figma_tab_active: bool,
+) {
+    paint_figma_card(ui, settings, figma_tab_active);
 }
 
 /// Top card on the Integrations pane: heading, description, live
-/// connection status, Enable toggle, and an "Install plugin in
-/// Figma" button that copies the manifest path to the clipboard
-/// and opens Figma in the browser. Figma has no deep link to its
-/// "Import plugin from manifest" dialog, so the user still has to
-/// click through `Plugins → Development → Import plugin from
-/// manifest…` — the inline blurb spells out that path.
-fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
+/// daemon-owned active-tab status, Enable toggle, and the current
+/// Community-publication state.
+fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings, figma_tab_active: bool) {
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_gray(34))
         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
@@ -2026,14 +2060,13 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
                         );
                     ui.add_space(8.0);
 
-                    let connected = vernier_platform::figma_bridge::current_figma_zoom().is_some();
                     ui.horizontal(|ui| {
                         let (dot_rect, _) =
                             ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        let (color, label) = if connected {
-                            (egui::Color32::from_rgb(80, 200, 120), "Plugin connected")
+                        let (color, label) = if figma_tab_active {
+                            (egui::Color32::from_rgb(80, 200, 120), "Active plugin tab")
                         } else {
-                            (egui::Color32::from_gray(120), "Plugin not connected")
+                            (egui::Color32::from_gray(120), "No active plugin tab")
                         };
                         ui.painter().circle_filled(dot_rect.center(), 5.0, color);
                         ui.label(
@@ -2045,60 +2078,22 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings) {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "The button below copies the plugin manifest \
-                             path to your clipboard and opens Figma. In \
-                             Figma, open the main menu, then Plugins > \
-                             Development > Import plugin from manifest..., \
-                             and paste the path.",
+                            "Community publication pending. Once approved, \
+                             install the official plugin from Figma Community. \
+                             Focus-safe correction currently supports Figma \
+                             Desktop on macOS and Figma Web under Hyprland.",
                         )
                         .color(egui::Color32::from_gray(170))
                         .size(12.0),
                     );
-                    ui.add_space(8.0);
-                    let manifest = vernier_platform::figma_bridge::manifest_path();
-                    ui.add_enabled_ui(manifest.is_some(), |ui| {
-                        if ui.button("Install plugin in Figma…").clicked() {
-                            if let Some(path) = manifest.as_ref() {
-                                ui.ctx().copy_text(path.display().to_string());
-                                open_figma_in_browser();
-                                log::info!(
-                                    "figma plugin: copied manifest path {} \
-                                     and launched browser",
-                                    path.display()
-                                );
-                            }
-                        }
-                    });
-                    if manifest.is_none() {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Plugin files not found next to the binary. \
-                                 Set $VERNIER_FIGMA_PLUGIN_DIR to the \
-                                 directory containing manifest.json.",
-                            )
-                            .color(egui::Color32::from_rgb(220, 160, 90))
-                            .size(11.5),
-                        );
-                    }
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "Maintainer setup and plugin source",
+                        "https://github.com/jondkinney/vernier/tree/main/figma-plugin",
+                    );
                 });
             });
         });
-}
-
-/// Open the Figma web app in the user's default browser. We can't
-/// deep-link into the "Import plugin from manifest" dialog (Figma
-/// exposes no such URL), so we land the user on the recent-files
-/// page and rely on the inline instructions in the card to take
-/// them the rest of the way.
-fn open_figma_in_browser() {
-    use std::process::{Command, Stdio};
-    let _ = Command::new("xdg-open")
-        .arg("https://www.figma.com/files/recent")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 fn shortcuts_section(

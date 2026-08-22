@@ -272,6 +272,14 @@ pub struct HudMeasurementFormat {
     /// integration). 1.0 = no scaling; 2.0 = halve every value
     /// because the user is viewing at 200% zoom.
     pub dimension_divisor: f64,
+    /// Measurements are being reported in an application's logical
+    /// canvas coordinate space rather than monitor device pixels.
+    ///
+    /// Figma viewport zoom is defined over logical canvas pixels. In
+    /// this mode ScreenPixels must therefore remove the display scale
+    /// as well as dimension_divisor. Outside an integration this stays
+    /// false, preserving ScreenPixels' exact physical-pixel behavior.
+    pub canvas_coordinates: bool,
 }
 
 impl Default for HudMeasurementFormat {
@@ -285,6 +293,7 @@ impl Default for HudMeasurementFormat {
             aspect_in_distance: false,
             aspect_mode: vernier_core::AspectMode::Automatic,
             dimension_divisor: 1.0,
+            canvas_coordinates: false,
         }
     }
 }
@@ -295,6 +304,11 @@ impl HudMeasurementFormat {
     pub fn format_number(&self, value_logical: f64) -> String {
         let divisor = if self.dimension_divisor > 0.0 {
             self.dimension_divisor
+        } else {
+            1.0
+        };
+        let scale = if self.scale_factor > 0.0 {
+            self.scale_factor
         } else {
             1.0
         };
@@ -310,7 +324,12 @@ impl HudMeasurementFormat {
             }
             HudRounding::PointsRounded => format!("{}", value.round() as i64),
             HudRounding::ScreenPixels => {
-                format!("{}", (value * self.scale_factor).round() as i64)
+                let value = if self.canvas_coordinates {
+                    value
+                } else {
+                    value * scale
+                };
+                format!("{}", value.round() as i64)
             }
         }
     }
@@ -326,24 +345,37 @@ impl HudMeasurementFormat {
     /// to logical exactly once (`÷ scale_factor`), apply the Figma
     /// `dimension_divisor`, then round per the configured mode.
     ///
-    /// [`HudRounding::ScreenPixels`] is special-cased to return the
-    /// physical integer verbatim — no ÷scale/×scale round-trip — so an
-    /// N-physical-pixel target reads exactly `N`.
+    /// [`HudRounding::ScreenPixels`] normally returns the physical
+    /// integer verbatim — no ÷scale/×scale round-trip — so an
+    /// N-physical-pixel target reads exactly `N`. When
+    /// `canvas_coordinates` is active, it instead removes display
+    /// scale and viewport zoom because the requested unit is a logical
+    /// canvas pixel.
     pub fn format_number_phys(&self, len_phys: f64) -> String {
         let divisor = if self.dimension_divisor > 0.0 {
             self.dimension_divisor
         } else {
             1.0
         };
+        let scale = if self.scale_factor > 0.0 {
+            self.scale_factor
+        } else {
+            1.0
+        };
         match self.rounding {
             HudRounding::ScreenPixels => {
-                // Physical pixels already — apply only the Figma
-                // divisor, skipping the scale round-trip entirely.
-                let value = len_phys / divisor;
+                // Raw screen measurements stay exact physical pixels.
+                // Canvas integrations first convert back to logical
+                // display coordinates, then remove the viewport zoom.
+                let value = if self.canvas_coordinates {
+                    (len_phys / scale) / divisor
+                } else {
+                    len_phys / divisor
+                };
                 format!("{}", value.round() as i64)
             }
             HudRounding::Points => {
-                let value = (len_phys / self.scale_factor) / divisor;
+                let value = (len_phys / scale) / divisor;
                 let r = (value * 10.0).round() / 10.0;
                 if (r - r.round()).abs() < f64::EPSILON {
                     format!("{}", r as i64)
@@ -352,7 +384,7 @@ impl HudMeasurementFormat {
                 }
             }
             HudRounding::PointsRounded => {
-                let value = (len_phys / self.scale_factor) / divisor;
+                let value = (len_phys / scale) / divisor;
                 format!("{}", value.round() as i64)
             }
         }
@@ -1084,5 +1116,48 @@ mod tests {
         assert_eq!(screen.format_wh_phys(249.6, 250.4), "250px \u{00D7} 250px");
         // A whole-number span is byte-identical to the crisp result.
         assert_eq!(screen.format_wh_phys(400.0, 400.0), "400px \u{00D7} 400px");
+    }
+
+    #[test]
+    fn figma_canvas_pixels_remove_both_display_scale_and_zoom() {
+        let figma = HudMeasurementFormat {
+            rounding: HudRounding::ScreenPixels,
+            scale_factor: 2.0,
+            dimension_divisor: 1.25,
+            canvas_coordinates: true,
+            ..HudMeasurementFormat::default()
+        };
+
+        // 125 logical display points = 250 physical device pixels.
+        // At 125% viewport zoom both representations describe a
+        // 100-pixel-wide Figma canvas object.
+        assert_eq!(figma.format_number(125.0), "100");
+        assert_eq!(figma.format_number_phys(250.0), "100");
+    }
+
+    #[test]
+    fn figma_at_one_hundred_percent_still_removes_hidpi_scale() {
+        let figma = HudMeasurementFormat {
+            rounding: HudRounding::ScreenPixels,
+            scale_factor: 2.0,
+            dimension_divisor: 1.0,
+            canvas_coordinates: true,
+            ..HudMeasurementFormat::default()
+        };
+
+        assert_eq!(figma.format_number_phys(200.0), "100");
+    }
+
+    #[test]
+    fn non_figma_screen_pixels_remain_exact_device_pixels() {
+        let screen = HudMeasurementFormat {
+            rounding: HudRounding::ScreenPixels,
+            scale_factor: 2.0,
+            canvas_coordinates: false,
+            ..HudMeasurementFormat::default()
+        };
+
+        assert_eq!(screen.format_number(100.0), "200");
+        assert_eq!(screen.format_number_phys(200.0), "200");
     }
 }

@@ -1,16 +1,15 @@
 {
   "name": "Vernier Bridge",
-  "id": "vernier-bridge-dev",
+  "id": "REPLACE_WITH_FIGMA_ASSIGNED_PLUGIN_ID",
   "api": "1.0.0",
   "main": "main.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "editorType": ["figma", "dev"],
   "documentAccess": "dynamic-page",
   "networkAccess": {
     "allowedDomains": [
-      "http://127.0.0.1:8765",
       "ws://127.0.0.1:8765"
     ],
-    "reasoning": "Reports the current viewport zoom to the local vernier daemon so on-screen measurements are reported in canvas pixels rather than zoomed screen pixels."
+    "reasoning": "Reports viewport zoom plus Design/Dev and active-tab context to the local Vernier app so on-screen measurements are reported in the correct canvas pixels."
   }
 }

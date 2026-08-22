@@ -1,19 +1,51 @@
-// Plugin sandbox runtime. Polls the current viewport zoom and posts
-// it to the hidden UI iframe, which forwards to the vernier daemon
-// over a localhost WebSocket. The sandbox itself can't open sockets.
-figma.showUI(__html__, { visible: false, width: 1, height: 1 });
+// Vernier Bridge's Figma sandbox runtime.
+//
+// The sandbox can read Figma's viewport zoom but cannot open network sockets,
+// so it answers read-only zoom requests from the plugin UI. The browser-backed
+// UI owns all timers and the localhost WebSocket connection to Vernier. This
+// plugin never reads or modifies nodes in the user's document.
 
-const POLL_MS = 100;
-const EPS = 0.0001;
-let lastSent = -1;
+figma.showUI(__html__, {
+  visible: true,
+  width: 360,
+  height: 360,
+  themeColors: true,
+});
 
-function tick() {
-  const z = figma.viewport.zoom;
-  if (Math.abs(z - lastSent) > EPS) {
-    lastSent = z;
-    figma.ui.postMessage({ type: "zoom", value: z });
-  }
+function currentZoom() {
+  const zoom = Number(figma.viewport.zoom);
+  return Number.isFinite(zoom) && zoom > 0 ? zoom : null;
 }
 
-setInterval(tick, POLL_MS);
-tick();
+function reportZoom() {
+  const zoom = currentZoom();
+  if (zoom == null) return;
+  figma.ui.postMessage({ type: "zoom", value: zoom });
+}
+
+function reportContext() {
+  figma.ui.postMessage({
+    type: "context",
+    editorType: figma.editorType,
+  });
+}
+
+figma.ui.onmessage = (message) => {
+  if (!message || typeof message !== "object") return;
+
+  // The UI may finish loading after the sandbox's first postMessage. Its ready
+  // message guarantees that it receives an initial zoom without waiting for the
+  // next heartbeat.
+  if (message.type === "ui-ready" || message.type === "request-state") {
+    reportContext();
+    reportZoom();
+    return;
+  }
+
+  if (message.type === "request-zoom") {
+    reportZoom();
+  }
+};
+
+reportContext();
+reportZoom();

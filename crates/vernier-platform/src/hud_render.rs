@@ -437,6 +437,7 @@ pub(crate) fn static_hash(hud: &Hud) -> u64 {
     // unit variants.
     std::mem::discriminant(&fmt.aspect_mode).hash(&mut h);
     hash_f64(&mut h, fmt.dimension_divisor);
+    fmt.canvas_coordinates.hash(&mut h);
 
     h.finish()
 }
@@ -3143,6 +3144,14 @@ mod tests {
             static_hash(&scale),
             base,
             "scale_factor change must invalidate"
+        );
+
+        let mut canvas = hud.clone();
+        canvas.measurement_format.canvas_coordinates = true;
+        assert_ne!(
+            static_hash(&canvas),
+            base,
+            "canvas-coordinate mode change must invalidate"
         );
 
         let mut primary = hud.clone();
