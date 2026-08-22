@@ -5870,6 +5870,24 @@ fn current_focused_app() -> Option<vernier_platform::AppIdentity> {
     focused_app_lock().read().ok().and_then(|app| app.clone())
 }
 
+/// Whether a frontmost-app identity is Vernier itself: matched by
+/// bundle ID (macOS bundle or Flatpak app id) or by the executable
+/// path of this very process.
+#[cfg(target_os = "macos")]
+fn identity_is_vernier(app: &vernier_platform::AppIdentity) -> bool {
+    if app.id.eq_ignore_ascii_case("com.jondkinney.vernier")
+        || app.id.eq_ignore_ascii_case("com.usevernier.Vernier")
+    {
+        return true;
+    }
+    let Some(executable) = app.executable.as_deref() else {
+        return false;
+    };
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|own| own.as_path() == std::path::Path::new(executable))
+}
+
 /// Poll the native frontmost-application API on macOS. Vernier's
 /// overlay windows are non-activating, so Figma Desktop remains the
 /// frontmost application while the user measures over it.
@@ -5900,8 +5918,16 @@ fn spawn_focused_app_watcher(platform: Arc<dyn Platform>) {
                 }
                 match platform.focused_app() {
                     Ok(app) => {
-                        if let Ok(mut cached) = focused_app_lock().write() {
-                            *cached = app;
+                        // Vernier's own overlay takes key focus during a
+                        // measurement session and can remain the frontmost
+                        // app after it ends. For the "is the user in
+                        // Figma?" question Vernier is transparent: keep
+                        // the previous real application instead.
+                        let is_self = app.as_ref().is_some_and(identity_is_vernier);
+                        if !is_self {
+                            if let Ok(mut cached) = focused_app_lock().write() {
+                                *cached = app;
+                            }
                         }
                     }
                     Err(e) => {
