@@ -8,7 +8,7 @@
   "documentAccess": "dynamic-page",
   "networkAccess": {
     "allowedDomains": [
-      "ws://127.0.0.1:8765"
+      "ws://localhost:8765"
     ],
     "reasoning": "Reports viewport zoom plus Design/Dev and active-tab context to the local Vernier app so on-screen measurements are reported in the correct canvas pixels."
   }

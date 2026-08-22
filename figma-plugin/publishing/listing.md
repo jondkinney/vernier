@@ -37,7 +37,7 @@ Vernier Bridge, so run it again before your next measuring session.
 
 Vernier Bridge sends the numeric viewport zoom, editor type, and active-tab
 flag to the Vernier process on the same computer using
-`ws://127.0.0.1:8765`. The connection never leaves the loopback interface. No
+`ws://localhost:8765`. The connection never leaves the loopback interface. No
 account information, document content, identifiers, usage analytics, or
 telemetry are collected, stored, or sent off-device.
 

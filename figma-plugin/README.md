@@ -43,7 +43,7 @@ screen-pixel measurements remain unchanged.
 ## Test locally
 
 1. Start Vernier and enable its Figma integration. The default local endpoint
-   is `ws://127.0.0.1:8765`.
+   is `ws://localhost:8765`.
 2. Open a test file in Figma Desktop. Do not use a production document for
    initial testing even though the plugin is read-only.
 3. Run **Vernier Bridge** from **Plugins → Development** in Design Mode.
@@ -73,7 +73,7 @@ action. Before submitting:
 - enable two-factor authentication on the publisher account (Figma requires
   it for plugin publication); and
 - make the privacy disclosure explicit: zoom, editor type, and active-tab state
-  are sent only to a local Vernier process over `127.0.0.1`.
+  are sent only to a local Vernier process over the loopback interface.
 
 After Figma approves the Community listing, Hyprland users install it from that
 listing and run it in Figma Web. Update Vernier's install UI and documentation
@@ -87,7 +87,7 @@ with the final listing URL after publication.
 - `main.js` answers each request with the read-only `figma.viewport.zoom`
   value. It does not access the document tree.
 - The UI also owns the visible status panel and WebSocket connection to
-  `ws://127.0.0.1:8765`. It verifies Vernier with a protocol handshake before
+  `ws://localhost:8765`. It verifies Vernier with a protocol handshake before
   reporting **Connected**, sends zoom leases with protocol and editor context,
   marks hidden Figma tabs inactive, retries with bounded backoff, and resends
   the latest value immediately after a reconnect.
@@ -99,7 +99,10 @@ with the final listing URL after publication.
   run at a time, so starting another plugin stops Vernier Bridge.
 
 The port is intentionally fixed in the published plugin manifest because Figma
-must approve network destinations ahead of time. If Vernier supports a
+must approve network destinations ahead of time. The endpoint is written as
+`ws://localhost:8765` rather than `ws://127.0.0.1:8765` because Figma's
+manifest validator rejects IP literals in `allowedDomains`; the name resolves
+to the same loopback interface, where Vernier binds `127.0.0.1` only. If Vernier supports a
 configurable bridge port, users of this official plugin should keep it at the
 default `8765`.
 

@@ -29,7 +29,7 @@ test("manifest is publishable, narrowly scoped, and supports Design and Dev Mode
   assert.deepEqual(manifest.editorType, ["figma", "dev"]);
   assert.equal(manifest.documentAccess, "dynamic-page");
   assert.deepEqual(manifest.networkAccess.allowedDomains, [
-    "ws://127.0.0.1:8765",
+    "ws://localhost:8765",
   ]);
   assert.ok(manifest.networkAccess.reasoning.length > 0);
   assert.equal(manifest.permissions, undefined);
@@ -285,7 +285,7 @@ test("UI polls in the iframe and gates zoom leases on Vernier's hello", () => {
   assert.equal(ui.elements.mode.textContent, "Dev Mode");
   assert.equal(ui.sockets.length, 1);
   const socket = ui.sockets[0];
-  assert.equal(socket.url, "ws://127.0.0.1:8765");
+  assert.equal(socket.url, "ws://localhost:8765");
 
   ui.sendPluginMessage({ type: "zoom", value: 1.275 });
   socket.open();

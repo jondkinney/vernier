@@ -238,7 +238,7 @@
         </div>
         <div>
           <dt>Local endpoint</dt>
-          <dd><code>127.0.0.1:8765</code></dd>
+          <dd><code>localhost:8765</code></dd>
         </div>
       </dl>
 
@@ -256,7 +256,9 @@
       (() => {
         "use strict";
 
-        const SOCKET_URL = "ws://127.0.0.1:8765";
+        // Figma's manifest validator rejects IP literals in allowedDomains,
+        // so the manifest and this URL must both use the localhost name.
+        const SOCKET_URL = "ws://localhost:8765";
         const PROTOCOL_VERSION = 1;
         const HELLO_TIMEOUT_MS = 2000;
         const ZOOM_POLL_MS = 100;

@@ -19,7 +19,7 @@ Vernier checks the frontmost application's bundle identity instead of its
 window title. Focus polling is inactive when the integration is disabled.
 
 The viewport zoom, editor type, and active flag are sent only to the Vernier
-process on the same computer over `ws://127.0.0.1:8765`. Loopback traffic does
+process on the same computer over `ws://localhost:8765`. Loopback traffic does
 not leave the computer. Vernier keeps the latest value only in memory under a
 short expiry lease; neither the plugin nor Vernier stores it on disk.
 

@@ -175,7 +175,7 @@ any zoom level. From Figma it reads only `figma.viewport.zoom` and whether the
 editor is in Design or Dev Mode; its panel also reports whether its tab is
 visible. It does not read or change layers, text, comments, selections, or
 other file content. Its only network connection is a loopback WebSocket to
-`127.0.0.1:8765` on the same computer.
+`localhost:8765` on the same computer, where Vernier listens on `127.0.0.1`.
 
 The Community listing is pending. Maintainers can test the development build
 using Figma Desktop on macOS by following

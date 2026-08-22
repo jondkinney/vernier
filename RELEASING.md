@@ -53,7 +53,7 @@ ship a Windows runtime. When a release changes `figma-plugin/`:
 The first publication also requires Figma account two-factor authentication,
 listing artwork and security disclosures, and Community review. The disclosure
 must state that Vernier Bridge sends viewport zoom, editor type, and active-tab
-state only to the loopback Vernier process at `127.0.0.1:8765`; it does not read
+state only to the loopback Vernier process at `localhost:8765`; it does not read
 or modify the Figma document.
 
 ## One-time setup

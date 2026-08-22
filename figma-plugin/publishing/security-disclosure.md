@@ -13,7 +13,7 @@ that loopback WebSocket traffic uses TLS.
 - **Data collected or stored:** none. Viewport zoom, editor type, and panel
   visibility are held briefly in memory and expire when heartbeats stop.
 - **Data shared with third parties:** none.
-- **Network destination:** only `ws://127.0.0.1:8765`, the Vernier process on
+- **Network destination:** only `ws://localhost:8765`, the Vernier process on
   the same computer. The manifest blocks every other destination.
 - **Transport:** unencrypted WebSocket over the operating system's loopback
   interface. Traffic cannot route off the computer.
