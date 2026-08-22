@@ -56,8 +56,9 @@ connect.
   visible tab controls Vernier as the tabs are switched.
 - Verify 50%, 100%, and 200% zoom and an unchanged zoom for 30 seconds.
 - Verify reconnect after stopping and restarting Vernier.
-- Capture a 1920×1080 thumbnail showing the connected plugin beside Vernier's
-  `F · 100%` indicator; do not include private document content.
+- Capture a 1920×960 cover image (Figma's plugin cover frame size) showing the
+  connected plugin, a canvas-pixel measurement at a non-100% zoom, and
+  Vernier's `F · <zoom>%` indicator; do not include private document content.
 - Review the final network access label before submitting.
 - Complete the Data security questionnaire using
   [`security-disclosure.md`](security-disclosure.md), checking every answer
