@@ -90,7 +90,10 @@ with the final listing URL after publication.
   `ws://localhost:8765`. It verifies Vernier with a protocol handshake before
   reporting **Connected**, sends zoom leases with protocol and editor context,
   marks hidden Figma tabs inactive, retries with bounded backoff, and resends
-  the latest value immediately after a reconnect.
+  the latest value immediately after a reconnect. When Figma pauses the
+  sandbox (as it does in background tabs), zoom requests go unanswered and
+  the UI leases its zoom inactive after two silent heartbeats, so a visible
+  tab's live zoom stays authoritative over a frozen one.
 - Vernier accepts only the opaque (`Origin: null`) plugin UI origin or exact
   first-party HTTPS Figma origins, bounds connection and message sizes, and
   expires stale zoom leases. The bridge carries no document data or privileged
@@ -141,4 +144,5 @@ npm test
 ```
 
 They cover manifest permissions, timer-free sandbox behavior, iframe polling,
-hello verification, zoom heartbeats, and reconnection.
+hello verification, zoom heartbeats, paused-sandbox lease revocation, and
+reconnection.

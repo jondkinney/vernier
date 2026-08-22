@@ -263,6 +263,11 @@
         const HELLO_TIMEOUT_MS = 2000;
         const ZOOM_POLL_MS = 100;
         const HEARTBEAT_MS = 750;
+        // Figma pauses the plugin sandbox in background tabs while this
+        // iframe's timers keep firing. After this many heartbeats without
+        // a sandbox zoom response, the lease is sent inactive so a live
+        // tab's zoom stays authoritative instead of this tab's frozen one.
+        const SANDBOX_STALE_HEARTBEATS = 2;
         const ZOOM_EPSILON = 0.0001;
         const INITIAL_RECONNECT_MS = 1000;
         const MAX_RECONNECT_MS = 5000;
@@ -283,6 +288,7 @@
         let verified = false;
         let active = document.visibilityState === "visible";
         let awaitingFreshZoom = false;
+        let heartbeatsSinceZoomResponse = 0;
         let lastZoom = null;
         let lastSentZoom = null;
         let lastSentActive = null;
@@ -308,6 +314,9 @@
         }
 
         function sendZoom(force = false) {
+          // Recompute visibility at send time: Figma tab switches do not
+          // always deliver a visibilitychange event to this iframe.
+          active = document.visibilityState === "visible";
           if (
             !socket ||
             socket.readyState !== WebSocket.OPEN ||
@@ -318,10 +327,15 @@
             return;
           }
 
+          // A paused sandbox cannot vouch for lastZoom, so lease it
+          // inactive until responses resume.
+          const leaseActive =
+            active && heartbeatsSinceZoomResponse < SANDBOX_STALE_HEARTBEATS;
+
           const changed =
             lastSentZoom == null ||
             Math.abs(lastZoom - lastSentZoom) > ZOOM_EPSILON;
-          const activityChanged = lastSentActive !== active;
+          const activityChanged = lastSentActive !== leaseActive;
           if (!force && !changed && !activityChanged) return;
 
           try {
@@ -332,11 +346,11 @@
                 protocol: PROTOCOL_VERSION,
                 client: "figma",
                 editorType,
-                active,
+                active: leaseActive,
               }),
             );
             lastSentZoom = lastZoom;
-            lastSentActive = active;
+            lastSentActive = leaseActive;
           } catch (_error) {
             // The socket's close event owns reconnection and user-visible state.
           }
@@ -555,6 +569,7 @@
 
           if (message.type === "zoom" && validZoom(message.value)) {
             lastZoom = message.value;
+            heartbeatsSinceZoomResponse = 0;
             showZoom(message.value);
             if (active && awaitingFreshZoom) awaitingFreshZoom = false;
             sendZoom();
@@ -580,7 +595,10 @@
         // Ask the sandbox to replay state after this iframe's listeners exist.
         parent.postMessage({ pluginMessage: { type: "ui-ready" } }, "*");
         zoomPollTimer = window.setInterval(requestZoom, ZOOM_POLL_MS);
-        heartbeatTimer = window.setInterval(() => sendZoom(true), HEARTBEAT_MS);
+        heartbeatTimer = window.setInterval(() => {
+          heartbeatsSinceZoomResponse += 1;
+          sendZoom(true);
+        }, HEARTBEAT_MS);
       })();
     </script>
   </body>

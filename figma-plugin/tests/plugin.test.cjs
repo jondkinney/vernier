@@ -400,6 +400,60 @@ test("UI revokes a hidden tab and refreshes zoom before reactivating it", () => 
   );
 });
 
+test("UI leases inactive when the sandbox stops answering zoom requests", () => {
+  const ui = loadUi();
+  ui.sendPluginMessage({ type: "context", editorType: "figma" });
+  ui.sendPluginMessage({ type: "zoom", value: 0.7423 });
+
+  const socket = ui.sockets[0];
+  socket.open();
+  socket.receive({
+    type: "hello",
+    protocol: 1,
+    server: "vernier",
+    version: "0.4.6",
+  });
+  assert.equal(socket.sent[1].active, true);
+
+  // Figma paused the sandbox (background tab): iframe heartbeats keep
+  // firing but zoom requests go unanswered. One silent heartbeat still
+  // vouches for the lease; the second must revoke it.
+  ui.scheduler.run("interval", 750);
+  assert.deepEqual(
+    socket.sent[2],
+    socket.sent[1],
+    "one unanswered heartbeat still renews the active lease",
+  );
+  ui.scheduler.run("interval", 750);
+  assert.deepEqual(socket.sent[3], {
+    type: "zoom",
+    value: 0.7423,
+    protocol: 1,
+    client: "figma",
+    editorType: "figma",
+    active: false,
+  });
+
+  ui.scheduler.run("interval", 750);
+  assert.equal(
+    socket.sent[4].active,
+    false,
+    "the lease stays revoked while the sandbox is silent",
+  );
+
+  // The sandbox resumes: a fresh answer restores the active lease with
+  // the current zoom rather than the frozen one.
+  ui.sendPluginMessage({ type: "zoom", value: 1.0027 });
+  assert.deepEqual(socket.sent[5], {
+    type: "zoom",
+    value: 1.0027,
+    protocol: 1,
+    client: "figma",
+    editorType: "figma",
+    active: true,
+  });
+});
+
 test("UI rejects an unverified listener and reconnects with bounded backoff", () => {
   const ui = loadUi();
   ui.sendPluginMessage({ type: "context", editorType: "figma" });
