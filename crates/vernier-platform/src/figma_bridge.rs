@@ -404,6 +404,14 @@ fn handle(stream: TcpStream, generation: u64, id: ConnectionId, _slot: ClientSlo
         .peer_addr()
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "?".into());
+    // BSD-derived systems (macOS) hand accepted sockets the listener's
+    // O_NONBLOCK flag; Linux always accepts blocking sockets. The
+    // handler relies on blocking reads bounded by the read/write
+    // timeouts below, so force blocking mode explicitly.
+    if let Err(e) = stream.set_nonblocking(false) {
+        log::debug!("figma bridge: make connection blocking for {peer}: {e}");
+        return;
+    }
     if let Err(e) = set_handshake_timeouts(&stream) {
         log::debug!("figma bridge: configure handshake timeout for {peer}: {e}");
         return;
