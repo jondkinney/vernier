@@ -40,6 +40,11 @@ finish-args:
   # Wayland is the primary target; X11 is the documented fallback.
   - "--socket=wayland"
   - "--socket=fallback-x11"
+  # The optional Figma Community plugin reports its viewport zoom to
+  # Vernier over a loopback-only WebSocket (127.0.0.1:8765). Flatpak
+  # does not expose a narrower loopback permission, so runtime network
+  # sharing is required for that local companion connection.
+  - "--share=network"
   # GPU access for the overlay renderer (wgpu / winit need DRI).
   - "--device=dri"
   # ipc share is required alongside fallback-x11 — the X11 server
