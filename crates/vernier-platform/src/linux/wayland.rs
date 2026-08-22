@@ -65,6 +65,17 @@ use crate::{
     PlatformEvent, Rect, Result, TrayHandle, TrayMenu,
 };
 
+/// Omarchy's stock PopupCard keeps its last buffer alive for a 140 ms close
+/// fade. Companion preparation holds the popup closed and waits 200 ms to
+/// include the next compositor-present boundary plus rapid close/reopen or
+/// prior-popout handoff before asking grim for a synchronous output snapshot.
+const SYNCHRONOUS_CAPTURE_SETTLE: Duration = Duration::from_millis(200);
+const SYNCHRONOUS_CAPTURE_TIMEOUT: &str = "3s";
+/// Bounds allocation if a broken or hostile grim executable emits an absurd
+/// PPM header. 100 million pixels is already a 400 MB RGBA frame and exceeds
+/// the 8192x8192 capture size Vernier negotiates with PipeWire.
+const MAX_PPM_PIXELS: usize = 100_000_000;
+
 /// Derive the compositor's physical/logical output scale without confusing a
 /// raw mode's axes with Wayland's already-transformed logical dimensions.
 /// Keep the historical width-ratio behavior for unrotated outputs; 90°/270°
@@ -217,6 +228,155 @@ impl WaylandPlatform {
             .send(cmd)
             .map_err(|e| PlatformError::Other(anyhow::anyhow!("event loop send: {e}")))
     }
+
+    fn native_frame_from_capture(
+        &self,
+        monitor: MonitorId,
+        captured: super::screencast::CapturedFrame,
+    ) -> Result<NativeFrame> {
+        let monitor_info = self
+            .monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == monitor)
+            .cloned();
+        let (bounds, scale_factor) = monitor_info
+            .map(|m| (m.bounds, m.scale_factor))
+            .unwrap_or((Rect::default(), 1.0));
+        let format = video_format_to_pixel_format(captured.format)?;
+        Ok(NativeFrame {
+            width: captured.width,
+            height: captured.height,
+            stride: captured.stride,
+            format,
+            bounds,
+            scale_factor,
+            pixels: captured.pixels,
+        })
+    }
+}
+
+fn grim_capture_command(monitor: &MonitorInfo) -> Result<std::process::Command> {
+    if !monitor.scale_factor.is_finite() || monitor.scale_factor <= 0.0 {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "invalid output scale {} for {}",
+            monitor.scale_factor,
+            monitor.name
+        )));
+    }
+    let scale = monitor.scale_factor.to_string();
+    let mut command = std::process::Command::new("timeout");
+    command.args([
+        "--signal=TERM",
+        "--kill-after=1s",
+        SYNCHRONOUS_CAPTURE_TIMEOUT,
+        "grim",
+        "-o",
+        &monitor.name,
+        "-s",
+        &scale,
+        "-t",
+        "ppm",
+        "-",
+    ]);
+    Ok(command)
+}
+
+fn expected_grim_dimensions(monitor: &MonitorInfo) -> Result<(u32, u32)> {
+    if monitor.bounds.w == 0 || monitor.bounds.h == 0 {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "output {} has invalid logical bounds {}x{}",
+            monitor.name,
+            monitor.bounds.w,
+            monitor.bounds.h
+        )));
+    }
+    if !monitor.scale_factor.is_finite() || monitor.scale_factor <= 0.0 {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "invalid output scale {} for {}",
+            monitor.scale_factor,
+            monitor.name
+        )));
+    }
+
+    let scaled_extent = |logical: u32| -> Result<u32> {
+        let physical = f64::from(logical) * monitor.scale_factor;
+        if !physical.is_finite() || physical > f64::from(u32::MAX) {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "scaled output dimensions overflow for {}",
+                monitor.name
+            )));
+        }
+        // grim/cairo truncates fractional target extents toward zero. Match
+        // that behavior exactly so validation remains correct for arbitrary
+        // fractional output scales (for example, 3072 * 1.333 = 4094 px).
+        let physical = physical.floor() as u32;
+        if physical == 0 {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "scaled output dimension is zero for {}",
+                monitor.name
+            )));
+        }
+        Ok(physical)
+    };
+
+    // `MonitorInfo::bounds` comes from Wayland's logical_size, which already
+    // reflects output transforms. Preserve that width/height ordering here:
+    // a rotated portrait output must validate as portrait, not as its raw mode.
+    Ok((
+        scaled_extent(monitor.bounds.w)?,
+        scaled_extent(monitor.bounds.h)?,
+    ))
+}
+
+fn validate_grim_dimensions(frame: &NativeFrame, monitor: &MonitorInfo) -> Result<()> {
+    let (expected_width, expected_height) = expected_grim_dimensions(monitor)?;
+    if frame.width != expected_width || frame.height != expected_height {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim capture for {} returned {}x{} pixels; expected {}x{} from logical {}x{} at scale {}",
+            monitor.name,
+            frame.width,
+            frame.height,
+            expected_width,
+            expected_height,
+            monitor.bounds.w,
+            monitor.bounds.h,
+            monitor.scale_factor
+        )));
+    }
+    Ok(())
+}
+
+fn capture_native_with_grim(monitor: &MonitorInfo) -> Result<NativeFrame> {
+    // Do not rely on the PipeWire cache here. Its buffers can be delivered
+    // after the companion popup has closed while still containing pixels
+    // composed before that close. grim's wlr-screencopy request is made only
+    // after the popup has remained unmapped through its stock fade.
+    thread::sleep(SYNCHRONOUS_CAPTURE_SETTLE);
+    let output = grim_capture_command(monitor)?.output().map_err(|error| {
+        PlatformError::Other(anyhow::anyhow!(
+            "launch bounded grim capture for {}: {error}",
+            monitor.name
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr: String = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect();
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim capture for {} failed with {}{}{}",
+            monitor.name,
+            output.status,
+            if stderr.trim().is_empty() { "" } else { ": " },
+            stderr.trim()
+        )));
+    }
+
+    let frame = parse_grim_ppm(&output.stdout, monitor.bounds, monitor.scale_factor)?;
+    validate_grim_dimensions(&frame, monitor)?;
+    Ok(frame)
 }
 
 impl Platform for WaylandPlatform {
@@ -242,26 +402,20 @@ impl Platform for WaylandPlatform {
                 "no frame captured yet — try again in a moment"
             ))
         })?;
+        self.native_frame_from_capture(monitor, captured)
+    }
+
+    fn capture_screen_native_synchronous(&self, monitor: MonitorId) -> Result<NativeFrame> {
         let monitor_info = self
             .monitors
             .lock()
             .unwrap()
             .iter()
-            .find(|m| m.id == monitor)
-            .cloned();
-        let (bounds, scale_factor) = monitor_info
-            .map(|m| (m.bounds, m.scale_factor))
-            .unwrap_or((Rect::default(), 1.0));
-        let format = video_format_to_pixel_format(captured.format)?;
-        Ok(NativeFrame {
-            width: captured.width,
-            height: captured.height,
-            stride: captured.stride,
-            format,
-            bounds,
-            scale_factor,
-            pixels: captured.pixels,
-        })
+            .find(|candidate| candidate.id == monitor)
+            .cloned()
+            .ok_or(PlatformError::MonitorNotFound(monitor))?;
+
+        capture_native_with_grim(&monitor_info)
     }
 
     fn capture_screen(&self, monitor: MonitorId) -> Result<Frame> {
@@ -1832,6 +1986,128 @@ impl PointerConstraintsHandler for WaylandState {
 // Pixel helpers
 // =========================================================================
 
+fn ppm_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
+    loop {
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while bytes.get(*cursor).is_some_and(|byte| *byte != b'\n') {
+            *cursor += 1;
+        }
+    }
+
+    let start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'#')
+    {
+        *cursor += 1;
+    }
+    if start == *cursor {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim emitted a truncated PPM header"
+        )));
+    }
+    Ok(&bytes[start..*cursor])
+}
+
+fn ppm_u32(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u32> {
+    let token = ppm_token(bytes, cursor)?;
+    let text = std::str::from_utf8(token).map_err(|_| {
+        PlatformError::Other(anyhow::anyhow!("grim PPM {field} is not an ASCII integer"))
+    })?;
+    text.parse::<u32>().map_err(|_| {
+        PlatformError::Other(anyhow::anyhow!(
+            "grim PPM {field} is not a valid integer: {text:?}"
+        ))
+    })
+}
+
+/// Parse grim's binary P6 output into a tightly-packed RGBA native frame.
+/// PPM is intentionally used instead of PNG here: it avoids an encode/decode
+/// pass on an 85 MB 6K capture and leaves only a simple, bounded parser on the
+/// latency-sensitive companion-open path.
+fn parse_grim_ppm(bytes: &[u8], bounds: Rect, scale_factor: f64) -> Result<NativeFrame> {
+    let mut cursor = 0;
+    if ppm_token(bytes, &mut cursor)? != b"P6" {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim output is not a binary P6 PPM"
+        )));
+    }
+    let width = ppm_u32(bytes, &mut cursor, "width")?;
+    let height = ppm_u32(bytes, &mut cursor, "height")?;
+    let max_value = ppm_u32(bytes, &mut cursor, "max value")?;
+    if width == 0 || height == 0 {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim PPM dimensions must be non-zero, got {width}x{height}"
+        )));
+    }
+    if max_value != 255 {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim PPM uses unsupported max value {max_value}; expected 255"
+        )));
+    }
+
+    // P6 requires one whitespace delimiter after maxval. Consume CRLF as one
+    // delimiter pair, but do not skip arbitrary whitespace: the first binary
+    // pixel byte is allowed to equal a whitespace character.
+    match bytes.get(cursor) {
+        Some(b'\r') if bytes.get(cursor + 1) == Some(&b'\n') => cursor += 2,
+        Some(byte) if byte.is_ascii_whitespace() => cursor += 1,
+        _ => {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "grim PPM header has no pixel-data delimiter"
+            )));
+        }
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("grim PPM dimensions overflow")))?;
+    if pixel_count > MAX_PPM_PIXELS {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim PPM dimensions {width}x{height} exceed the {}-pixel safety limit",
+            MAX_PPM_PIXELS
+        )));
+    }
+    let rgb_len = pixel_count
+        .checked_mul(3)
+        .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("grim PPM RGB size overflows")))?;
+    let remaining = bytes.len().saturating_sub(cursor);
+    if remaining != rgb_len {
+        return Err(PlatformError::Other(anyhow::anyhow!(
+            "grim PPM has {remaining} bytes of pixel data, expected {rgb_len} for {width}x{height}"
+        )));
+    }
+
+    let rgba_len = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("grim PPM RGBA size overflows")))?;
+    let mut pixels = Vec::with_capacity(rgba_len);
+    for rgb in bytes[cursor..].chunks_exact(3) {
+        pixels.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
+    }
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| PlatformError::Other(anyhow::anyhow!("grim PPM stride overflows")))?;
+
+    Ok(NativeFrame {
+        width,
+        height,
+        stride,
+        format: PixelFormat::Rgba8,
+        bounds,
+        scale_factor,
+        pixels,
+    })
+}
+
 /// Convert a PipeWire-format buffer into tightly-packed RGBA8 (stride =
 /// width*4). Hyprland gives us BGRA; other compositors may pick BGRx /
 /// RGBA / RGBx / xRGB / xBGR. We honor the PipeWire stride to skip any
@@ -2002,6 +2278,178 @@ mod monitor_scale_tests {
                 fallback,
             ),
             3.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod synchronous_capture_tests {
+    use super::*;
+
+    fn ppm(header: &[u8], pixels: &[u8]) -> Vec<u8> {
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(pixels);
+        bytes
+    }
+
+    fn monitor(bounds: Rect, scale_factor: f64) -> MonitorInfo {
+        MonitorInfo {
+            id: MonitorId(1),
+            name: "DP-2".to_owned(),
+            bounds,
+            scale_factor,
+            is_primary: true,
+        }
+    }
+
+    #[test]
+    fn grim_command_pins_the_selected_outputs_scale() {
+        let command = grim_capture_command(&monitor(Rect::new(0, 0, 1200, 800), 1.5))
+            .expect("valid grim command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "--signal=TERM",
+                "--kill-after=1s",
+                SYNCHRONOUS_CAPTURE_TIMEOUT,
+                "grim",
+                "-o",
+                "DP-2",
+                "-s",
+                "1.5",
+                "-t",
+                "ppm",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn validates_fractional_and_transformed_logical_dimensions() {
+        let landscape = monitor(Rect::new(0, 0, 1200, 800), 1.5);
+        assert_eq!(
+            expected_grim_dimensions(&landscape).expect("landscape dimensions"),
+            (1800, 1200)
+        );
+
+        // Wayland logical bounds are already transform-aware. A portrait
+        // output therefore remains portrait after scaling.
+        let portrait = monitor(Rect::new(0, 0, 800, 1200), 1.5);
+        assert_eq!(
+            expected_grim_dimensions(&portrait).expect("portrait dimensions"),
+            (1200, 1800)
+        );
+
+        let mut frame = NativeFrame {
+            width: 1200,
+            height: 1800,
+            stride: 4800,
+            format: PixelFormat::Rgba8,
+            bounds: portrait.bounds,
+            scale_factor: portrait.scale_factor,
+            pixels: Vec::new(),
+        };
+        validate_grim_dimensions(&frame, &portrait).expect("matching dimensions");
+        frame.width = 1800;
+        frame.height = 1200;
+        assert!(validate_grim_dimensions(&frame, &portrait).is_err());
+
+        let truncated = monitor(Rect::new(0, 0, 3072, 1728), 1.333);
+        assert_eq!(
+            expected_grim_dimensions(&truncated).expect("fractional dimensions"),
+            (4094, 2303)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_grim_scale_and_logical_bounds() {
+        assert!(grim_capture_command(&monitor(Rect::new(0, 0, 1, 1), 0.0)).is_err());
+        assert!(expected_grim_dimensions(&monitor(Rect::default(), 1.0)).is_err());
+    }
+
+    #[test]
+    fn parses_grim_ppm_into_tightly_packed_rgba() {
+        // The first RGB byte is newline (ASCII whitespace). The parser must
+        // consume exactly the header delimiter and preserve that pixel byte.
+        let bytes = ppm(b"P6\n2 1\n255\n", &[10, 20, 30, 40, 50, 60]);
+        let bounds = Rect::new(5, 7, 2, 1);
+
+        let frame = parse_grim_ppm(&bytes, bounds, 2.0).expect("valid P6");
+
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 1);
+        assert_eq!(frame.stride, 8);
+        assert_eq!(frame.format, PixelFormat::Rgba8);
+        assert_eq!(frame.bounds, bounds);
+        assert_eq!(frame.scale_factor, 2.0);
+        assert_eq!(frame.pixels, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn parses_comments_and_crlf_header_delimiter() {
+        let bytes = ppm(b"P6\r\n# captured by grim\r\n1 1\r\n255\r\n", &[1, 2, 3]);
+
+        let frame = parse_grim_ppm(&bytes, Rect::default(), 1.0).expect("valid P6");
+
+        assert_eq!(frame.pixels, vec![1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn rejects_invalid_dimensions_max_value_and_data_length() {
+        assert!(parse_grim_ppm(b"P6\n0 1\n255\n", Rect::default(), 1.0).is_err());
+        assert!(parse_grim_ppm(b"P6\n1 1\n65535\n", Rect::default(), 1.0).is_err());
+        assert!(parse_grim_ppm(b"P6\n1 1\n255\n\x00\x01", Rect::default(), 1.0).is_err());
+    }
+
+    #[test]
+    fn rejects_dimensions_over_safety_limit_before_allocating() {
+        let bytes = b"P6\n100000001 1\n255\n";
+
+        let error = parse_grim_ppm(bytes, Rect::default(), 1.0)
+            .expect_err("oversized capture must fail")
+            .to_string();
+
+        assert!(error.contains("safety limit"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "captures the live desktop; set VERNIER_LIVE_GRIM_* to opt in"]
+    fn live_grim_command_round_trips_through_production_parser() {
+        let output_name = std::env::var("VERNIER_LIVE_GRIM_OUTPUT")
+            .expect("set VERNIER_LIVE_GRIM_OUTPUT to a Wayland output name");
+        let logical_width = std::env::var("VERNIER_LIVE_GRIM_LOGICAL_WIDTH")
+            .expect("set VERNIER_LIVE_GRIM_LOGICAL_WIDTH")
+            .parse()
+            .expect("logical width is a u32");
+        let logical_height = std::env::var("VERNIER_LIVE_GRIM_LOGICAL_HEIGHT")
+            .expect("set VERNIER_LIVE_GRIM_LOGICAL_HEIGHT")
+            .parse()
+            .expect("logical height is a u32");
+        let scale_factor = std::env::var("VERNIER_LIVE_GRIM_SCALE")
+            .expect("set VERNIER_LIVE_GRIM_SCALE")
+            .parse()
+            .expect("scale is an f64");
+        let monitor = MonitorInfo {
+            id: MonitorId(1),
+            name: output_name,
+            bounds: Rect::new(0, 0, logical_width, logical_height),
+            scale_factor,
+            is_primary: true,
+        };
+
+        let frame = capture_native_with_grim(&monitor).expect("live grim PPM capture parses");
+
+        assert!(frame.width > 0);
+        assert!(frame.height > 0);
+        assert_eq!(frame.stride, frame.width * 4);
+        assert_eq!(
+            frame.pixels.len(),
+            frame.width as usize * frame.height as usize * 4
         );
     }
 }

@@ -327,6 +327,17 @@ pub trait Platform: Send + Sync {
         })
     }
 
+    /// Capture the compositor's current output synchronously.
+    ///
+    /// A continuously streamed backend's ordinary native capture may return a
+    /// cached buffer. Companion UIs use this method while their own popup is
+    /// still unmapped, then pin the returned frame for a later activation.
+    /// Backends whose ordinary capture is already synchronous can use this
+    /// default implementation.
+    fn capture_screen_native_synchronous(&self, monitor: MonitorId) -> Result<NativeFrame> {
+        self.capture_screen_native(monitor)
+    }
+
     /// Register a global hotkey. Activations arrive as
     /// [`PlatformEvent::HotkeyPressed`]. `label` is shown to the user by the
     /// host (e.g. portal dialog) and stored alongside the binding.

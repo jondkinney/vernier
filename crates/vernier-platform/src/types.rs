@@ -103,6 +103,67 @@ pub struct NativeFrame {
     pub pixels: Vec<u8>,
 }
 
+impl NativeFrame {
+    /// Convert this native four-byte pixel buffer into a tightly-packed RGBA
+    /// frame without consulting the capture backend again. Keeping the
+    /// conversion tied to this exact buffer is important for frozen overlays:
+    /// edge detection and the displayed background must describe the same
+    /// compositor frame.
+    pub fn to_rgba_frame(&self) -> Result<Frame> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let row_bytes = width.checked_mul(4).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("native frame row size overflows usize"))
+        })?;
+        let stride = self.stride as usize;
+        if stride < row_bytes {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "native frame stride {} is smaller than its {}-byte pixel row",
+                self.stride,
+                row_bytes
+            )));
+        }
+        let required = stride.checked_mul(height).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("native frame buffer size overflows usize"))
+        })?;
+        if self.pixels.len() < required {
+            return Err(PlatformError::Other(anyhow::anyhow!(
+                "native frame has {} bytes, expected at least {} for {}x{} stride {}",
+                self.pixels.len(),
+                required,
+                self.width,
+                self.height,
+                self.stride
+            )));
+        }
+        let output_len = row_bytes.checked_mul(height).ok_or_else(|| {
+            PlatformError::Other(anyhow::anyhow!("RGBA frame size overflows usize"))
+        })?;
+        let mut pixels = Vec::with_capacity(output_len);
+        for row in self.pixels.chunks(stride).take(height) {
+            for pixel in row[..row_bytes].chunks_exact(4) {
+                let rgba = match self.format {
+                    PixelFormat::Bgra8 => [pixel[2], pixel[1], pixel[0], pixel[3]],
+                    PixelFormat::Bgrx8 => [pixel[2], pixel[1], pixel[0], 0xff],
+                    PixelFormat::Rgba8 => [pixel[0], pixel[1], pixel[2], pixel[3]],
+                    PixelFormat::Rgbx8 => [pixel[0], pixel[1], pixel[2], 0xff],
+                    PixelFormat::Xrgb8 => [pixel[1], pixel[2], pixel[3], 0xff],
+                    PixelFormat::Xbgr8 => [pixel[3], pixel[2], pixel[1], 0xff],
+                };
+                pixels.extend_from_slice(&rgba);
+            }
+        }
+
+        Ok(Frame {
+            width: self.width,
+            height: self.height,
+            scale_factor: self.scale_factor,
+            bounds: self.bounds,
+            pixels,
+        })
+    }
+}
+
 /// A heads-up display the overlay should render on top of its background
 /// tint. Coordinates are surface-local pixels (logical px on Wayland).
 #[derive(Debug, Clone)]
@@ -924,6 +985,65 @@ pub(crate) type EventSender = mpsc::Sender<PlatformEvent>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native(format: PixelFormat, stride: u32, pixels: Vec<u8>) -> NativeFrame {
+        NativeFrame {
+            width: 2,
+            height: 1,
+            stride,
+            format,
+            bounds: Rect::new(10, 20, 2, 1),
+            scale_factor: 2.0,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn native_frame_conversion_preserves_geometry_and_skips_padding() {
+        let source = native(
+            PixelFormat::Bgra8,
+            12,
+            vec![3, 2, 1, 4, 7, 6, 5, 8, 90, 91, 92, 93],
+        );
+
+        let frame = source.to_rgba_frame().expect("valid native frame");
+
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 1);
+        assert_eq!(frame.bounds, Rect::new(10, 20, 2, 1));
+        assert_eq!(frame.scale_factor, 2.0);
+        assert_eq!(frame.pixels, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn native_frame_conversion_handles_all_supported_pixel_orders() {
+        let cases = [
+            (PixelFormat::Bgra8, [30, 20, 10, 40], [10, 20, 30, 40]),
+            (PixelFormat::Bgrx8, [30, 20, 10, 0], [10, 20, 30, 255]),
+            (PixelFormat::Rgba8, [10, 20, 30, 40], [10, 20, 30, 40]),
+            (PixelFormat::Rgbx8, [10, 20, 30, 0], [10, 20, 30, 255]),
+            (PixelFormat::Xrgb8, [0, 10, 20, 30], [10, 20, 30, 255]),
+            (PixelFormat::Xbgr8, [0, 30, 20, 10], [10, 20, 30, 255]),
+        ];
+        for (format, input, expected) in cases {
+            let mut pixels = input.to_vec();
+            pixels.extend_from_slice(&input);
+            let frame = native(format, 8, pixels)
+                .to_rgba_frame()
+                .expect("valid native frame");
+            assert_eq!(&frame.pixels[..4], &expected, "format {format:?}");
+            assert_eq!(&frame.pixels[4..], &expected, "format {format:?}");
+        }
+    }
+
+    #[test]
+    fn native_frame_conversion_rejects_short_stride_and_buffer() {
+        let short_stride = native(PixelFormat::Rgba8, 4, vec![0; 8]);
+        assert!(short_stride.to_rgba_frame().is_err());
+
+        let short_buffer = native(PixelFormat::Rgba8, 8, vec![0; 7]);
+        assert!(short_buffer.to_rgba_frame().is_err());
+    }
 
     /// A target that is N physical pixels must read exactly N in
     /// `ScreenPixels` mode, and `N / scale` rounded in `PointsRounded`.
