@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "com.jondkinney.vernier",
+  "name": "Vernier",
+  "version": "1.0.0",
+  "author": "Jon Kinney",
+  "license": "MIT OR Apache-2.0",
+  "description": "Native Omarchy bar controls and live measurement status for Vernier.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "packaging/omarchy/BarWidget.qml",
+    "service": "packaging/omarchy/VernierService.qml"
+  },
+  "barWidget": {
+    "displayName": "Vernier",
+    "description": "Control Vernier, inspect live measurement state, and install the app on first launch.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

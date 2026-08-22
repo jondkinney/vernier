@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+# Install Vernier through Omarchy's supported AUR helper, then hand the
+# long-running daemon to UWSM. This script is deliberately interactive: the
+# companion opens it in a visible terminal so yay/sudo can prompt normally.
+
+set -euo pipefail
+
+readonly package_name="vernier-bin"
+readonly runtime_base="${XDG_RUNTIME_DIR:-}"
+
+[[ -n $runtime_base ]] || {
+  printf 'Vernier installation failed: XDG_RUNTIME_DIR is not set\n' >&2
+  exit 1
+}
+[[ -d $runtime_base && -O $runtime_base && ! -L $runtime_base ]] || {
+  printf 'Vernier installation failed: XDG_RUNTIME_DIR is not a safe user-owned directory\n' >&2
+  exit 1
+}
+
+readonly state_dir="$runtime_base/vernier-companion"
+readonly state_path="$state_dir/install-state"
+readonly lock_path="$state_dir/install.lock"
+
+if [[ -e $state_dir && (! -d $state_dir || -L $state_dir || ! -O $state_dir) ]]; then
+  printf 'Vernier installation failed: the companion runtime path is unsafe\n' >&2
+  exit 1
+fi
+
+install -d -m 0700 -- "$state_dir"
+chmod 0700 -- "$state_dir"
+
+exec 9>"$lock_path"
+if ! flock -n 9; then
+  printf 'A Vernier installation is already in progress.\n' >&2
+  exit 75
+fi
+
+write_state() {
+  local value=$1
+  local temporary
+
+  temporary="$(mktemp -- "$state_dir/.install-state.XXXXXX")" || return 1
+  if ! printf '%s\n' "$value" >"$temporary" ||
+    ! chmod 0600 -- "$temporary" ||
+    ! mv -fT -- "$temporary" "$state_path"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+ready=0
+on_exit() {
+  local exit_code=$?
+  if (( ! ready )); then
+    # Best effort only: preserve the original install failure even if the
+    # runtime directory disappeared during session shutdown.
+    write_state failed || true
+  fi
+  return "$exit_code"
+}
+
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+write_state installing || {
+  printf 'Vernier installation failed: could not publish installer state\n' >&2
+  exit 1
+}
+
+fail() {
+  printf 'Vernier installation failed: %s\n' "$*" >&2
+  exit 1
+}
+
+if ! command -v vernier >/dev/null 2>&1; then
+  command -v omarchy >/dev/null 2>&1 ||
+    fail "the omarchy command is not available"
+
+  printf 'Installing %s from the AUR through Omarchy...\n\n' "$package_name"
+  omarchy pkg aur add "$package_name" ||
+    fail "Omarchy could not install $package_name"
+
+  # omarchy-pkg-aur-add performs this check too. Keep the verification here so
+  # a future helper behavior change cannot make the companion report success
+  # without the requested package being registered in pacman's database.
+  pacman -Q "$package_name" >/dev/null 2>&1 ||
+    fail "$package_name is not registered as installed"
+else
+  printf 'Vernier is already installed; skipping package installation.\n'
+fi
+
+vernier_bin="$(command -v vernier 2>/dev/null || true)"
+[[ -n $vernier_bin && -x $vernier_bin ]] ||
+  fail "the vernier executable is not available after installation"
+
+command -v uwsm-app >/dev/null 2>&1 ||
+  fail "uwsm-app is not available"
+
+printf '\nStarting the Vernier daemon...\n'
+
+# Companion-aware Vernier releases expose the idempotent `start` command.
+# The plugin repository can move ahead of AUR briefly while a release is being
+# published, though, so retain a bare-launch fallback for older binaries. The
+# capability check is non-mutating: clap exits after printing subcommand help.
+launch_args=("$vernier_bin")
+if "$vernier_bin" start --help >/dev/null 2>&1; then
+  launch_args+=(start)
+fi
+
+# Put the foreground daemon in a UWSM-owned background service. `uwsm-app`
+# returns after the user service has accepted the process, so we can verify
+# the handoff without keeping the installation terminal attached to Vernier.
+# The companion independently polls `vernier status` for actual readiness.
+uwsm-app -s b -t service -a vernier -- "${launch_args[@]}" ||
+  fail "UWSM could not start Vernier"
+
+write_state ready ||
+  fail "could not publish successful installer state"
+ready=1
+
+printf 'Vernier is installed and starting. The companion will connect shortly.\n'
