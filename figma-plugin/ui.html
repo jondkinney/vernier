@@ -94,6 +94,17 @@
         display: none;
       }
 
+      /* Figma's window chrome already names the plugin; the compact
+         strip carries only the zoom, the status, and the expander. */
+      body.compact h1 {
+        display: none;
+      }
+
+      body.compact #compact-zoom {
+        flex: 1;
+        text-align: left;
+      }
+
       .connection {
         display: grid;
         grid-template-columns: 10px minmax(0, 1fr);
