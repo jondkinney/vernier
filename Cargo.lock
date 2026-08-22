@@ -3737,6 +3737,8 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "serde",
+ "serde_json",
  "vernier-rs-core",
  "vernier-rs-platform",
  "vernier-rs-ui",

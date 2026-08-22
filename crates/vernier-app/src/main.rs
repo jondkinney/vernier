@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -12,8 +13,8 @@ use vernier_core::{
 use vernier_platform::{
     Accelerator, Color as PlatColor, CursorKind, Frame, Guide, GuideAxis, HeldRect, HotkeyId, Hud,
     HudAxis, HudContextMenu, HudContextMenuIcon, HudContextMenuItem, HudEdge, HudKind,
-    HudMeasurementFormat, HudRounding, HudToast, MonitorId, NativeFrame, Platform, PlatformEvent,
-    StuckMeasurement, TrayMenu,
+    HudMeasurementFormat, HudRounding, HudToast, MonitorId, MonitorInfo, NativeFrame, Platform,
+    PlatformEvent, StuckMeasurement, TrayMenu,
 };
 
 mod capture_worker;
@@ -34,6 +35,17 @@ const HUD_POINTER_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 /// dropped; only their buffer commits are coalesced.
 const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The shell companion heartbeats every five seconds. A fifteen-second
+/// lease tolerates two missed beats while still restoring the generic
+/// tray item promptly after a shell crash or reload.
+const COMPANION_LEASE_DURATION: Duration = Duration::from_secs(15);
+/// Prepared captures are one-shot and normally live only while the companion
+/// popup is open. The hard limit prevents a crashed shell from pinning an
+/// 85 MB 6K frame indefinitely, while still allowing the user to leave the
+/// popup open long enough to read it before starting a measurement.
+const PREPARED_ACTIVATION_TTL: Duration = Duration::from_secs(5 * 60);
+const COMPANION_ACTIVATION_PROTOCOL: u32 = 1;
+
 // How long the `R` refresh-capture blinks the overlay transparent
 // before recapturing. On Wayland the overlay is part of the
 // compositor's screencast, so it has to be off-screen long enough for
@@ -42,7 +54,6 @@ const HUD_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 // shutter-style action; covers commit + recomposite + screencast
 // delivery with margin.
 const FREEZE_RECAPTURE_SETTLE: Duration = Duration::from_millis(120);
-
 #[derive(Parser, Debug)]
 #[command(name = "vernier", version)]
 struct Cli {
@@ -57,6 +68,22 @@ enum Cmd {
     /// `GlobalShortcuts` portal is unavailable (e.g. Hyprland: `bind = ALT
     /// SHIFT, P, exec, vernier toggle`).
     Toggle,
+    /// Start the daemon if it is not already running; otherwise exit successfully.
+    Start,
+    /// Ensure the running vernier daemon's measurement overlay is active.
+    /// Unlike `toggle`, this is idempotent and is safe for declarative shell UI.
+    Activate,
+    /// Ensure the running vernier daemon's measurement overlay is inactive.
+    /// Persisted guides and measurements remain visible in background mode.
+    Deactivate,
+    /// Print a one-line JSON snapshot of the running daemon's state.
+    Status,
+    /// Clear all held rectangles, guides, and pinned measurements.
+    /// Measurement mode stays active; an idle background overlay is hidden.
+    Clear,
+    /// Manage the temporary lease used by a shell-native companion.
+    #[command(subcommand)]
+    Companion(CompanionCmd),
     /// Tell the running vernier daemon to quit.
     Quit,
     /// Ask the running daemon to capture the primary monitor and write a PNG.
@@ -101,6 +128,805 @@ enum Cmd {
     Doctor,
 }
 
+#[derive(Subcommand, Debug)]
+enum CompanionCmd {
+    /// Attach (or heartbeat) a shell companion and make the generic tray item passive.
+    Attach,
+    /// Capture and pin a popup-free frame before the companion opens its UI.
+    PrepareActivate,
+    /// Consume a prepared frame and enter measurement mode.
+    Activate {
+        /// Opaque one-shot token returned by `prepare-activate`.
+        token: String,
+    },
+    /// Release a prepared frame when its companion popup closes unused.
+    CancelActivate {
+        /// Opaque token returned by `prepare-activate`.
+        token: String,
+    },
+}
+
+/// Versioned, shell-friendly snapshot returned by `vernier status`.
+///
+/// Keep fields additive within a schema version: companion UIs can
+/// safely ignore fields they do not understand, while a future
+/// incompatible change can bump `schema_version`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct DaemonStatus {
+    schema_version: u32,
+    app_version: String,
+    build_id: String,
+    measurement_active: bool,
+    interaction_mode: String,
+    overlay_visible: bool,
+    background_mode: bool,
+    companion_attached: bool,
+    companion_activation_protocol: u32,
+    clear_supported: bool,
+    toggle_shortcut: Option<String>,
+    clear_and_exit_shortcut: Option<String>,
+    held_rect_count: usize,
+    guide_count: usize,
+    stuck_measurement_count: usize,
+}
+
+impl DaemonStatus {
+    fn snapshot(
+        mode: &InteractionMode,
+        held_rect_count: usize,
+        guide_count: usize,
+        stuck_measurement_count: usize,
+        companion_attached: bool,
+        shortcuts: &ShortcutSettings,
+    ) -> Self {
+        let measurement_active = !matches!(mode, InteractionMode::Idle);
+        let has_persisted_content =
+            held_rect_count > 0 || guide_count > 0 || stuck_measurement_count > 0;
+        Self {
+            schema_version: 1,
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_id: vernier_core::build_id(),
+            measurement_active,
+            interaction_mode: interaction_mode_name(mode).to_owned(),
+            overlay_visible: measurement_active || has_persisted_content,
+            background_mode: !measurement_active && has_persisted_content,
+            companion_attached,
+            companion_activation_protocol: COMPANION_ACTIVATION_PROTOCOL,
+            clear_supported: true,
+            toggle_shortcut: canonical_configured_shortcut(&shortcuts.toggle),
+            clear_and_exit_shortcut: canonical_configured_shortcut(&shortcuts.clear_and_exit),
+            held_rect_count,
+            guide_count,
+            stuck_measurement_count,
+        }
+    }
+
+    fn to_json_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self).map(|json| format!("{json}\n"))
+    }
+}
+
+fn interaction_mode_name(mode: &InteractionMode) -> &'static str {
+    match mode {
+        InteractionMode::Idle => "idle",
+        InteractionMode::Hover { .. } => "hover",
+        InteractionMode::Drawing { .. } => "drawing",
+        InteractionMode::Held { .. } => "held",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasurementControl {
+    Toggle,
+    Activate,
+    Deactivate,
+}
+
+/// Short, renewable ownership lease for a shell-native companion.
+/// If its process or Quickshell disappears, the lack of heartbeats
+/// automatically makes Vernier's generic tray item Active again.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CompanionLease {
+    attached: bool,
+    generation: u64,
+}
+
+impl CompanionLease {
+    fn attach(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.attached = true;
+        self.generation
+    }
+
+    /// Expire only the latest heartbeat; stale timer events are ignored.
+    /// Returns true when the tray needs to be restored.
+    fn expire(&mut self, generation: u64) -> bool {
+        if self.attached && self.generation == generation {
+            self.attached = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedActivation {
+    token: String,
+    expires_at: Instant,
+    monitor: MonitorId,
+    frame: NativeFrame,
+}
+
+#[derive(Debug, Default)]
+struct PreparedActivationStore {
+    next_token: u64,
+    pending: Option<PreparedActivation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedActivationError {
+    Missing,
+    TokenMismatch,
+    Expired,
+    MonitorChanged,
+}
+
+impl std::fmt::Display for PreparedActivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Missing => "no prepared activation is pending",
+            Self::TokenMismatch => "prepared activation token is stale or invalid",
+            Self::Expired => "prepared activation token has expired",
+            Self::MonitorChanged => "the prepared activation monitor has changed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl PreparedActivationStore {
+    /// Invalidate any older preparation before a new capture starts. This is
+    /// the latest-wins boundary even when the new synchronous capture fails.
+    fn invalidate(&mut self) {
+        self.pending = None;
+    }
+
+    fn prepare(&mut self, frame: NativeFrame, monitor: MonitorId, now: Instant) -> String {
+        self.next_token = self.next_token.wrapping_add(1);
+        if self.next_token == 0 {
+            self.next_token = 1;
+        }
+        let token = format!("{:016x}", self.next_token);
+        self.pending = Some(PreparedActivation {
+            token: token.clone(),
+            expires_at: now + PREPARED_ACTIVATION_TTL,
+            monitor,
+            frame,
+        });
+        token
+    }
+
+    fn consume(
+        &mut self,
+        token: &str,
+        monitor: MonitorId,
+        now: Instant,
+    ) -> std::result::Result<NativeFrame, PreparedActivationError> {
+        let Some(prepared) = self.pending.as_ref() else {
+            return Err(PreparedActivationError::Missing);
+        };
+        if now >= prepared.expires_at {
+            self.pending = None;
+            return Err(PreparedActivationError::Expired);
+        }
+        if prepared.token != token {
+            return Err(PreparedActivationError::TokenMismatch);
+        }
+        if prepared.monitor != monitor {
+            self.pending = None;
+            return Err(PreparedActivationError::MonitorChanged);
+        }
+        Ok(self
+            .pending
+            .take()
+            .expect("prepared frame checked above")
+            .frame)
+    }
+
+    fn cancel(&mut self, token: &str) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|prepared| prepared.token == token)
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expire(&mut self, token: &str, now: Instant) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|prepared| prepared.token == token && now >= prepared.expires_at)
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PreparedActivationReply<'a> {
+    schema_version: u32,
+    token: &'a str,
+    expires_in_ms: u64,
+}
+
+fn prepared_activation_json(token: &str) -> serde_json::Result<String> {
+    serde_json::to_string(&PreparedActivationReply {
+        schema_version: COMPANION_ACTIVATION_PROTOCOL,
+        token,
+        expires_in_ms: PREPARED_ACTIVATION_TTL.as_millis() as u64,
+    })
+    .map(|json| format!("{json}\n"))
+}
+
+/// Decide whether a shell control request should cross the active/idle
+/// boundary. `activate` and `deactivate` intentionally become no-ops
+/// when the daemon is already in the requested state.
+fn should_transition_measurement(mode: &InteractionMode, control: MeasurementControl) -> bool {
+    match control {
+        MeasurementControl::Toggle => true,
+        MeasurementControl::Activate => matches!(mode, InteractionMode::Idle),
+        MeasurementControl::Deactivate => !matches!(mode, InteractionMode::Idle),
+    }
+}
+
+/// A prepared frame is valid only for the exact primary-output snapshot that
+/// produced it. Names matter because grim selects by name; geometry and scale
+/// determine the frame-to-overlay coordinate mapping; primary status controls
+/// which output the daemon targets.
+fn primary_monitor_changed(current: &MonitorInfo, candidate: Option<&MonitorInfo>) -> bool {
+    candidate.is_none_or(|candidate| {
+        candidate.id != current.id
+            || candidate.name != current.name
+            || candidate.bounds != current.bounds
+            || candidate.scale_factor.to_bits() != current.scale_factor.to_bits()
+            || candidate.is_primary != current.is_primary
+    })
+}
+
+fn prepared_capture_needs_overlay_hide(
+    mode: &InteractionMode,
+    has_persisted_content: bool,
+    overlay_visible: bool,
+) -> bool {
+    matches!(mode, InteractionMode::Idle) && has_persisted_content && overlay_visible
+}
+
+fn daemon_start_needed(responsive: bool) -> bool {
+    !responsive
+}
+
+fn launch_daemon() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        vernier_platform::bootstrap_main(|| {
+            if let Err(e) = run_daemon() {
+                log::error!("daemon exited with error: {e:#}");
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        run_daemon()
+    }
+}
+
+#[cfg(test)]
+mod shell_api_tests {
+    use super::*;
+
+    #[test]
+    fn shell_commands_parse_without_ambiguous_arguments() {
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "status"])
+                .expect("status parses")
+                .command,
+            Some(Cmd::Status)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "clear"])
+                .expect("clear parses")
+                .command,
+            Some(Cmd::Clear)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "start"])
+                .expect("start parses")
+                .command,
+            Some(Cmd::Start)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "activate"])
+                .expect("activate parses")
+                .command,
+            Some(Cmd::Activate)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "deactivate"])
+                .expect("deactivate parses")
+                .command,
+            Some(Cmd::Deactivate)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "companion", "attach"])
+                .expect("companion attach parses")
+                .command,
+            Some(Cmd::Companion(CompanionCmd::Attach))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "companion", "prepare-activate"])
+                .expect("companion prepare parses")
+                .command,
+            Some(Cmd::Companion(CompanionCmd::PrepareActivate))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "companion", "activate", "opaque"])
+                .expect("companion activation parses")
+                .command,
+            Some(Cmd::Companion(CompanionCmd::Activate { token })) if token == "opaque"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vernier", "companion", "cancel-activate", "opaque"])
+                .expect("companion cancellation parses")
+                .command,
+            Some(Cmd::Companion(CompanionCmd::CancelActivate { token })) if token == "opaque"
+        ));
+    }
+
+    #[test]
+    fn status_is_a_single_versioned_json_line() {
+        let shortcuts = ShortcutSettings::default();
+        let status = DaemonStatus::snapshot(&InteractionMode::Idle, 2, 1, 3, true, &shortcuts);
+        let line = status.to_json_line().expect("status serializes");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("valid status json");
+
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(line.ends_with('\n'));
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["app_version"], env!("CARGO_PKG_VERSION"));
+        assert!(value["build_id"].is_string());
+        assert_eq!(value["measurement_active"], false);
+        assert_eq!(value["interaction_mode"], "idle");
+        assert_eq!(value["overlay_visible"], true);
+        assert_eq!(value["background_mode"], true);
+        assert_eq!(value["companion_attached"], true);
+        assert_eq!(
+            value["companion_activation_protocol"],
+            COMPANION_ACTIVATION_PROTOCOL
+        );
+        assert_eq!(value["clear_supported"], true);
+        assert_eq!(value["toggle_shortcut"], shortcuts.toggle);
+        assert_eq!(value["clear_and_exit_shortcut"], shortcuts.clear_and_exit);
+        assert_eq!(value["held_rect_count"], 2);
+        assert_eq!(value["guide_count"], 1);
+        assert_eq!(value["stuck_measurement_count"], 3);
+    }
+
+    #[test]
+    fn active_status_is_visible_without_persisted_content() {
+        let mode = InteractionMode::Hover {
+            cursor: Px::new(10, 20),
+        };
+        let status = DaemonStatus::snapshot(&mode, 0, 0, 0, false, &ShortcutSettings::default());
+
+        assert!(status.measurement_active);
+        assert_eq!(status.interaction_mode, "hover");
+        assert!(status.overlay_visible);
+        assert!(!status.background_mode);
+        assert!(!status.companion_attached);
+    }
+
+    #[test]
+    fn status_shortcuts_are_live_canonical_bindings_and_hide_invalid_values() {
+        let mut shortcuts = ShortcutSettings {
+            toggle: "shift+control+f".to_owned(),
+            clear_and_exit: "option+delete".to_owned(),
+            ..ShortcutSettings::default()
+        };
+        let status = DaemonStatus::snapshot(&InteractionMode::Idle, 0, 0, 0, true, &shortcuts);
+
+        assert_eq!(status.toggle_shortcut.as_deref(), Some("CTRL+SHIFT+F"));
+        assert_eq!(
+            status.clear_and_exit_shortcut.as_deref(),
+            Some("ALT+DELETE")
+        );
+
+        shortcuts.toggle.clear();
+        shortcuts.clear_and_exit = "not-a-key".to_owned();
+        let status = DaemonStatus::snapshot(&InteractionMode::Idle, 0, 0, 0, true, &shortcuts);
+        assert_eq!(status.toggle_shortcut, None);
+        assert_eq!(status.clear_and_exit_shortcut, None);
+    }
+
+    #[test]
+    fn activate_and_deactivate_are_idempotent() {
+        let idle = InteractionMode::Idle;
+        let active = InteractionMode::Hover {
+            cursor: Px::default(),
+        };
+
+        assert!(should_transition_measurement(
+            &idle,
+            MeasurementControl::Activate
+        ));
+        assert!(!should_transition_measurement(
+            &active,
+            MeasurementControl::Activate
+        ));
+        assert!(!should_transition_measurement(
+            &idle,
+            MeasurementControl::Deactivate
+        ));
+        assert!(should_transition_measurement(
+            &active,
+            MeasurementControl::Deactivate
+        ));
+        assert!(should_transition_measurement(
+            &idle,
+            MeasurementControl::Toggle
+        ));
+        assert!(should_transition_measurement(
+            &active,
+            MeasurementControl::Toggle
+        ));
+    }
+
+    #[test]
+    fn companion_lease_ignores_stale_expiry_and_restores_once() {
+        let mut lease = CompanionLease::default();
+        let first = lease.attach();
+        let latest = lease.attach();
+
+        assert!(lease.attached);
+        assert!(!lease.expire(first));
+        assert!(lease.attached);
+        assert!(lease.expire(latest));
+        assert!(!lease.attached);
+        assert!(!lease.expire(latest));
+
+        let renewed = lease.attach();
+        assert!(lease.attached);
+        assert!(lease.expire(renewed));
+    }
+
+    #[test]
+    fn start_is_only_needed_without_a_responsive_daemon() {
+        assert!(daemon_start_needed(false));
+        assert!(!daemon_start_needed(true));
+    }
+
+    #[test]
+    fn prepared_commands_outlive_the_daemons_reply_deadline() {
+        assert_eq!(
+            client_command_timeout("companion prepare-activate"),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            client_command_timeout("companion activate token"),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            client_command_timeout("companion cancel-activate token"),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            client_command_timeout("companion attach"),
+            Duration::from_secs(3)
+        );
+        assert_eq!(client_command_timeout("status"), Duration::from_secs(3));
+    }
+
+    fn primary_monitor() -> MonitorInfo {
+        MonitorInfo {
+            id: MonitorId(7),
+            name: "DP-2".to_owned(),
+            bounds: vernier_platform::Rect::new(10, 20, 1920, 1080),
+            scale_factor: 1.5,
+            is_primary: true,
+        }
+    }
+
+    #[test]
+    fn prepared_monitor_snapshot_detects_every_capture_relevant_change() {
+        let current = primary_monitor();
+        assert!(!primary_monitor_changed(&current, Some(&current)));
+        assert!(primary_monitor_changed(&current, None));
+
+        let mut changed = current.clone();
+        changed.id = MonitorId(8);
+        assert!(primary_monitor_changed(&current, Some(&changed)));
+
+        let mut changed = current.clone();
+        changed.name = "HDMI-A-1".to_owned();
+        assert!(primary_monitor_changed(&current, Some(&changed)));
+
+        let mut changed = current.clone();
+        changed.bounds = vernier_platform::Rect::new(10, 20, 1080, 1920);
+        assert!(primary_monitor_changed(&current, Some(&changed)));
+
+        let mut changed = current.clone();
+        changed.scale_factor = 2.0;
+        assert!(primary_monitor_changed(&current, Some(&changed)));
+
+        let mut changed = current.clone();
+        changed.is_primary = false;
+        assert!(primary_monitor_changed(&current, Some(&changed)));
+    }
+
+    #[test]
+    fn prepared_capture_hides_only_a_visible_idle_persisted_overlay() {
+        let idle = InteractionMode::Idle;
+        let active = InteractionMode::Hover {
+            cursor: Px::default(),
+        };
+
+        assert!(prepared_capture_needs_overlay_hide(&idle, true, true));
+        assert!(!prepared_capture_needs_overlay_hide(&idle, false, true));
+        assert!(!prepared_capture_needs_overlay_hide(&idle, true, false));
+        assert!(!prepared_capture_needs_overlay_hide(&active, true, true));
+    }
+
+    fn prepared_frame(marker: u8) -> NativeFrame {
+        NativeFrame {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: vernier_platform::PixelFormat::Rgba8,
+            bounds: vernier_platform::Rect::new(0, 0, 1, 1),
+            scale_factor: 1.0,
+            pixels: vec![marker, marker, marker, 255],
+        }
+    }
+
+    #[test]
+    fn prepared_activation_is_latest_wins_and_one_shot() {
+        let now = Instant::now();
+        let monitor = MonitorId(1);
+        let mut store = PreparedActivationStore::default();
+        let stale = store.prepare(prepared_frame(1), monitor, now);
+        let latest = store.prepare(prepared_frame(2), monitor, now);
+
+        assert_eq!(
+            store
+                .consume(&stale, monitor, now)
+                .expect_err("stale token must fail"),
+            PreparedActivationError::TokenMismatch
+        );
+        let frame = store
+            .consume(&latest, monitor, now)
+            .expect("latest token consumes");
+        assert_eq!(frame.pixels[0], 2);
+        assert_eq!(
+            store
+                .consume(&latest, monitor, now)
+                .expect_err("one-shot token must be consumed"),
+            PreparedActivationError::Missing
+        );
+    }
+
+    #[test]
+    fn invalid_token_does_not_destroy_current_preparation() {
+        let now = Instant::now();
+        let monitor = MonitorId(1);
+        let mut store = PreparedActivationStore::default();
+        let token = store.prepare(prepared_frame(3), monitor, now);
+
+        assert_eq!(
+            store
+                .consume("wrong", monitor, now)
+                .expect_err("wrong token must fail"),
+            PreparedActivationError::TokenMismatch
+        );
+        assert_eq!(
+            store
+                .consume(&token, monitor, now)
+                .expect("valid token remains")
+                .pixels[0],
+            3
+        );
+    }
+
+    #[test]
+    fn prepared_activation_expiry_and_monitor_change_are_strict() {
+        let now = Instant::now();
+        let mut store = PreparedActivationStore::default();
+        let expired = store.prepare(prepared_frame(4), MonitorId(1), now);
+        assert_eq!(
+            store
+                .consume(&expired, MonitorId(1), now + PREPARED_ACTIVATION_TTL)
+                .expect_err("expired token must fail"),
+            PreparedActivationError::Expired
+        );
+
+        let changed = store.prepare(prepared_frame(5), MonitorId(1), now);
+        assert_eq!(
+            store
+                .consume(&changed, MonitorId(2), now)
+                .expect_err("monitor change must fail"),
+            PreparedActivationError::MonitorChanged
+        );
+        assert_eq!(
+            store
+                .consume(&changed, MonitorId(1), now)
+                .expect_err("monitor mismatch consumes preparation"),
+            PreparedActivationError::Missing
+        );
+    }
+
+    #[test]
+    fn cancellation_and_expiry_only_clear_the_matching_token() {
+        let now = Instant::now();
+        let monitor = MonitorId(1);
+        let mut store = PreparedActivationStore::default();
+        let token = store.prepare(prepared_frame(6), monitor, now);
+
+        assert!(!store.cancel("wrong"));
+        assert!(!store.expire("wrong", now + PREPARED_ACTIVATION_TTL));
+        assert!(store.cancel(&token));
+        assert!(!store.cancel(&token));
+
+        let token = store.prepare(prepared_frame(7), monitor, now);
+        assert!(!store.expire(&token, now));
+        assert!(store.expire(&token, now + PREPARED_ACTIVATION_TTL));
+    }
+
+    #[test]
+    fn prepared_activation_reply_uses_string_token_and_ttl() {
+        let value: serde_json::Value = serde_json::from_str(
+            prepared_activation_json("0000000000000001")
+                .expect("serialize reply")
+                .trim(),
+        )
+        .expect("valid reply JSON");
+
+        assert_eq!(value["schema_version"], COMPANION_ACTIVATION_PROTOCOL);
+        assert_eq!(value["token"], "0000000000000001");
+        assert_eq!(
+            value["expires_in_ms"],
+            PREPARED_ACTIVATION_TTL.as_millis() as u64
+        );
+    }
+
+    struct CountingCapturePlatform {
+        capture_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Platform for CountingCapturePlatform {
+        fn monitors(
+            &self,
+        ) -> std::result::Result<Vec<vernier_platform::MonitorInfo>, vernier_platform::PlatformError>
+        {
+            unreachable!("not used by capture resolver test")
+        }
+
+        fn focused_app(
+            &self,
+        ) -> std::result::Result<
+            Option<vernier_platform::AppIdentity>,
+            vernier_platform::PlatformError,
+        > {
+            unreachable!("not used by capture resolver test")
+        }
+
+        fn capture_screen(
+            &self,
+            _monitor: MonitorId,
+        ) -> std::result::Result<Frame, vernier_platform::PlatformError> {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(vernier_platform::PlatformError::Unsupported {
+                what: "test capture",
+            })
+        }
+
+        fn capture_screen_native(
+            &self,
+            _monitor: MonitorId,
+        ) -> std::result::Result<NativeFrame, vernier_platform::PlatformError> {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(vernier_platform::PlatformError::Unsupported {
+                what: "test capture",
+            })
+        }
+
+        fn register_hotkey(
+            &self,
+            _accelerator: Accelerator,
+            _label: &str,
+        ) -> std::result::Result<HotkeyId, vernier_platform::PlatformError> {
+            unreachable!("not used by capture resolver test")
+        }
+
+        fn unregister_hotkey(
+            &self,
+            _id: HotkeyId,
+        ) -> std::result::Result<(), vernier_platform::PlatformError> {
+            unreachable!("not used by capture resolver test")
+        }
+
+        fn create_overlay(
+            &self,
+            _monitor: MonitorId,
+        ) -> std::result::Result<vernier_platform::OverlayHandle, vernier_platform::PlatformError>
+        {
+            unreachable!("not used by capture resolver test")
+        }
+
+        fn create_tray(
+            &self,
+            _menu: TrayMenu,
+        ) -> std::result::Result<vernier_platform::TrayHandle, vernier_platform::PlatformError>
+        {
+            unreachable!("not used by capture resolver test")
+        }
+    }
+
+    #[test]
+    fn prepared_capture_uses_exact_frame_without_touching_platform() {
+        let platform = CountingCapturePlatform {
+            capture_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let source = prepared_frame(37);
+
+        let (native, background) =
+            resolve_measurement_capture(&platform, MonitorId(1), Some(source), true)
+                .expect("prepared capture resolves");
+
+        assert_eq!(
+            platform
+                .capture_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            native.expect("prepared native frame").pixels,
+            vec![37, 37, 37, 255]
+        );
+        assert_eq!(
+            background.expect("freeze background").pixels,
+            vec![37, 37, 37, 255]
+        );
+    }
+
+    #[test]
+    fn ordinary_capture_failure_keeps_legacy_no_frame_activation_path() {
+        let platform = CountingCapturePlatform {
+            capture_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let (native, background) = resolve_measurement_capture(&platform, MonitorId(1), None, true)
+            .expect("ordinary capture failure is non-fatal");
+
+        assert!(native.is_none());
+        assert!(background.is_none());
+        assert_eq!(
+            platform
+                .capture_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
@@ -109,6 +935,27 @@ fn main() -> Result<()> {
     .init();
     match cli.command {
         Some(Cmd::Toggle) => run_client_command("toggle"),
+        Some(Cmd::Start) => {
+            if daemon_start_needed(existing_daemon_responsive()) {
+                launch_daemon()
+            } else {
+                Ok(())
+            }
+        }
+        Some(Cmd::Activate) => run_client_command("activate"),
+        Some(Cmd::Deactivate) => run_client_command("deactivate"),
+        Some(Cmd::Status) => run_client_command("status"),
+        Some(Cmd::Clear) => run_client_command("clear"),
+        Some(Cmd::Companion(CompanionCmd::Attach)) => run_client_command("companion attach"),
+        Some(Cmd::Companion(CompanionCmd::PrepareActivate)) => {
+            run_client_command("companion prepare-activate")
+        }
+        Some(Cmd::Companion(CompanionCmd::Activate { token })) => {
+            run_client_command(&format!("companion activate {token}"))
+        }
+        Some(Cmd::Companion(CompanionCmd::CancelActivate { token })) => {
+            run_client_command(&format!("companion cancel-activate {token}"))
+        }
         Some(Cmd::Quit) => run_client_command("quit"),
         Some(Cmd::Capture { path }) => run_client_command(&format!(
             "capture {}",
@@ -138,32 +985,18 @@ fn main() -> Result<()> {
                 let _ = run_client_command("open-prefs");
                 Ok(())
             } else {
-                // macOS: NSApp must own the main thread for the
-                // tray + overlay windows to receive events. Push
-                // the daemon body onto a worker and run NSApp.run()
-                // here. Never returns.
-                #[cfg(target_os = "macos")]
-                {
-                    vernier_platform::bootstrap_main(|| {
-                        if let Err(e) = run_daemon() {
-                            log::error!("daemon exited with error: {e:#}");
-                        }
-                    });
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    run_daemon()
-                }
+                launch_daemon()
             }
         }
     }
 }
 
-/// Probe the IPC socket. Returns true if connecting succeeds —
-/// proving a daemon owns the socket. A stale socket file from a
-/// crashed daemon refuses connections, which we treat as "not
-/// running" so the next launch can replace it.
+/// Probe the IPC socket with a bounded version round-trip. A stale socket file
+/// from a crashed daemon refuses connections, while a listener that cannot
+/// answer promptly is not healthy enough for `start` to treat as responsive.
 fn existing_daemon_responsive() -> bool {
+    use std::io::{Read, Write};
+
     let path = match ipc_socket_path() {
         Ok(p) => p,
         Err(_) => return false,
@@ -171,7 +1004,21 @@ fn existing_daemon_responsive() -> bool {
     if !path.exists() {
         return false;
     }
-    std::os::unix::net::UnixStream::connect(&path).is_ok()
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
+        return false;
+    };
+    let timeout = Some(Duration::from_millis(750));
+    if stream.set_write_timeout(timeout).is_err()
+        || stream.set_read_timeout(timeout).is_err()
+        || stream.write_all(b"version\n").is_err()
+        || stream.shutdown(std::net::Shutdown::Write).is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok()
+        && !response.trim().is_empty()
+        && !response.trim_start().starts_with("error:")
 }
 
 /// Open the egui prefs window. After each successful save the
@@ -245,20 +1092,53 @@ fn run_prefs_window() -> Result<()> {
     vernier_ui::run_prefs(on_saved, on_quit, static_bind)
 }
 
+fn client_command_timeout(cmd: &str) -> Duration {
+    if cmd == "companion prepare-activate"
+        || cmd.starts_with("companion activate ")
+        || cmd.starts_with("companion cancel-activate ")
+    {
+        // These requests use the daemon's five-second prepared-activation
+        // reply budget. Keep the outer socket deadline strictly larger so a
+        // bounded server error reaches the caller instead of looking like an
+        // unrelated client-side timeout.
+        Duration::from_secs(6)
+    } else {
+        Duration::from_secs(3)
+    }
+}
+
 fn run_client_command(cmd: &str) -> Result<()> {
     let path = ipc_socket_path()?;
     let mut stream = std::os::unix::net::UnixStream::connect(&path)
         .with_context(|| format!("connect to {} (is the daemon running?)", path.display()))?;
     use std::io::{Read, Write};
+    let timeout = client_command_timeout(cmd);
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))?;
     stream.write_all(cmd.as_bytes())?;
     stream.write_all(b"\n")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .with_context(|| "shutdown write half of ipc socket")?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok();
-    if !response.is_empty() {
-        print!("{}", String::from_utf8_lossy(&response));
+    stream
+        .read_to_end(&mut response)
+        .with_context(|| format!("read daemon reply for {cmd:?}"))?;
+    let response = String::from_utf8_lossy(&response);
+    if response.trim_start().starts_with("error:") {
+        bail!("{}", response.trim());
+    }
+    let reply_required = cmd == "status"
+        || cmd == "clear"
+        || cmd.starts_with("companion ")
+        || cmd.starts_with("detect-edges ");
+    if reply_required && response.trim().is_empty() {
+        bail!("daemon returned no reply for {cmd:?}");
+    }
+    let is_silent_ack =
+        (cmd == "clear" || cmd.starts_with("companion ")) && response.trim() == "ok";
+    if !response.is_empty() && !is_silent_ack {
+        print!("{response}");
     }
     Ok(())
 }
@@ -337,7 +1217,7 @@ fn run_daemon() -> Result<()> {
         .context("no monitors available")?;
     set_primary_scale_factor(primary.scale_factor);
     let mut overlay = platform.create_overlay(primary.id)?;
-    let _tray = if !initial_settings.general.hide_tray_icon {
+    let mut tray = if !initial_settings.general.hide_tray_icon {
         match platform.create_tray(TrayMenu::minimal("Vernier")) {
             Ok(t) => Some(t),
             Err(e) => {
@@ -689,6 +1569,8 @@ fn run_daemon() -> Result<()> {
     // measure mode is off or freeze is on (capture is a one-shot in
     // freeze mode, not a stream).
     let mut capture_worker: Option<CaptureWorker> = None;
+    let mut companion_lease = CompanionLease::default();
+    let mut prepared_activations = PreparedActivationStore::default();
 
     while let Ok(event) = combined_rx.recv() {
         match event {
@@ -712,6 +1594,7 @@ fn run_daemon() -> Result<()> {
                         frozen_frame: &mut frozen_frame,
                         capture_worker: &mut capture_worker,
                         prefs_hotkey: &mut prefs_hotkey,
+                        prepared_activations: &mut prepared_activations,
                     },
                     MeasurementView {
                         held_rects: &held_rects,
@@ -761,6 +1644,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame: &mut frozen_frame,
                             capture_worker: &mut capture_worker,
                             prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
                         },
                         MeasurementView {
                             held_rects: &held_rects,
@@ -795,6 +1679,7 @@ fn run_daemon() -> Result<()> {
                         frozen_frame: &mut frozen_frame,
                         capture_worker: &mut capture_worker,
                         prefs_hotkey: &mut prefs_hotkey,
+                        prepared_activations: &mut prepared_activations,
                     },
                     MeasurementView {
                         held_rects: &held_rects,
@@ -1204,6 +2089,7 @@ fn run_daemon() -> Result<()> {
                                         frozen_frame: &mut frozen_frame,
                                         capture_worker: &mut capture_worker,
                                         prefs_hotkey: &mut prefs_hotkey,
+                                        prepared_activations: &mut prepared_activations,
                                     },
                                     &mut SessionContent {
                                         held_rects: &mut held_rects,
@@ -1231,6 +2117,7 @@ fn run_daemon() -> Result<()> {
                                         frozen_frame: &mut frozen_frame,
                                         capture_worker: &mut capture_worker,
                                         prefs_hotkey: &mut prefs_hotkey,
+                                        prepared_activations: &mut prepared_activations,
                                     },
                                     MeasurementView {
                                         held_rects: &held_rects,
@@ -1299,6 +2186,7 @@ fn run_daemon() -> Result<()> {
                                             frozen_frame: &mut frozen_frame,
                                             capture_worker: &mut capture_worker,
                                             prefs_hotkey: &mut prefs_hotkey,
+                                            prepared_activations: &mut prepared_activations,
                                         },
                                         MeasurementView {
                                             held_rects: &held_rects,
@@ -1978,6 +2866,7 @@ fn run_daemon() -> Result<()> {
                                     frozen_frame: &mut frozen_frame,
                                     capture_worker: &mut capture_worker,
                                     prefs_hotkey: &mut prefs_hotkey,
+                                    prepared_activations: &mut prepared_activations,
                                 },
                                 MeasurementView {
                                     held_rects: &held_rects,
@@ -2343,6 +3232,7 @@ fn run_daemon() -> Result<()> {
                                 frozen_frame: &mut frozen_frame,
                                 capture_worker: &mut capture_worker,
                                 prefs_hotkey: &mut prefs_hotkey,
+                                prepared_activations: &mut prepared_activations,
                             },
                             MeasurementView {
                                 held_rects: &held_rects,
@@ -2436,6 +3326,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame: &mut frozen_frame,
                             capture_worker: &mut capture_worker,
                             prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
                         },
                         MeasurementView {
                             held_rects: &held_rects,
@@ -2473,6 +3364,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame: &mut frozen_frame,
                             capture_worker: &mut capture_worker,
                             prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
                         },
                         MeasurementView {
                             held_rects: &held_rects,
@@ -2907,6 +3799,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame: &mut frozen_frame,
                             capture_worker: &mut capture_worker,
                             prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
                         },
                         &mut SessionContent {
                             held_rects: &mut held_rects,
@@ -3276,25 +4169,256 @@ fn run_daemon() -> Result<()> {
                 }
             }
             MainEvent::Platform(other) => log::debug!("platform event: {other:?}"),
-            MainEvent::Ipc(IpcCmd::Toggle) => {
-                toggle_measurement(
-                    &mut MeasureSession {
-                        mode: &mut mode,
-                        overlay: &mut overlay,
-                        platform: &platform,
-                        monitor: primary.id,
-                        frozen_frame: &mut frozen_frame,
-                        capture_worker: &mut capture_worker,
-                        prefs_hotkey: &mut prefs_hotkey,
-                    },
-                    MeasurementView {
-                        held_rects: &held_rects,
-                        guides: &guides,
-                        stuck_measurements: &stuck_measurements,
-                    },
-                    color_alternate,
-                    prefs_hotkey_accel,
+            MainEvent::Ipc(
+                control_cmd @ (IpcCmd::Toggle | IpcCmd::Activate | IpcCmd::Deactivate),
+            ) => {
+                let control = match control_cmd {
+                    IpcCmd::Toggle => MeasurementControl::Toggle,
+                    IpcCmd::Activate => MeasurementControl::Activate,
+                    IpcCmd::Deactivate => MeasurementControl::Deactivate,
+                    _ => unreachable!(),
+                };
+                if should_transition_measurement(&mode, control) {
+                    prepared_activations.invalidate();
+                    // Explicit shell controls always enter or leave a
+                    // clean top-level mode. An idempotent no-op leaves
+                    // an in-progress interaction untouched.
+                    pending_guide = None;
+                    pending_guide_shift_acked = false;
+                    toggle_measurement(
+                        &mut MeasureSession {
+                            mode: &mut mode,
+                            overlay: &mut overlay,
+                            platform: &platform,
+                            monitor: primary.id,
+                            frozen_frame: &mut frozen_frame,
+                            capture_worker: &mut capture_worker,
+                            prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
+                        },
+                        MeasurementView {
+                            held_rects: &held_rects,
+                            guides: &guides,
+                            stuck_measurements: &stuck_measurements,
+                        },
+                        color_alternate,
+                        prefs_hotkey_accel,
+                    );
+                }
+            }
+            MainEvent::Ipc(IpcCmd::CompanionPrepareActivate { reply }) => {
+                prepared_activations.invalidate();
+                let response = if !matches!(mode, InteractionMode::Idle) {
+                    "error: measurement mode is already active\n".to_owned()
+                } else {
+                    let has_persisted_content = !held_rects.is_empty()
+                        || !guides.is_empty()
+                        || !stuck_measurements.is_empty();
+                    let restore_overlay = prepared_capture_needs_overlay_hide(
+                        &mode,
+                        has_persisted_content,
+                        overlay.is_visible(),
+                    );
+                    if restore_overlay {
+                        // The persisted idle HUD is click-through but still
+                        // compositor-visible. Hide it before the backend's
+                        // settle interval so grim cannot pin Vernier's own
+                        // guides or measurements into the clean frame.
+                        overlay.hide();
+                    }
+                    let capture = platform.capture_screen_native_synchronous(primary.id);
+                    if restore_overlay {
+                        // Preparation does not change background-mode state;
+                        // restore the passthrough HUD on success and error.
+                        overlay.show();
+                    }
+                    match capture {
+                        Ok(frame) => {
+                            let token =
+                                prepared_activations.prepare(frame, primary.id, Instant::now());
+                            spawn_prepared_activation_expiry(&combined_tx, token.clone());
+                            log::info!("shell companion prepared popup-free measurement frame");
+                            prepared_activation_json(&token).unwrap_or_else(|error| {
+                                prepared_activations.invalidate();
+                                format!("error: serialize prepared activation: {error}\n")
+                            })
+                        }
+                        Err(error) => {
+                            format!("error: prepare popup-free measurement capture: {error}\n")
+                        }
+                    }
+                };
+                let _ = reply.send(response);
+            }
+            MainEvent::Ipc(IpcCmd::CompanionActivate { token, reply }) => {
+                let response = if !matches!(mode, InteractionMode::Idle) {
+                    // A valid token is one-shot even if an external control
+                    // won the race and activated measurement first. A bogus
+                    // token must not disturb the actual owner's preparation.
+                    prepared_activations.cancel(&token);
+                    "error: measurement mode is already active\n".to_owned()
+                } else {
+                    match prepared_activations.consume(&token, primary.id, Instant::now()) {
+                        Ok(frame) => {
+                            pending_guide = None;
+                            pending_guide_shift_acked = false;
+                            let activated = toggle_measurement_with_frame(
+                                &mut MeasureSession {
+                                    mode: &mut mode,
+                                    overlay: &mut overlay,
+                                    platform: &platform,
+                                    monitor: primary.id,
+                                    frozen_frame: &mut frozen_frame,
+                                    capture_worker: &mut capture_worker,
+                                    prefs_hotkey: &mut prefs_hotkey,
+                                    prepared_activations: &mut prepared_activations,
+                                },
+                                MeasurementView {
+                                    held_rects: &held_rects,
+                                    guides: &guides,
+                                    stuck_measurements: &stuck_measurements,
+                                },
+                                color_alternate,
+                                prefs_hotkey_accel,
+                                Some(frame),
+                            );
+                            if activated {
+                                log::info!(
+                                    "shell companion activated its prepared measurement frame"
+                                );
+                                "ok\n".to_owned()
+                            } else {
+                                "error: prepared measurement activation failed\n".to_owned()
+                            }
+                        }
+                        Err(error) => format!("error: {error}\n"),
+                    }
+                };
+                let _ = reply.send(response);
+            }
+            MainEvent::Ipc(IpcCmd::CompanionCancelActivate { token, reply }) => {
+                prepared_activations.cancel(&token);
+                let _ = reply.send("ok\n".to_owned());
+            }
+            MainEvent::Ipc(IpcCmd::Clear { reply }) => {
+                log::info!(
+                    "ipc: clear {} rect(s), {} guide(s), {} pinned",
+                    held_rects.len(),
+                    guides.len(),
+                    stuck_measurements.len(),
                 );
+
+                // Clear persisted measurements and every transient selector
+                // that could still reference one of their old indexes. This
+                // makes the external command safe even if it arrives during a
+                // draw, resize, guide drag, nudge repeat, or open HUD menu.
+                held_rects.clear();
+                guides.clear();
+                stuck_measurements.clear();
+                pending_guide = None;
+                pending_guide_shift_acked = false;
+                drawing_start_guide_snap = GuidePointSnap::default();
+                nudge_selection = None;
+                nudge_guide_idx = None;
+                last_selected_guide = None;
+                nudge_generation = nudge_generation.wrapping_add(1);
+                nudge_active_gen.store(nudge_generation, std::sync::atomic::Ordering::Relaxed);
+                active_nudge = None;
+                dragging_guide = None;
+                guide_press_pos = None;
+                last_guide_click = None;
+                dragging_stuck_pill = None;
+                stuck_press_pos = None;
+                stuck_initial_offset = (0.0, 0.0);
+                stuck_pill_drag_committed = false;
+                resizing = None;
+                context_menu = None;
+                active_toast = None;
+                toast_until = None;
+
+                if matches!(mode, InteractionMode::Idle) {
+                    // Clearing the last background-mode drawing must make the
+                    // passthrough overlay disappear immediately.
+                    overlay.set_background_frame(None);
+                    overlay.set_input_capturing(false);
+                    overlay.set_hud(None);
+                    overlay.hide();
+                } else {
+                    // Match the in-overlay Clear All action: keep measuring,
+                    // but normalize any partial interaction back to Hover and
+                    // repaint an empty HUD at the current cursor.
+                    let (x, y) = last_pointer_xy.unwrap_or((-100.0, -100.0));
+                    mode = InteractionMode::Hover {
+                        cursor: Px::new(x.round() as i32, y.round() as i32),
+                    };
+                    last_hud_redraw = Instant::now();
+                    refresh_hud(
+                        &mut overlay,
+                        &HudScene {
+                            mode: &mode,
+                            frozen_frame: frozen_frame.as_ref(),
+                            measurements: MeasurementView {
+                                held_rects: &held_rects,
+                                guides: &guides,
+                                stuck_measurements: &stuck_measurements,
+                            },
+                            pending_guide,
+                            toast: None,
+                            tolerance: current_tol_value(tol_level),
+                            bias: edge_bias,
+                            screen: ScreenSize {
+                                w: primary.bounds.w as i32,
+                                h: primary.bounds.h as i32,
+                            },
+                            flags: HudFlags {
+                                color_alternate,
+                                align_mode,
+                                alt_held,
+                                stuck_drag_committed: false,
+                            },
+                            resize_handle: None,
+                            context_menu: None,
+                        },
+                        x,
+                        y,
+                    );
+                }
+                if system_pointer_visible {
+                    overlay.set_system_pointer_visible(false);
+                    system_pointer_visible = false;
+                }
+                if pointing_hand_cursor {
+                    overlay.set_pointing_hand_cursor(false);
+                    pointing_hand_cursor = false;
+                }
+                let _ = reply.send("ok\n".to_owned());
+            }
+            MainEvent::Ipc(IpcCmd::Status { reply }) => {
+                let current_shortcuts = current_settings().shortcuts;
+                let status = DaemonStatus::snapshot(
+                    &mode,
+                    held_rects.len(),
+                    guides.len(),
+                    stuck_measurements.len(),
+                    companion_lease.attached,
+                    &current_shortcuts,
+                );
+                let response = status
+                    .to_json_line()
+                    .unwrap_or_else(|e| format!("error: serialize status: {e}\n"));
+                let _ = reply.send(response);
+            }
+            MainEvent::Ipc(IpcCmd::CompanionAttach { reply }) => {
+                let was_attached = companion_lease.attached;
+                let generation = companion_lease.attach();
+                if !was_attached {
+                    if let Some(handle) = tray.as_mut() {
+                        handle.set_active(false);
+                    }
+                    log::info!("shell companion attached; generic tray item is passive");
+                }
+                spawn_companion_lease_expiry(&combined_tx, generation);
+                let _ = reply.send(());
             }
             MainEvent::Ipc(IpcCmd::Quit) => {
                 log::info!("ipc: quit");
@@ -3499,6 +4623,7 @@ fn run_daemon() -> Result<()> {
                             frozen_frame: &mut frozen_frame,
                             capture_worker: &mut capture_worker,
                             prefs_hotkey: &mut prefs_hotkey,
+                            prepared_activations: &mut prepared_activations,
                         },
                         MeasurementView {
                             held_rects: &held_rects,
@@ -3660,19 +4785,30 @@ fn run_daemon() -> Result<()> {
                     .find(|m| m.is_primary)
                     .or_else(|| fresh.first())
                     .cloned();
+                let primary_changed = primary_monitor_changed(&primary, new_primary.as_ref());
+                if primary_changed {
+                    // A pinned frame's output name, coordinate space, or pixel
+                    // scale no longer matches the compositor snapshot it came
+                    // from. Invalidate before rebuilding or deferring overlay
+                    // state so no later activation can consume stale pixels.
+                    prepared_activations.invalidate();
+                }
                 if let Some(np) = new_primary {
-                    let changed = np.id != primary.id
-                        || np.bounds != primary.bounds
-                        || (np.scale_factor - primary.scale_factor).abs() > f64::EPSILON;
-                    if changed {
+                    if primary_changed {
                         log::info!(
-                            "display changed: {}x{} scale={} -> {}x{} scale={}",
+                            "display changed: {:?} {} {}x{} scale={} primary={} -> {:?} {} {}x{} scale={} primary={}",
+                            primary.id,
+                            primary.name,
                             primary.bounds.w,
                             primary.bounds.h,
                             primary.scale_factor,
+                            primary.is_primary,
+                            np.id,
+                            np.name,
                             np.bounds.w,
                             np.bounds.h,
                             np.scale_factor,
+                            np.is_primary,
                         );
                         primary = np;
                         set_primary_scale_factor(primary.scale_factor);
@@ -3690,6 +4826,20 @@ fn run_daemon() -> Result<()> {
                             pending_overlay_rebuild = true;
                         }
                     }
+                }
+            }
+            MainEvent::CompanionLeaseElapsed { generation } => {
+                if companion_lease.expire(generation) {
+                    prepared_activations.invalidate();
+                    if let Some(handle) = tray.as_mut() {
+                        handle.set_active(true);
+                    }
+                    log::info!("shell companion lease expired; generic tray item is active");
+                }
+            }
+            MainEvent::PreparedActivationElapsed { token } => {
+                if prepared_activations.expire(&token, Instant::now()) {
+                    log::debug!("expired unused shell companion activation frame");
                 }
             }
         }
@@ -4949,6 +6099,7 @@ struct MeasureSession<'a> {
     frozen_frame: &'a mut Option<NativeFrame>,
     capture_worker: &'a mut Option<CaptureWorker>,
     prefs_hotkey: &'a mut Option<HotkeyId>,
+    prepared_activations: &'a mut PreparedActivationStore,
 }
 
 /// Mutable persisted + transient session content cleared by the
@@ -5361,6 +6512,28 @@ fn spawn_display_poll(tx: &std::sync::mpsc::Sender<MainEvent>) {
         .ok();
 }
 
+fn spawn_companion_lease_expiry(tx: &std::sync::mpsc::Sender<MainEvent>, generation: u64) {
+    let tx = tx.clone();
+    std::thread::Builder::new()
+        .name("vernier-companion-lease".into())
+        .spawn(move || {
+            std::thread::sleep(COMPANION_LEASE_DURATION);
+            let _ = tx.send(MainEvent::CompanionLeaseElapsed { generation });
+        })
+        .ok();
+}
+
+fn spawn_prepared_activation_expiry(tx: &std::sync::mpsc::Sender<MainEvent>, token: String) {
+    let tx = tx.clone();
+    std::thread::Builder::new()
+        .name("vernier-prepared-activation-expiry".into())
+        .spawn(move || {
+            std::thread::sleep(PREPARED_ACTIVATION_TTL);
+            let _ = tx.send(MainEvent::PreparedActivationElapsed { token });
+        })
+        .ok();
+}
+
 #[derive(Debug)]
 enum MainEvent {
     Platform(PlatformEvent),
@@ -5383,6 +6556,16 @@ enum MainEvent {
     /// Internal: 2s periodic poll so the daemon notices monitor scale
     /// / resolution changes instead of running on stale geometry.
     PollDisplays,
+    /// The timeout for a particular shell-companion heartbeat. Only
+    /// the current lease generation is allowed to restore the tray.
+    CompanionLeaseElapsed {
+        generation: u64,
+    },
+    /// Hard lifetime bound for a popup-free frame pinned by the shell
+    /// companion. The token makes expiry latest-wins just like the lease.
+    PreparedActivationElapsed {
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5420,6 +6603,28 @@ enum CaptureOutcome {
 #[derive(Debug)]
 enum IpcCmd {
     Toggle,
+    Activate,
+    Deactivate,
+    Status {
+        reply: SyncSender<String>,
+    },
+    Clear {
+        reply: SyncSender<String>,
+    },
+    CompanionAttach {
+        reply: SyncSender<()>,
+    },
+    CompanionPrepareActivate {
+        reply: SyncSender<String>,
+    },
+    CompanionActivate {
+        token: String,
+        reply: SyncSender<String>,
+    },
+    CompanionCancelActivate {
+        token: String,
+        reply: SyncSender<String>,
+    },
     Quit,
     Capture(PathBuf),
     DetectEdges {
@@ -5469,6 +6674,114 @@ fn ipc_loop(
                 "toggle" => {
                     if sender.send(MainEvent::Ipc(IpcCmd::Toggle)).is_err() {
                         return;
+                    }
+                }
+                "activate" => {
+                    if sender.send(MainEvent::Ipc(IpcCmd::Activate)).is_err() {
+                        return;
+                    }
+                }
+                "deactivate" => {
+                    if sender.send(MainEvent::Ipc(IpcCmd::Deactivate)).is_err() {
+                        return;
+                    }
+                }
+                "status" => {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+                    if sender
+                        .send(MainEvent::Ipc(IpcCmd::Status { reply: tx }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(resp) => {
+                            let _ = writer.write_all(resp.as_bytes());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = writer.write_all(b"error: daemon status timed out\n");
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = writer.write_all(b"error: daemon dropped status reply\n");
+                        }
+                    }
+                }
+                "clear" => {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+                    if sender
+                        .send(MainEvent::Ipc(IpcCmd::Clear { reply: tx }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(response) => {
+                            let _ = writer.write_all(response.as_bytes());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = writer.write_all(b"error: clear request timed out\n");
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = writer.write_all(b"error: daemon dropped clear reply\n");
+                        }
+                    }
+                }
+                "companion" => {
+                    let parts: Vec<&str> = arg.split_whitespace().collect();
+                    if parts.as_slice() == ["attach"] {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+                        if sender
+                            .send(MainEvent::Ipc(IpcCmd::CompanionAttach { reply: tx }))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(()) => {
+                                let _ = writer.write_all(b"ok\n");
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let _ = writer.write_all(b"error: companion attach timed out\n");
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                let _ =
+                                    writer.write_all(b"error: daemon dropped companion reply\n");
+                            }
+                        }
+                        continue;
+                    }
+
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+                    let ipc = match parts.as_slice() {
+                        ["prepare-activate"] => IpcCmd::CompanionPrepareActivate { reply: tx },
+                        ["activate", token] => IpcCmd::CompanionActivate {
+                            token: (*token).to_owned(),
+                            reply: tx,
+                        },
+                        ["cancel-activate", token] => IpcCmd::CompanionCancelActivate {
+                            token: (*token).to_owned(),
+                            reply: tx,
+                        },
+                        _ => {
+                            let _ = writer.write_all(
+                                b"error: companion attach|prepare-activate|activate TOKEN|cancel-activate TOKEN\n",
+                            );
+                            continue;
+                        }
+                    };
+                    if sender.send(MainEvent::Ipc(ipc)).is_err() {
+                        return;
+                    }
+                    match rx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(response) => {
+                            let _ = writer.write_all(response.as_bytes());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = writer.write_all(b"error: companion request timed out\n");
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = writer.write_all(b"error: daemon dropped companion reply\n");
+                        }
                     }
                 }
                 "quit" => {
@@ -5593,7 +6906,11 @@ fn ipc_loop(
                     });
                     break;
                 }
-                other => log::debug!("ipc unknown command: {other:?}"),
+                other => {
+                    log::debug!("ipc unknown command: {other:?}");
+                    let _ =
+                        writer.write_all(format!("error: unknown command: {other}\n").as_bytes());
+                }
             }
         }
     }
@@ -6192,12 +7509,16 @@ fn build_hud_menu_items_from_settings(
         .collect()
 }
 
-/// Render a configured accelerator using compact platform-appropriate
-/// glyphs. Parsing first is important: an empty or invalid setting has
-/// no active binding, so the menu must show no hint rather than
-/// advertising a shortcut that cannot fire.
+/// Canonicalize one configured accelerator for status/menu consumers.
+/// Empty or invalid settings return `None`, because they have no active
+/// binding and must not be advertised by either UI.
+fn canonical_configured_shortcut(stored: &str) -> Option<String> {
+    Accelerator::parse(stored).map(|accelerator| accelerator.to_string_key())
+}
+
+/// Render a configured accelerator using compact platform-appropriate glyphs.
 fn format_menu_shortcut(stored: &str, super_glyph: &str) -> Option<String> {
-    let canonical = Accelerator::parse(stored)?.to_string_key();
+    let canonical = canonical_configured_shortcut(stored)?;
     Some(
         canonical
             .split('+')
@@ -6485,6 +7806,59 @@ fn toggle_measurement(
     color_alternate: bool,
     prefs_accel: Option<Accelerator>,
 ) {
+    let _ = toggle_measurement_with_frame(session, content, color_alternate, prefs_accel, None);
+}
+
+fn resolve_measurement_capture(
+    platform: &dyn Platform,
+    monitor: MonitorId,
+    prepared_frame: Option<NativeFrame>,
+    freeze_screen: bool,
+) -> std::result::Result<(Option<NativeFrame>, Option<Frame>), vernier_platform::PlatformError> {
+    match prepared_frame {
+        Some(frame) => {
+            let background = if freeze_screen {
+                Some(frame.to_rgba_frame()?)
+            } else {
+                None
+            };
+            Ok((Some(frame), background))
+        }
+        None => match platform.capture_screen_native(monitor) {
+            Ok(frame) => {
+                let background = if freeze_screen {
+                    platform.capture_screen(monitor).ok()
+                } else {
+                    None
+                };
+                Ok((Some(frame), background))
+            }
+            Err(error) => {
+                log::warn!(
+                    "measurement mode: ON (no frame yet — capture failed: {error}). \
+                     Press 'r' once a frame is available."
+                );
+                Ok((None, None))
+            }
+        },
+    }
+}
+
+/// Toggle measurement, optionally entering with a frame pinned by the shell
+/// companion before its popup was mapped. `Some(frame)` is never allowed to
+/// fall back to the capture backend: the exact prepared pixels must drive both
+/// edge detection and the frozen background.
+fn toggle_measurement_with_frame(
+    session: &mut MeasureSession,
+    content: MeasurementView,
+    color_alternate: bool,
+    prefs_accel: Option<Accelerator>,
+    prepared_frame: Option<NativeFrame>,
+) -> bool {
+    // Every actual mode transition invalidates an unused companion frame,
+    // including tray, hotkey, menu, and keyboard paths. Prepared activation
+    // has already consumed its token before it reaches this function.
+    session.prepared_activations.invalidate();
     let monitor = session.monitor;
     let platform = session.platform;
     let mode = &mut *session.mode;
@@ -6501,35 +7875,43 @@ fn toggle_measurement(
     if matches!(mode, InteractionMode::Idle) {
         // Going ON — recapture the screen for edge detection, restore
         // input grab, and re-render any persisted content alongside.
-        match platform.capture_screen_native(monitor) {
-            Ok(frame) => {
-                log::info!(
-                    "measurement mode: ON (frozen {}×{} {:?})",
-                    frame.width,
-                    frame.height,
-                    frame.format
-                );
-                // Push the captured frame to the overlay as its
-                // background so the user sees a literal snapshot —
-                // anything moving underneath (browser scroll, video)
-                // becomes invisible while measuring. Backends that
-                // don't implement set_background_frame fall through to
-                // the default no-op (transparent overlay, live content
-                // visible), which is functionally fine since edge
-                // detection still uses the frozen NativeFrame.
-                if effective_freeze_screen() {
-                    if let Ok(packed) = platform.capture_screen(monitor) {
+        let capture = resolve_measurement_capture(
+            platform.as_ref(),
+            monitor,
+            prepared_frame,
+            effective_freeze_screen(),
+        );
+        match capture {
+            Ok((frame, background)) => {
+                if let Some(frame) = frame {
+                    log::info!(
+                        "measurement mode: ON (frozen {}×{} {:?})",
+                        frame.width,
+                        frame.height,
+                        frame.format
+                    );
+                    // Push the captured frame to the overlay as its
+                    // background so the user sees a literal snapshot —
+                    // anything moving underneath (browser scroll, video)
+                    // becomes invisible while measuring. Backends that
+                    // don't implement set_background_frame fall through to
+                    // the default no-op (transparent overlay, live content
+                    // visible), which is functionally fine since edge
+                    // detection still uses the frozen NativeFrame.
+                    if let Some(packed) = background {
                         overlay.set_background_frame(Some(packed));
                     }
+                    *frozen_frame = Some(frame);
+                } else {
+                    *frozen_frame = None;
                 }
-                *frozen_frame = Some(frame);
             }
             Err(e) => {
-                log::warn!(
-                    "measurement mode: ON (no frame yet — capture failed: {e}). \
-                     Press 'r' once a frame is available."
-                );
-                *frozen_frame = None;
+                // Only prepared-frame conversion can fail here. Ordinary
+                // capture errors resolve to `(None, None)` above and retain
+                // Vernier's legacy behavior of entering without edge data.
+                log::warn!("prepared measurement activation aborted: {e}");
+                return false;
             }
         }
         // Live mode → spawn the background capture worker so cursor
@@ -6571,7 +7953,7 @@ fn toggle_measurement(
         hud.stuck_measurements = stuck_measurements.to_vec();
         overlay.set_hud(Some(hud));
         overlay.show();
-        return;
+        return true;
     }
     // Stop the capture worker on every measure-mode OFF transition,
     // both passthrough-with-content and clean-exit. The thread joins
@@ -6629,6 +8011,7 @@ fn toggle_measurement(
         overlay.set_input_capturing(false);
         overlay.set_hud(None);
     }
+    true
 }
 
 fn update_cursor_in_mode(mode: &mut InteractionMode, cursor_px: Px) {
