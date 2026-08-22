@@ -69,6 +69,9 @@
         flex: none;
         width: 22px;
         height: 22px;
+        /* The base button rule's min-height would win over height and
+           leave this taller than the 22px status pill it sits beside. */
+        min-height: 22px;
         padding: 0;
         border: 1px solid var(--figma-color-border, #e5e5e5);
         border-radius: 4px;
