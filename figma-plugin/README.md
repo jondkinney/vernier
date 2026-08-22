@@ -91,9 +91,13 @@ with the final listing URL after publication.
   reporting **Connected**, sends zoom leases with protocol and editor context,
   marks hidden Figma tabs inactive, retries with bounded backoff, and resends
   the latest value immediately after a reconnect. When Figma pauses the
-  sandbox (as it does in background tabs), zoom requests go unanswered and
-  the UI leases its zoom inactive after two silent heartbeats, so a visible
-  tab's live zoom stays authoritative over a frozen one.
+  sandbox (as it does in background tabs and windows), zoom requests go
+  unanswered and the UI leases its zoom inactive after two silent
+  heartbeats, so a visible tab's live zoom stays authoritative over a
+  frozen one. Once verified, every heartbeat sends a message even when the
+  UI cannot vouch for its zoom — Vernier reads liveness from message
+  arrival, and a silent connection would be dropped and thrash through
+  reconnects.
 - Vernier accepts only the opaque (`Origin: null`) plugin UI origin or exact
   first-party HTTPS Figma origins, bounds connection and message sizes, and
   expires stale zoom leases. The bridge carries no document data or privileged

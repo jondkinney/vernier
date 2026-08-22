@@ -317,24 +317,24 @@
           // Recompute visibility at send time: Figma tab switches do not
           // always deliver a visibilitychange event to this iframe.
           active = document.visibilityState === "visible";
-          if (
-            !socket ||
-            socket.readyState !== WebSocket.OPEN ||
-            !verified ||
-            (active && awaitingFreshZoom) ||
-            !validZoom(lastZoom)
-          ) {
+          if (!socket || socket.readyState !== WebSocket.OPEN || !verified) {
             return;
           }
 
-          // A paused sandbox cannot vouch for lastZoom, so lease it
-          // inactive until responses resume.
-          const leaseActive =
-            active && heartbeatsSinceZoomResponse < SANDBOX_STALE_HEARTBEATS;
+          // The lease is active only when the sandbox is answering and
+          // the zoom is known fresh. Otherwise this send still goes out
+          // as a revocation: Vernier reads liveness from message
+          // arrival, so a silent plugin would be disconnected even
+          // though its socket is healthy.
+          const vouched =
+            validZoom(lastZoom) &&
+            !awaitingFreshZoom &&
+            heartbeatsSinceZoomResponse < SANDBOX_STALE_HEARTBEATS;
+          const leaseActive = active && vouched;
+          const value = validZoom(lastZoom) ? lastZoom : 1;
 
           const changed =
-            lastSentZoom == null ||
-            Math.abs(lastZoom - lastSentZoom) > ZOOM_EPSILON;
+            lastSentZoom == null || Math.abs(value - lastSentZoom) > ZOOM_EPSILON;
           const activityChanged = lastSentActive !== leaseActive;
           if (!force && !changed && !activityChanged) return;
 
@@ -342,14 +342,14 @@
             socket.send(
               JSON.stringify({
                 type: "zoom",
-                value: lastZoom,
+                value,
                 protocol: PROTOCOL_VERSION,
                 client: "figma",
                 editorType,
                 active: leaseActive,
               }),
             );
-            lastSentZoom = lastZoom;
+            lastSentZoom = value;
             lastSentActive = leaseActive;
           } catch (_error) {
             // The socket's close event owns reconnection and user-visible state.

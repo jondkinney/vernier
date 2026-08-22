@@ -376,14 +376,21 @@ test("UI revokes a hidden tab and refreshes zoom before reactivating it", () => 
   });
 
   ui.scheduler.run("interval", 750);
-  assert.equal(
-    socket.sent.length,
-    3,
-    "a heartbeat must not reactivate the cached zoom while refresh is pending",
+  assert.deepEqual(
+    socket.sent[3],
+    {
+      type: "zoom",
+      value: 0.5,
+      protocol: 1,
+      client: "figma",
+      editorType: "figma",
+      active: false,
+    },
+    "a heartbeat keeps the lease revoked while refresh is pending",
   );
 
   ui.sendPluginMessage({ type: "zoom", value: 0.75 });
-  assert.deepEqual(socket.sent[3], {
+  assert.deepEqual(socket.sent[4], {
     type: "zoom",
     value: 0.75,
     protocol: 1,
@@ -394,10 +401,54 @@ test("UI revokes a hidden tab and refreshes zoom before reactivating it", () => 
 
   ui.scheduler.run("interval", 750);
   assert.deepEqual(
+    socket.sent[5],
     socket.sent[4],
-    socket.sent[3],
     "the active lease retains the complete schema on heartbeat",
   );
+});
+
+test("UI keeps the connection fed when the sandbox never answers", () => {
+  const ui = loadUi();
+  ui.sendPluginMessage({ type: "context", editorType: "figma" });
+
+  // No zoom response ever arrives (Figma paused the sandbox before the
+  // first answer). Verification and every heartbeat must still send a
+  // protocol message, or Vernier's read timeout drops the socket and
+  // the plugin thrashes through reconnects.
+  const socket = ui.sockets[0];
+  socket.open();
+  socket.receive({
+    type: "hello",
+    protocol: 1,
+    server: "vernier",
+    version: "0.4.6",
+  });
+  assert.deepEqual(socket.sent[1], {
+    type: "zoom",
+    value: 1,
+    protocol: 1,
+    client: "figma",
+    editorType: "figma",
+    active: false,
+  });
+
+  ui.scheduler.run("interval", 750);
+  assert.deepEqual(
+    socket.sent[2],
+    socket.sent[1],
+    "heartbeats keep proving liveness with a revoked placeholder lease",
+  );
+
+  // The sandbox wakes up: the real zoom immediately activates the lease.
+  ui.sendPluginMessage({ type: "zoom", value: 1.9674 });
+  assert.deepEqual(socket.sent[3], {
+    type: "zoom",
+    value: 1.9674,
+    protocol: 1,
+    client: "figma",
+    editorType: "figma",
+    active: true,
+  });
 });
 
 test("UI leases inactive when the sandbox stops answering zoom requests", () => {
