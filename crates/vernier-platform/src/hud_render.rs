@@ -846,13 +846,21 @@ fn draw_corner_indicator(
 ) {
     let _ = buf_h;
     let margin = 12.0 * scale_f;
+    // macOS: the overlay spans the full screen including the menu bar,
+    // so a 12px top margin draws the pill over the clock. 50 logical px
+    // clears the tallest (notched) menu bar with room to spare and still
+    // reads naturally in full screen, where the bar is hidden.
+    #[cfg(target_os = "macos")]
+    let top_margin = 50.0 * scale_f;
+    #[cfg(not(target_os = "macos"))]
+    let top_margin = margin;
     push_pill(
         pixmap,
         pills,
         text.to_string(),
         PillAnchorAt {
             x: buf_w - margin,
-            y: margin,
+            y: top_margin,
             anchor: PillAnchor::AnchorTopRight,
         },
         BufSize { w: buf_w, h: buf_h },
