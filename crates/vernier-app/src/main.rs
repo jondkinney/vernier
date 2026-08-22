@@ -3732,6 +3732,7 @@ fn run_daemon() -> Result<()> {
                         Ok(f) => {
                             log::info!("frame refreshed");
                             frozen_frame = Some(f);
+                            refresh_figma_correction_latch();
                             // Refresh the freeze-screen visual from
                             // the same clean (post-blink) capture.
                             if effective_freeze_screen() {
@@ -4951,7 +4952,7 @@ fn current_measurement_format() -> HudMeasurementFormat {
     } else {
         String::new()
     };
-    let (dimension_divisor, figma_indicator) = current_figma_correction(&s);
+    let (dimension_divisor, figma_indicator) = effective_figma_correction(&s);
     HudMeasurementFormat {
         unit_suffix,
         rounding: match s.general.rounding_mode {
@@ -5041,7 +5042,7 @@ fn populate_hud_appearance(hud: &mut Hud, alt_held: bool) {
     } else {
         String::new()
     };
-    let (dimension_divisor, corner_indicator) = current_figma_correction(&s);
+    let (dimension_divisor, corner_indicator) = effective_figma_correction(&s);
     hud.measurement_format = HudMeasurementFormat {
         unit_suffix,
         rounding: match s.general.rounding_mode {
@@ -6064,28 +6065,156 @@ fn figma_context_is_active(
         || focused_app.is_some_and(native_figma_app_matches)
 }
 
+/// Correction outcomes, tracked so state transitions (and only
+/// transitions — this runs on every HUD redraw) can be logged. The
+/// applied percent is part of the state so zoom changes surface too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FigmaCorrectionState {
+    Disabled,
+    NoLease,
+    NotFocused,
+    Applied(i64),
+}
+
+fn log_figma_correction_state(state: FigmaCorrectionState) {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<FigmaCorrectionState>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = last.lock() else { return };
+    if last.as_ref() == Some(&state) {
+        return;
+    }
+    match &state {
+        FigmaCorrectionState::Disabled => {
+            log::info!("figma correction: disabled in settings")
+        }
+        FigmaCorrectionState::NoLease => {
+            log::info!("figma correction: no fresh plugin lease; measuring screen pixels")
+        }
+        FigmaCorrectionState::NotFocused => {
+            log::info!("figma correction: Figma is not the focused app; measuring screen pixels")
+        }
+        FigmaCorrectionState::Applied(pct) => {
+            log::info!("figma correction: applying canvas zoom {pct}%")
+        }
+    }
+    *last = Some(state);
+}
+
 fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
     if !settings.integrations.figma_zoom_correction {
+        log_figma_correction_state(FigmaCorrectionState::Disabled);
         return (1.0, None);
     }
     let zoom = match vernier_platform::figma_bridge::current_figma_zoom() {
         Some(z) if z > 0.0 => z,
-        _ => return (1.0, None),
+        _ => {
+            log_figma_correction_state(FigmaCorrectionState::NoLease);
+            return (1.0, None);
+        }
     };
     if !figma_context_is_active(
         settings,
         &current_active_window(),
         current_focused_app().as_ref(),
     ) {
+        log_figma_correction_state(FigmaCorrectionState::NotFocused);
         return (1.0, None);
     }
     let pct = (zoom * 100.0).round() as i64;
+    log_figma_correction_state(FigmaCorrectionState::Applied(pct));
     (zoom, Some(format!("F \u{00B7} {pct}%")))
+}
+
+/// Correction sampled at measurement activation and held for the whole
+/// session. The overlay grabs input while measuring, so the first click
+/// can make macOS report Vernier as the frontmost app, and an occluded
+/// or backgrounded Figma revokes its own zoom lease — but the frozen
+/// pixels being measured were captured at the latched zoom, so live
+/// re-evaluation mid-session is wrong as well as flaky.
+fn figma_correction_latch_lock() -> &'static std::sync::Mutex<Option<(f64, Option<String>)>> {
+    use std::sync::{Mutex, OnceLock};
+    static SLOT: OnceLock<Mutex<Option<(f64, Option<String>)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn latch_figma_correction() {
+    let sampled = current_figma_correction(&current_settings());
+    match &sampled.1 {
+        Some(indicator) => {
+            log::info!("figma correction: latched {indicator} for this measurement session")
+        }
+        None => log::debug!("figma correction: no correction to latch; measuring screen pixels"),
+    }
+    if let Ok(mut latch) = figma_correction_latch_lock().lock() {
+        *latch = Some(sampled);
+    }
+}
+
+/// Recapture (R) can only happen while the overlay holds input, so a
+/// missing live correction usually means Vernier itself has the focus
+/// or has occluded Figma. Keep the capture-time correction in that
+/// case; adopt the live sample only when it actually carries one.
+fn refresh_figma_correction_latch() {
+    let sampled = current_figma_correction(&current_settings());
+    if let Ok(mut latch) = figma_correction_latch_lock().lock() {
+        match (&*latch, &sampled) {
+            (Some((_, Some(_))), (_, None)) => {}
+            _ => *latch = Some(sampled),
+        }
+    }
+}
+
+fn clear_figma_correction_latch() {
+    if let Ok(mut latch) = figma_correction_latch_lock().lock() {
+        *latch = None;
+    }
+}
+
+/// The measurement-session latch when one is set, the live evaluation
+/// otherwise (idle and background rendering).
+fn effective_figma_correction(settings: &Settings) -> (f64, Option<String>) {
+    if let Ok(latch) = figma_correction_latch_lock().lock() {
+        if let Some(latched) = latch.clone() {
+            return latched;
+        }
+    }
+    current_figma_correction(settings)
 }
 
 #[cfg(test)]
 mod figma_activation_tests {
     use super::*;
+
+    /// One combined test: the latch is process-global state, so
+    /// asserting its lifecycle in a single test keeps parallel test
+    /// threads from interleaving on it.
+    #[test]
+    fn measurement_latch_overrides_live_correction_until_cleared() {
+        let mut settings = Settings::default();
+        // Live evaluation must be deterministic here: disabled short-circuits
+        // before the bridge and focus globals are consulted.
+        settings.integrations.figma_zoom_correction = false;
+
+        clear_figma_correction_latch();
+        assert_eq!(effective_figma_correction(&settings), (1.0, None));
+
+        *figma_correction_latch_lock().lock().unwrap() =
+            Some((1.9674, Some("F \u{00B7} 197%".into())));
+        let (divisor, indicator) = effective_figma_correction(&settings);
+        assert_eq!(divisor, 1.9674);
+        assert_eq!(indicator.as_deref(), Some("F \u{00B7} 197%"));
+
+        // A recapture with no live correction available (Vernier itself
+        // focused, lease revoked) keeps the capture-time latch.
+        refresh_figma_correction_latch();
+        let (divisor, indicator) = effective_figma_correction(&settings);
+        assert_eq!(divisor, 1.9674);
+        assert!(indicator.is_some());
+
+        clear_figma_correction_latch();
+        assert_eq!(effective_figma_correction(&settings), (1.0, None));
+    }
 
     fn app(id: &str, name: &str, executable: Option<&str>) -> vernier_platform::AppIdentity {
         vernier_platform::AppIdentity {
@@ -8195,6 +8324,10 @@ fn toggle_measurement_with_frame(
                 LIVE_CAPTURE_INTERVAL,
             ));
         }
+        // Sample the correction while Figma is still the frontmost app
+        // and its plugin still holds an unrevoked lease; grabbing input
+        // below can end both.
+        latch_figma_correction();
         *mode = InteractionMode::Hover {
             cursor: Px::default(),
         };
@@ -8256,6 +8389,7 @@ fn toggle_measurement_with_frame(
             stuck_measurements.len(),
         );
         *mode = InteractionMode::Idle;
+        clear_figma_correction_latch();
         *frozen_frame = None;
         overlay.set_input_capturing(false);
         // Drop the snapshot so the desktop is visible again in
@@ -8275,6 +8409,7 @@ fn toggle_measurement_with_frame(
         // Going OFF clean: hide the overlay and detach all state.
         log::info!("measurement mode: OFF");
         *mode = InteractionMode::Idle;
+        clear_figma_correction_latch();
         *frozen_frame = None;
         overlay.set_background_frame(None);
         overlay.hide();
