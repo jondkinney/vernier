@@ -167,6 +167,33 @@ loads when you open it. On macOS it promotes itself to a foreground
 app via `TransformProcessType` so it can take key focus despite the
 daemon being `LSUIElement`.
 
+### Figma integration (optional)
+
+Vernier Bridge reports the active Figma file's viewport zoom to the local
+Vernier process, allowing measurements to be shown in Figma canvas pixels at
+any zoom level. From Figma it reads only `figma.viewport.zoom` and whether the
+editor is in Design or Dev Mode; its panel also reports whether its tab is
+visible. It does not read or change layers, text, comments, selections, or
+other file content. Its only network connection is a loopback WebSocket to
+`127.0.0.1:8765` on the same computer.
+
+The Community listing is pending. Maintainers can test the development build
+using Figma Desktop on macOS by following
+[figma-plugin/README.md](figma-plugin/README.md). Figma requires its desktop app
+for importing and publishing development plugins.
+
+Zoom correction is currently focus-safe in Figma Desktop on macOS and Figma
+Web under Hyprland on Linux. The plugin can connect from Figma Web on other
+Linux desktops after Community publication, but Vernier deliberately leaves
+measurements in ordinary screen pixels there until it has a trustworthy
+active-window backend. The rest of Vernier continues to work normally, with or
+without Figma or Quickshell.
+
+Run Vernier Bridge once in each Figma file or tab where you want zoom-corrected
+measurements, then keep its small connection window open. Figma allows only one
+plugin to run at a time, so starting another plugin stops the bridge; run
+Vernier Bridge again afterward.
+
 ## Hyprland setup
 
 The Linux tray icon registers as a standard `StatusNotifierItem`, so a tray

@@ -27,7 +27,34 @@ is no release script to run.
      up to ~30 min for the Linux tarballs to land on the Release
      before pinning per-arch sha256sums.
 
-No local steps, no `release.sh`.
+The native release has no local steps and no `release.sh`. Figma plugin changes
+also follow the manual publication lane below.
+
+## Publishing Figma plugin changes
+
+Figma plugin publication is a separate manual lane because Figma only permits
+plugin registration and publication from its macOS or Windows desktop app.
+End-to-end Vernier integration testing must use macOS because Vernier does not
+ship a Windows runtime. When a release changes `figma-plugin/`:
+
+1. Check out the exact commit being released on a Mac with the matching Vernier
+   release build installed.
+2. Import or locate `figma-plugin/manifest.json` in Figma Desktop and run the
+   plugin in both Design and Dev Mode.
+3. Verify the connection stays live at unchanged zoom for at least 30 seconds,
+   reconnects after Vernier restarts, and reports correctly at 50%, 100%, and
+   200% zoom. Repeat at Retina 2× display scale.
+4. In **Plugins → Manage plugins**, publish a new version and include the
+   relevant Vernier release notes.
+5. Verify the Community listing from Figma Web under Hyprland after
+   publication, including switching between two files at different zooms and
+   testing a fractional Wayland display scale where available.
+
+The first publication also requires Figma account two-factor authentication,
+listing artwork and security disclosures, and Community review. The disclosure
+must state that Vernier Bridge sends viewport zoom, editor type, and active-tab
+state only to the loopback Vernier process at `127.0.0.1:8765`; it does not read
+or modify the Figma document.
 
 ## One-time setup
 
