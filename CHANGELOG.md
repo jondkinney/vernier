@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/jondkinney/vernier/compare/v0.4.5...v0.5.0) - 2026-08-22
+
+### Added
+
+- *(figma)* add the official zoom bridge plugin
+- *(app)* add the shell companion control protocol
+- *(platform)* support exact synchronous Wayland captures
+
+### Fixed
+
+- *(wayland)* derive scale correctly for transformed outputs
+
+### Other
+
+- *(linux)* consume the newest queued PipeWire frame
+
 ## [0.4.5](https://github.com/jondkinney/vernier/compare/v0.4.4...v0.4.5) - 2026-08-21
 
 ### Fixed

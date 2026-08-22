@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-rs"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-rs-core"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "log",
@@ -3757,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-rs-platform"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "vernier-rs-ui"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "eframe",
