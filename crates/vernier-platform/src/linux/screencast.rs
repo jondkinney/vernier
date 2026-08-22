@@ -59,6 +59,15 @@ pub(crate) struct CapturedFrame {
     pub pixels: Vec<u8>,
 }
 
+/// Select the newest item from a FIFO drain and report how many older items
+/// were discarded. Keeping the full vector alive until selection is complete
+/// matters for PipeWire: returning an old input buffer while still draining
+/// can let the producer refill it and keep the drain loop running indefinitely.
+fn take_fifo_newest<T>(mut ready: Vec<T>) -> Option<(T, usize)> {
+    let discarded = ready.len().saturating_sub(1);
+    ready.pop().map(|newest| (newest, discarded))
+}
+
 /// Live capture service: owns the PipeWire main loop on a background thread
 /// and exposes the latest frame per portal stream node id.
 pub(crate) struct CaptureService {
@@ -216,12 +225,28 @@ fn create_stream(
         })
         .process(|stream, ud| {
             ud.process_calls += 1;
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            // The 6K capture buffer is ~85 MB, so copying queued frames one by
+            // one can leave our cache several compositor frames behind. Drain
+            // the finite input-buffer pool while retaining ownership of every
+            // dequeued buffer, then copy only PipeWire's FIFO-newest frame.
+            // `take_fifo_newest` drops/requeues the older buffers before the
+            // expensive mmap + copy begins.
+            let mut ready = Vec::new();
+            while let Some(buffer) = stream.dequeue_buffer() {
+                ready.push(buffer);
+            }
+            let Some((mut buffer, discarded)) = take_fifo_newest(ready) else {
                 if ud.process_calls <= 3 {
                     log::debug!("pw {}: dequeue_buffer returned None", ud.node_id);
                 }
                 return;
             };
+            if discarded > 0 && ud.process_calls <= 3 {
+                log::debug!(
+                    "pw {}: discarded {discarded} queued frame(s) before copying FIFO-newest",
+                    ud.node_id
+                );
+            }
             let datas = buffer.datas_mut();
             let Some(data) = datas.iter_mut().next() else {
                 if ud.process_calls <= 3 {
@@ -250,7 +275,7 @@ fn create_stream(
                 }
                 return;
             };
-            if ud.process_calls == 0 {
+            if ud.process_calls == 1 {
                 log::debug!(
                     "pw {}: first process: type={:?} flags={:?} fd={} size={} offset={} stride={} maxsize={}",
                     ud.node_id, dtype, dflags, dfd, size, chunk_offset, stride, dmaxsize
@@ -302,6 +327,7 @@ fn create_stream(
                 }
                 return;
             };
+            ud.frame_count += 1;
             let frame = CapturedFrame {
                 width: ud.format.size().width,
                 height: ud.format.size().height,
@@ -309,15 +335,14 @@ fn create_stream(
                 format: ud.format.format(),
                 pixels,
             };
-            if ud.frame_count == 0 {
+            if ud.frame_count == 1 {
                 log::info!(
                     "pw {}: first frame {}x{} {} bytes, format {:?}",
                     ud.node_id, frame.width, frame.height, size, frame.format
                 );
             }
-            ud.frame_count += 1;
-            if let Ok(mut g) = ud.frames.lock() {
-                g.insert(ud.node_id, frame);
+            if let Ok(mut frames) = ud.frames.lock() {
+                frames.insert(ud.node_id, frame);
             }
         })
         .register()
@@ -531,4 +556,16 @@ fn save_token(token: &str) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&path, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifo_drain_selects_last_item_and_counts_discarded_items() {
+        assert_eq!(take_fifo_newest(Vec::<u8>::new()), None);
+        assert_eq!(take_fifo_newest(vec![7]), Some((7, 0)));
+        assert_eq!(take_fifo_newest(vec![1, 2, 3, 4]), Some((4, 3)));
+    }
 }
