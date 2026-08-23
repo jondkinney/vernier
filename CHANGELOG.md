@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/jondkinney/vernier/compare/v0.4.5...v0.5.0) - 2026-08-23
+
+### Added
+
+- *(figma)* add the official zoom bridge plugin
+- *(app)* add the shell companion control protocol
+- *(platform)* support exact synchronous Wayland captures
+
+### Fixed
+
+- *(linux)* recognize Chromium Figma window titles
+- *(figma)* keep the focus gate blind to Vernier itself
+- *(figma)* latch the correction per measurement session
+- *(figma)* clear the menu bar with the corner indicator
+- *(figma)* make accepted bridge sockets blocking
+- *(wayland)* derive scale correctly for transformed outputs
+
+### Other
+
+- *(app)* alias the figma correction tuple
+- *(linux)* consume the newest queued PipeWire frame
+- *(figma)* point install surfaces at the live listing
+
 ## [0.4.5](https://github.com/jondkinney/vernier/compare/v0.4.4...v0.4.5) - 2026-08-21
 
 ### Fixed
