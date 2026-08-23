@@ -39,8 +39,8 @@ ship a Windows runtime. When a release changes `figma-plugin/`:
 
 1. Check out the exact commit being released on a Mac with the matching Vernier
    release build installed.
-2. Import or locate `figma-plugin/manifest.json` in Figma Desktop and run the
-   plugin in both Design and Dev Mode.
+2. Import or locate `figma-plugin/plugin/manifest.json` in Figma Desktop and
+   run the plugin in both Design and Dev Mode.
 3. Verify the connection stays live at unchanged zoom for at least 30 seconds,
    reconnects after Vernier restarts, and reports correctly at 50%, 100%, and
    200% zoom. Repeat at Retina 2× display scale.

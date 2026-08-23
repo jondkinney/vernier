@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const PLUGIN_DIR = path.resolve(__dirname, "..");
+const PLUGIN_DIR = path.resolve(__dirname, "..", "plugin");
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));

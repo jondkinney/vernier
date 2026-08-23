@@ -15,14 +15,14 @@ inspect selections or document nodes.
 
 ## Import the registered plugin for development
 
-The checked-in `manifest.json` contains Vernier Bridge's permanent Figma plugin
-ID, `1673041143009172236`. Keep that ID unchanged so development builds and
-future Community releases update the existing plugin listing.
+The checked-in `plugin/manifest.json` contains Vernier Bridge's permanent Figma
+plugin ID, `1673041143009172236`. Keep that ID unchanged so development builds
+and future Community releases update the existing plugin listing.
 
 1. On a Mac or Windows computer, open **Figma Desktop** and sign in to the
    account that owns the Community listing.
 2. Choose **Plugins → Development → Import plugin from manifest…** and select
-   this directory's `manifest.json`.
+   this directory's `plugin/manifest.json`.
 3. Run **Vernier Bridge** from **Plugins → Development** in a test file.
 
 A fork that intentionally creates a separate Community plugin must first
@@ -78,10 +78,10 @@ Hyprland users install it from that listing and run it in Figma Web.
 
 ## Runtime behavior
 
-- `ui.html` owns all timers because Figma's browser-backed UI iframe provides
-  reliable browser timers. It requests the current zoom every 100 ms and sends
-  an unchanged value every 750 ms as a lease heartbeat.
-- `main.js` answers each request with the read-only `figma.viewport.zoom`
+- `plugin/ui.html` owns all timers because Figma's browser-backed UI iframe
+  provides reliable browser timers. It requests the current zoom every 100 ms
+  and sends an unchanged value every 750 ms as a lease heartbeat.
+- `plugin/main.js` answers each request with the read-only `figma.viewport.zoom`
   value. It does not access the document tree.
 - The UI also owns the visible status panel and WebSocket connection to
   `ws://localhost:8765`. It verifies Vernier with a protocol handshake before

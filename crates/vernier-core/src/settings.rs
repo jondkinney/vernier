@@ -351,11 +351,11 @@ pub enum RoundingMode {
 pub struct IntegrationSettings {
     /// Divide on-screen measurements by the current Figma viewport
     /// zoom so dimensions reflect canvas pixels at any zoom level.
-    /// Requires the companion Figma plugin (`figma-plugin/`) to be
+    /// Requires the companion Figma plugin (`figma-plugin/plugin/`) to be
     /// running in the active Figma file.
     pub figma_zoom_correction: bool,
     /// TCP port the Figma plugin connects to. Must match
-    /// `figma-plugin/ui.html`.
+    /// `figma-plugin/plugin/ui.html`.
     pub figma_bridge_port: u16,
     /// Window classes treated as "browser tab" candidates for
     /// Figma detection. The daemon checks `class` against this list

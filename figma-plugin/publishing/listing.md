@@ -49,9 +49,10 @@ control or communicate with a native desktop overlay. If the browser requests
 Local network access for Figma, the user must allow it for the bridge to
 connect.
 
-## First-publication checklist
+## Publication checklist
 
-- Replace the development manifest ID with the numeric ID assigned by Figma.
+- Confirm `../plugin/manifest.json` still uses Figma plugin ID
+  `1673041143009172236`.
 - Enable two-factor authentication on the publishing Figma account.
 - Test Design Mode and Dev Mode in Figma Desktop.
 - Test the same build in Figma Web under Hyprland on Linux.
