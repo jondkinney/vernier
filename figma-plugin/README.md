@@ -9,29 +9,25 @@ deletes document nodes. It sends the positive numeric viewport zoom, Design or
 Dev editor type, and active-tab flag over a localhost WebSocket; none of that
 context or any file content leaves the computer.
 
-## Register the plugin before importing it
+The manifest's `inspect` capability is Figma's required declaration for
+showing a plugin UI in Dev Mode's Plugins/Inspect panel. Vernier does not
+inspect selections or document nodes.
 
-The checked-in `manifest.json` deliberately contains this nonfunctional ID:
+## Import the registered plugin for development
 
-```json
-"id": "REPLACE_WITH_FIGMA_ASSIGNED_PLUGIN_ID"
-```
-
-Do not publish or ship that placeholder. Figma assigns the real plugin ID when
-the plugin is created from Figma Desktop:
+The checked-in `manifest.json` contains Vernier Bridge's permanent Figma plugin
+ID, `1673041143009172236`. Keep that ID unchanged so development builds and
+future Community releases update the existing plugin listing.
 
 1. On a Mac or Windows computer, open **Figma Desktop** and sign in to the
-   account that will own the Community listing.
-2. Create a new development plugin from Figma's **Plugins → Development**
-   menu. Choose a plugin with a custom UI and name it **Vernier Bridge**.
-   Figma's menu wording may be **New plugin…** or **Create new plugin…**.
-3. In the temporary plugin Figma creates, copy the assigned numeric `id` from
-   its `manifest.json`.
-4. Replace `REPLACE_WITH_FIGMA_ASSIGNED_PLUGIN_ID` in this directory's
-   `manifest.json` with that exact ID. Keep the ID in version control so every
-   future release updates the same Community plugin.
-5. In Figma Desktop, choose **Plugins → Development → Import plugin from
-   manifest…** and select this directory's `manifest.json`.
+   account that owns the Community listing.
+2. Choose **Plugins → Development → Import plugin from manifest…** and select
+   this directory's `manifest.json`.
+3. Run **Vernier Bridge** from **Plugins → Development** in a test file.
+
+A fork that intentionally creates a separate Community plugin must first
+register its own plugin in Figma Desktop and replace the ID with the one Figma
+assigns to that new listing.
 
 Figma currently requires its macOS or Windows desktop app for local plugin
 development and Community publishing. Vernier itself currently supports this
@@ -65,7 +61,8 @@ that permission, and choose **Retry now**.
 Publishing is done from Figma Desktop using the development plugin's publish
 action. Before submitting:
 
-- confirm the assigned Figma plugin ID has replaced the placeholder;
+- confirm the manifest still uses the assigned plugin ID
+  `1673041143009172236`;
 - test both Design Mode and Dev Mode against the release build of Vernier;
 - prepare the Community icon, cover art, description, support link, and release
   notes required by Figma;

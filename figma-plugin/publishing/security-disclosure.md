@@ -6,6 +6,9 @@ that loopback WebSocket traffic uses TLS.
 
 - **Document access:** none. The plugin reads `figma.viewport.zoom` and
   `figma.editorType`; it does not enumerate or access document nodes.
+- **Dev Mode capability:** the manifest declares `inspect` because Figma
+  requires it to show the plugin UI in Dev Mode's Plugins/Inspect panel.
+  Vernier does not inspect selections or document nodes.
 - **Native focus check:** on Hyprland, Vernier transiently reads the active OS
   window class and title, which may include a Figma file name; this value stays
   in memory and is never stored or transmitted. On macOS it checks only the

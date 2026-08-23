@@ -18,15 +18,11 @@ test("manifest is publishable, narrowly scoped, and supports Design and Dev Mode
   const manifest = JSON.parse(readPluginFile("manifest.json"));
 
   assert.equal(manifest.name, "Vernier Bridge");
-  assert.match(
-    manifest.id,
-    /^(REPLACE_WITH_FIGMA_ASSIGNED_PLUGIN_ID|[0-9]+)$/,
-    "the plugin ID must be the explicit placeholder or a Figma-assigned numeric ID",
-  );
-  assert.notEqual(manifest.id, "vernier-bridge-dev");
+  assert.equal(manifest.id, "1673041143009172236");
   assert.equal(manifest.main, "main.js");
   assert.equal(manifest.ui, "ui.html");
   assert.deepEqual(manifest.editorType, ["figma", "dev"]);
+  assert.deepEqual(manifest.capabilities, ["inspect"]);
   assert.equal(manifest.documentAccess, "dynamic-page");
   assert.deepEqual(manifest.networkAccess.allowedDomains, [
     "ws://localhost:8765",
