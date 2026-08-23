@@ -6065,7 +6065,13 @@ fn configured_figma_window_matches(settings: &Settings, window: &ActiveWindow) -
         .iter()
         .any(|class| class.eq_ignore_ascii_case(&window.class));
     let suffix = &settings.integrations.figma_title_suffix;
-    let title_match = !suffix.trim().is_empty() && window.title.ends_with(suffix);
+    let title_match = !suffix.trim().is_empty()
+        && (window.title.ends_with(suffix)
+            || (window.class.eq_ignore_ascii_case("chromium")
+                && window
+                    .title
+                    .strip_suffix(" - Chromium")
+                    .is_some_and(|title| title.ends_with(suffix))));
     class_match && title_match
 }
 
@@ -6271,9 +6277,46 @@ mod figma_activation_tests {
         };
         assert!(!figma_context_is_active(&settings, &embedded_suffix, None,));
 
+        let chromium_branded = ActiveWindow {
+            class: "chromium".into(),
+            title: "Untitled – Figma - Chromium".into(),
+        };
+        assert!(figma_context_is_active(&settings, &chromium_branded, None,));
+
+        let wrong_class_for_brand = ActiveWindow {
+            class: "Google-chrome".into(),
+            title: "Untitled – Figma - Chromium".into(),
+        };
+        assert!(!figma_context_is_active(
+            &settings,
+            &wrong_class_for_brand,
+            None,
+        ));
+
+        let branding_not_terminal = ActiveWindow {
+            class: "chromium".into(),
+            title: "Untitled – Figma - Chromium – Documentation".into(),
+        };
+        assert!(!figma_context_is_active(
+            &settings,
+            &branding_not_terminal,
+            None,
+        ));
+
+        let embedded_figma = ActiveWindow {
+            class: "chromium".into(),
+            title: "Untitled – Figma notes - Chromium".into(),
+        };
+        assert!(!figma_context_is_active(&settings, &embedded_figma, None,));
+
         let mut empty_suffix = settings.clone();
         empty_suffix.integrations.figma_title_suffix.clear();
         assert!(!figma_context_is_active(&empty_suffix, &figma, None,));
+        assert!(!figma_context_is_active(
+            &empty_suffix,
+            &chromium_branded,
+            None,
+        ));
     }
 
     #[test]
