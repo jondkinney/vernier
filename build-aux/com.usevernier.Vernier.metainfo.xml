@@ -37,6 +37,31 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.5.0" date="2026-08-23">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>add the official zoom bridge plugin</li>
+          <li>add the shell companion control protocol</li>
+          <li>support exact synchronous Wayland captures</li>
+        </ul>
+        <p>Fixed:</p>
+        <ul>
+          <li>recognize Chromium Figma window titles</li>
+          <li>keep the focus gate blind to Vernier itself</li>
+          <li>latch the correction per measurement session</li>
+          <li>clear the menu bar with the corner indicator</li>
+          <li>make accepted bridge sockets blocking</li>
+          <li>derive scale correctly for transformed outputs</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>alias the figma correction tuple</li>
+          <li>consume the newest queued PipeWire frame</li>
+          <li>point install surfaces at the live listing</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.5" date="2026-08-21">
       <description>
         <p>Fixed:</p>
