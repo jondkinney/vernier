@@ -29,6 +29,18 @@ cd "$REPO_ROOT"
 MODE="install"
 DO_BUILD=1
 DO_RESTART=0
+readonly -a APP_ICON_PATHS=(
+    16x16/apps/vernier.png
+    22x22/apps/vernier.png
+    24x24/apps/vernier.png
+    32x32/apps/vernier.png
+    48x48/apps/vernier.png
+    64x64/apps/vernier.png
+    128x128/apps/vernier.png
+    256x256/apps/vernier.png
+    512x512/apps/vernier.png
+    scalable/apps/vernier.svg
+)
 
 while (($#)); do
     case "$1" in
@@ -95,10 +107,14 @@ case "$MODE" in
         say "installing into /usr/bin, /usr/share/..."
         sudo install -Dm755 target/release/vernier             /usr/bin/vernier
         sudo install -Dm644 packaging/vernier.desktop          /usr/share/applications/vernier.desktop
-        sudo install -d /usr/share/icons/hicolor
-        sudo cp -r assets/icons/hicolor/.                      /usr/share/icons/hicolor/
-        # Match PKGBUILD: status/ icons stay out, tray pixmap covers it.
-        sudo rm -rf /usr/share/icons/hicolor/*/status
+        # Unlike PKGBUILD's private $pkgdir, this is the live system icon tree.
+        # Install only Vernier's app icons so other packages' status icons are
+        # never copied over or removed.
+        for icon_path in "${APP_ICON_PATHS[@]}"; do
+            sudo install -Dm644 -- \
+                "assets/icons/hicolor/$icon_path" \
+                "/usr/share/icons/hicolor/$icon_path"
+        done
         sudo install -Dm644 LICENSE-MIT                        /usr/share/licenses/vernier/LICENSE-MIT
         sudo install -Dm644 LICENSE-APACHE                     /usr/share/licenses/vernier/LICENSE-APACHE
         # Best-effort icon cache refresh (gtk-update-icon-cache is
@@ -123,8 +139,8 @@ case "$MODE" in
         sudo rm -f /usr/bin/vernier
         sudo rm -f /usr/share/applications/vernier.desktop
         sudo rm -rf /usr/share/licenses/vernier
-        for size in 16x16 22x22 24x24 32x32 48x48 64x64 128x128 256x256 512x512 scalable; do
-            sudo rm -f "/usr/share/icons/hicolor/$size/apps/vernier".{png,svg} 2>/dev/null || true
+        for icon_path in "${APP_ICON_PATHS[@]}"; do
+            sudo rm -f -- "/usr/share/icons/hicolor/$icon_path"
         done
         if command -v gtk-update-icon-cache >/dev/null 2>&1; then
             sudo gtk-update-icon-cache --quiet --force /usr/share/icons/hicolor 2>/dev/null || true
