@@ -46,9 +46,11 @@ ship a Windows runtime. When a release changes `figma-plugin/`:
    200% zoom. Repeat at Retina 2× display scale.
 4. In **Plugins → Manage plugins**, publish a new version and include the
    relevant Vernier release notes.
-5. Verify the Community listing from Figma Web under Hyprland after
-   publication, including switching between two files at different zooms and
-   testing a fractional Wayland display scale where available.
+5. Verify the [Community
+   listing](https://www.figma.com/community/plugin/1673041143009172236/vernier-bridge)
+   from Figma Web under Hyprland after publication, including switching
+   between two files at different zooms and testing a fractional Wayland
+   display scale where available.
 
 The first publication also requires Figma account two-factor authentication,
 listing artwork and security disclosures, and Community review. The disclosure

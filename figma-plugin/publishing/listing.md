@@ -1,6 +1,9 @@
 # Vernier Bridge — Community listing copy
 
-Use this copy when publishing the first Community version. Keep the privacy and
+Published listing:
+<https://www.figma.com/community/plugin/1673041143009172236/vernier-bridge>
+
+Use this copy when publishing Community versions. Keep the privacy and
 native-companion disclosures intact when editing it in Figma Desktop.
 
 ## Listing fields

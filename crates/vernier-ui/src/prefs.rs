@@ -2078,15 +2078,21 @@ fn paint_figma_card(ui: &mut egui::Ui, s: &mut IntegrationSettings, figma_tab_ac
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "Community publication pending. Once approved, \
-                             install the official plugin from Figma Community. \
-                             Focus-safe correction currently supports Figma \
-                             Desktop on macOS and Figma Web under Hyprland.",
+                            "Install the official Vernier Bridge plugin from \
+                             Figma Community, then keep its panel open while \
+                             measuring. Focus-safe correction currently \
+                             supports Figma Desktop on macOS and Figma Web \
+                             under Hyprland.",
                         )
                         .color(egui::Color32::from_gray(170))
                         .size(12.0),
                     );
                     ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "Install Vernier Bridge from Figma Community",
+                        "https://www.figma.com/community/plugin/1673041143009172236/vernier-bridge",
+                    );
+                    ui.add_space(4.0);
                     ui.hyperlink_to(
                         "Maintainer setup and plugin source",
                         "https://github.com/jondkinney/vernier/tree/main/figma-plugin",

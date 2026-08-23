@@ -177,14 +177,16 @@ visible. It does not read or change layers, text, comments, selections, or
 other file content. Its only network connection is a loopback WebSocket to
 `localhost:8765` on the same computer, where Vernier listens on `127.0.0.1`.
 
-The Community listing is pending. Maintainers can test the development build
-using Figma Desktop on macOS by following
+Install the official
+[Vernier Bridge plugin](https://www.figma.com/community/plugin/1673041143009172236/vernier-bridge)
+from Figma Community. Maintainers can also run the development build using
+Figma Desktop on macOS by following
 [figma-plugin/README.md](figma-plugin/README.md). Figma requires its desktop app
 for importing and publishing development plugins.
 
 Zoom correction is currently focus-safe in Figma Desktop on macOS and Figma
 Web under Hyprland on Linux. The plugin can connect from Figma Web on other
-Linux desktops after Community publication, but Vernier deliberately leaves
+Linux desktops, but Vernier deliberately leaves
 measurements in ordinary screen pixels there until it has a trustworthy
 active-window backend. The rest of Vernier continues to work normally, with or
 without Figma or Quickshell.

@@ -75,9 +75,9 @@ action. Before submitting:
 - make the privacy disclosure explicit: zoom, editor type, and active-tab state
   are sent only to a local Vernier process over the loopback interface.
 
-After Figma approves the Community listing, Hyprland users install it from that
-listing and run it in Figma Web. Update Vernier's install UI and documentation
-with the final listing URL after publication.
+The plugin is published at
+<https://www.figma.com/community/plugin/1673041143009172236/vernier-bridge>.
+Hyprland users install it from that listing and run it in Figma Web.
 
 ## Runtime behavior
 
