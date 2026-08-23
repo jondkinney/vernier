@@ -6133,7 +6133,10 @@ fn log_figma_correction_state(state: FigmaCorrectionState) {
     *last = Some(state);
 }
 
-fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
+/// Zoom factor plus the `F · <zoom>%` indicator label, when active.
+type FigmaCorrection = (f64, Option<String>);
+
+fn current_figma_correction(settings: &Settings) -> FigmaCorrection {
     if !settings.integrations.figma_zoom_correction {
         log_figma_correction_state(FigmaCorrectionState::Disabled);
         return (1.0, None);
@@ -6164,9 +6167,9 @@ fn current_figma_correction(settings: &Settings) -> (f64, Option<String>) {
 /// or backgrounded Figma revokes its own zoom lease — but the frozen
 /// pixels being measured were captured at the latched zoom, so live
 /// re-evaluation mid-session is wrong as well as flaky.
-fn figma_correction_latch_lock() -> &'static std::sync::Mutex<Option<(f64, Option<String>)>> {
+fn figma_correction_latch_lock() -> &'static std::sync::Mutex<Option<FigmaCorrection>> {
     use std::sync::{Mutex, OnceLock};
-    static SLOT: OnceLock<Mutex<Option<(f64, Option<String>)>>> = OnceLock::new();
+    static SLOT: OnceLock<Mutex<Option<FigmaCorrection>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -6205,7 +6208,7 @@ fn clear_figma_correction_latch() {
 
 /// The measurement-session latch when one is set, the live evaluation
 /// otherwise (idle and background rendering).
-fn effective_figma_correction(settings: &Settings) -> (f64, Option<String>) {
+fn effective_figma_correction(settings: &Settings) -> FigmaCorrection {
     if let Ok(latch) = figma_correction_latch_lock().lock() {
         if let Some(latched) = latch.clone() {
             return latched;
