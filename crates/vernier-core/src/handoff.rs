@@ -52,6 +52,7 @@ pub struct HandoffApp {
 /// stays focused on tools that take a single PNG path on the
 /// command line and open straight into an annotate-and-save view.
 pub const KNOWN_HANDOFF_APPS: &[&str] = &[
+    "omasnap",   // Omarchy-native screenshot and annotation tool
     "tensaku",   // Wayland-native annotate-and-save (Satty fork)
     "satty",     // Wayland-native, modern annotate-and-save
     "swappy",    // Sway/wlroots annotation companion
@@ -476,6 +477,11 @@ fn parse_desktop(path: &Path, expected_basename: &str, resolved_bin: &Path) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_handoff_apps_include_omasnap() {
+        assert!(KNOWN_HANDOFF_APPS.contains(&"omasnap"));
+    }
 
     #[test]
     fn render_args_substitutes_file_token() {
