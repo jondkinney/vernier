@@ -37,6 +37,17 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.5.1" date="2026-09-05">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>remove the tray item before stopping the event loop</li>
+          <li>recognize Omasnap as an annotation app</li>
+          <li>expose only the root plugin manifest</li>
+          <li>keep rebuilt hidden overlays from taking focus</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-23">
       <description>
         <p>Added:</p>
