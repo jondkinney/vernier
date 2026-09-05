@@ -219,6 +219,27 @@ impl TrayOps for MacTray {
     }
 }
 
+impl Drop for MacTray {
+    fn drop(&mut self) {
+        // MainState owns the retained NSStatusItem, so merely dropping
+        // TrayHandle on the daemon thread does not remove anything. Tear it
+        // down synchronously while NSApp is still running; otherwise macOS
+        // can leave a dead menu-bar item behind until the process finishes,
+        // and clicking that orphan reports an OSStatus error.
+        super::app::run_on_main_sync(|| {
+            let resources = super::with_main_state(|s| s.tray.take());
+            let Some(resources) = resources else {
+                return;
+            };
+
+            resources.status_item.setVisible(false);
+            resources.status_item.setMenu(None);
+            NSStatusBar::systemStatusBar().removeStatusItem(&resources.status_item);
+            log::info!("macos tray: removed NSStatusItem");
+        });
+    }
+}
+
 // --- Target/action delegate -------------------------------------------------
 
 define_class!(

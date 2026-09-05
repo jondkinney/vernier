@@ -4869,6 +4869,11 @@ fn run_daemon() -> Result<()> {
         }
     }
 
+    // Remove the tray while the platform event loop is still alive. On macOS
+    // this synchronously unregisters the NSStatusItem before NSApp is stopped,
+    // preventing a dead menu-bar item from surviving the Quit action.
+    drop(tray.take());
+
     // Clean up the runtime hyprctl bind so the next daemon launch
     // doesn't stack duplicates (and so a stale `vernier toggle`
     // bind doesn't keep firing into a dead IPC socket).
