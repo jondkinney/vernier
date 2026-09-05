@@ -807,6 +807,7 @@ mod shell_api_tests {
 
     struct CountingCapturePlatform {
         capture_calls: std::sync::atomic::AtomicUsize,
+        fresh_capture: bool,
     }
 
     impl Platform for CountingCapturePlatform {
@@ -848,6 +849,19 @@ mod shell_api_tests {
             })
         }
 
+        fn capture_screen_native_synchronous(
+            &self,
+            monitor: MonitorId,
+        ) -> std::result::Result<NativeFrame, vernier_platform::PlatformError> {
+            if self.fresh_capture {
+                self.capture_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(prepared_frame(91))
+            } else {
+                self.capture_screen_native(monitor)
+            }
+        }
+
         fn register_hotkey(
             &self,
             _accelerator: Accelerator,
@@ -884,6 +898,7 @@ mod shell_api_tests {
     fn prepared_capture_uses_exact_frame_without_touching_platform() {
         let platform = CountingCapturePlatform {
             capture_calls: std::sync::atomic::AtomicUsize::new(0),
+            fresh_capture: false,
         };
         let source = prepared_frame(37);
 
@@ -908,9 +923,31 @@ mod shell_api_tests {
     }
 
     #[test]
+    fn ordinary_activation_uses_one_fresh_frame_for_pixels_and_background() {
+        let platform = CountingCapturePlatform {
+            capture_calls: std::sync::atomic::AtomicUsize::new(0),
+            fresh_capture: true,
+        };
+        let (native, background) = resolve_measurement_capture(&platform, MonitorId(1), None, true)
+            .expect("fresh capture resolves");
+        assert_eq!(native.expect("native frame").pixels, vec![91, 91, 91, 255]);
+        assert_eq!(
+            background.expect("background").pixels,
+            vec![91, 91, 91, 255]
+        );
+        assert_eq!(
+            platform
+                .capture_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn ordinary_capture_failure_keeps_legacy_no_frame_activation_path() {
         let platform = CountingCapturePlatform {
             capture_calls: std::sync::atomic::AtomicUsize::new(0),
+            fresh_capture: false,
         };
 
         let (native, background) = resolve_measurement_capture(&platform, MonitorId(1), None, true)
@@ -3728,18 +3765,23 @@ fn run_daemon() -> Result<()> {
                         overlay.hide();
                         std::thread::sleep(FREEZE_RECAPTURE_SETTLE);
                     }
-                    match platform.capture_screen_native(primary.id) {
-                        Ok(f) => {
+                    match platform
+                        .capture_screen_native_synchronous(primary.id)
+                        .and_then(|frame| {
+                            let background = if effective_freeze_screen() {
+                                Some(frame.to_rgba_frame()?)
+                            } else {
+                                None
+                            };
+                            Ok((frame, background))
+                        }) {
+                        Ok((f, background)) => {
                             log::info!("frame refreshed");
                             frozen_frame = Some(f);
                             refresh_figma_correction_latch();
                             // Refresh the freeze-screen visual from
                             // the same clean (post-blink) capture.
-                            if effective_freeze_screen() {
-                                if let Ok(packed) = platform.capture_screen(primary.id) {
-                                    overlay.set_background_frame(Some(packed));
-                                }
-                            }
+                            overlay.set_background_frame(background);
                             // Re-show after the new background is
                             // queued, so the overlay never flashes the
                             // stale freeze frame.
@@ -8300,10 +8342,10 @@ fn resolve_measurement_capture(
             };
             Ok((Some(frame), background))
         }
-        None => match platform.capture_screen_native(monitor) {
+        None => match platform.capture_screen_native_synchronous(monitor) {
             Ok(frame) => {
                 let background = if freeze_screen {
-                    platform.capture_screen(monitor).ok()
+                    Some(frame.to_rgba_frame()?)
                 } else {
                     None
                 };
@@ -8351,6 +8393,13 @@ fn toggle_measurement_with_frame(
     if matches!(mode, InteractionMode::Idle) {
         // Going ON — recapture the screen for edge detection, restore
         // input grab, and re-render any persisted content alongside.
+        // A passthrough overlay may still display retained measurements.
+        // Keep those out of an ordinary Wayland activation capture too.
+        let was_visible = overlay.is_visible();
+        if cfg!(target_os = "linux") && was_visible && prepared_frame.is_none() {
+            overlay.hide();
+            std::thread::sleep(FREEZE_RECAPTURE_SETTLE);
+        }
         let capture = resolve_measurement_capture(
             platform.as_ref(),
             monitor,
@@ -8359,6 +8408,8 @@ fn toggle_measurement_with_frame(
         );
         match capture {
             Ok((frame, background)) => {
+                // Clear a previous background even if capture failed.
+                overlay.set_background_frame(background);
                 if let Some(frame) = frame {
                     log::info!(
                         "measurement mode: ON (frozen {}×{} {:?})",
@@ -8366,27 +8417,18 @@ fn toggle_measurement_with_frame(
                         frame.height,
                         frame.format
                     );
-                    // Push the captured frame to the overlay as its
-                    // background so the user sees a literal snapshot —
-                    // anything moving underneath (browser scroll, video)
-                    // becomes invisible while measuring. Backends that
-                    // don't implement set_background_frame fall through to
-                    // the default no-op (transparent overlay, live content
-                    // visible), which is functionally fine since edge
-                    // detection still uses the frozen NativeFrame.
-                    if let Some(packed) = background {
-                        overlay.set_background_frame(Some(packed));
-                    }
                     *frozen_frame = Some(frame);
                 } else {
                     *frozen_frame = None;
                 }
             }
             Err(e) => {
-                // Only prepared-frame conversion can fail here. Ordinary
-                // capture errors resolve to `(None, None)` above and retain
-                // Vernier's legacy behavior of entering without edge data.
-                log::warn!("prepared measurement activation aborted: {e}");
+                // Conversion failures abort activation; ordinary capture
+                // failures still enter without edge data or a background.
+                if was_visible {
+                    overlay.show();
+                }
+                log::warn!("measurement activation aborted: {e}");
                 return false;
             }
         }
