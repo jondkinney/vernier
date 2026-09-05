@@ -37,6 +37,15 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.5.2" date="2026-09-05">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>provide grim for fresh Wayland captures</li>
+          <li>use fresh frames for measurement activation and refresh</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-09-05">
       <description>
         <p>Fixed:</p>
