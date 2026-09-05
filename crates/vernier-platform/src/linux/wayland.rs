@@ -1031,7 +1031,9 @@ impl WaylandState {
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        // New overlays start hidden and click-through. Match that state here so a
+        // display-triggered rebuild cannot take keyboard focus before activation.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, 0);
         // True (possibly fractional) display scale. Seed from the
         // monitor's scale factor WITHOUT rounding — the fractional-
