@@ -111,8 +111,12 @@ your application launcher — it writes `vernier.desktop` and the icon
 theme under `~/.local/share`, no extra step needed. To register it
 *before* the first launch, run `vernier install-desktop`.
 
-`cargo install` can't pull in the optional capture/clipboard tools
-(`grim`, `slurp`, `wl-clipboard`, `libnotify`). Run `vernier doctor`
+Wayland measurement activation and refresh require `grim` for a fresh
+screenshot. AUR packages install it and Flatpak bundles it; source and
+`cargo install` users must install it separately.
+
+`cargo install` also can't pull in the optional capture/clipboard tools
+(`slurp`, `wl-clipboard`, `libnotify`). Run `vernier doctor`
 to see which are missing — the related features degrade gracefully
 until you install them.
 

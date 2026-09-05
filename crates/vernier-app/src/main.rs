@@ -122,7 +122,7 @@ enum Cmd {
     /// needed to register a freshly `cargo install`ed binary with
     /// app launchers before its first run.
     InstallDesktop,
-    /// Report which optional external tools Vernier relies on
+    /// Report which external tools Vernier relies on
     /// (grim, slurp, wl-clipboard, libnotify) and whether a
     /// `GlobalShortcuts` portal backend is installed.
     Doctor,
@@ -1223,7 +1223,7 @@ fn run_daemon() -> Result<()> {
         log::warn!("autostart: {e:#}");
     });
     #[cfg(target_os = "linux")]
-    warn_missing_optional_tools();
+    warn_missing_external_tools();
     replace_settings(initial_settings.clone());
 
     let (platform, platform_events) = vernier_platform::init()?;
@@ -5313,7 +5313,7 @@ fn packaged_entry_exists() -> bool {
 /// feature. Absence degrades that feature gracefully rather than
 /// breaking the daemon, so these are reported, never required.
 #[cfg(target_os = "linux")]
-struct OptionalTool {
+struct ExternalTool {
     /// Executable name looked up on `$PATH`.
     binary: &'static str,
     /// Arch package that provides it (names vary on other distros).
@@ -5323,23 +5323,23 @@ struct OptionalTool {
 }
 
 #[cfg(target_os = "linux")]
-const OPTIONAL_TOOLS: &[OptionalTool] = &[
-    OptionalTool {
+const EXTERNAL_TOOLS: &[ExternalTool] = &[
+    ExternalTool {
         binary: "grim",
         arch_pkg: "grim",
-        enables: "screenshot capture of held-rect regions",
+        enables: "fresh Wayland measurement capture (required) and held-rect screenshots",
     },
-    OptionalTool {
+    ExternalTool {
         binary: "slurp",
         arch_pkg: "slurp",
         enables: "region selection for the external-screenshot shortcut",
     },
-    OptionalTool {
+    ExternalTool {
         binary: "wl-copy",
         arch_pkg: "wl-clipboard",
         enables: "copying screenshots / measurements to the clipboard",
     },
-    OptionalTool {
+    ExternalTool {
         binary: "notify-send",
         arch_pkg: "libnotify",
         enables: "post-capture notifications",
@@ -5381,35 +5381,35 @@ fn global_shortcuts_portal_present() -> bool {
         })
 }
 
-/// Log a single warning naming any optional tools missing from
+/// Log a single warning naming any external tools missing from
 /// `$PATH`, so a `cargo install`ed binary on a bare system surfaces
 /// the gap instead of silently dropping features. Called once on
 /// daemon start.
 #[cfg(target_os = "linux")]
-fn warn_missing_optional_tools() {
-    let missing: Vec<&str> = OPTIONAL_TOOLS
+fn warn_missing_external_tools() {
+    let missing: Vec<&str> = EXTERNAL_TOOLS
         .iter()
         .filter(|t| !binary_on_path(t.binary))
         .map(|t| t.binary)
         .collect();
     if !missing.is_empty() {
         log::warn!(
-            "optional tools not on PATH: {} — related capture/clipboard/\
+            "external tools not on PATH: {} — related capture/clipboard/\
              notification features are disabled; run `vernier doctor` for details",
             missing.join(", ")
         );
     }
 }
 
-/// `doctor` subcommand: probe for the optional external tools and
+/// `doctor` subcommand: probe for the external tools and
 /// the `GlobalShortcuts` portal, then print a report. Everything it
 /// checks degrades gracefully, so it always exits 0 — it's a hint,
 /// not a gate.
 #[cfg(target_os = "linux")]
 fn run_doctor() -> Result<()> {
-    println!("Vernier optional-dependency check\n");
+    println!("Vernier external-dependency check\n");
     let mut missing = 0;
-    for t in OPTIONAL_TOOLS {
+    for t in EXTERNAL_TOOLS {
         if binary_on_path(t.binary) {
             println!("  ok       {:<12} {}", t.binary, t.enables);
         } else {
@@ -5438,7 +5438,7 @@ fn run_doctor() -> Result<()> {
     }
     println!();
     if missing == 0 {
-        println!("All optional tools present.");
+        println!("All external tools present.");
     } else {
         println!("{missing} item(s) missing — the related features stay disabled until installed.");
     }

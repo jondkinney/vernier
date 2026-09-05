@@ -19,9 +19,9 @@ KDE.
   `vernier-bin`;
 - a real, user-owned `$XDG_RUNTIME_DIR` (the normal Omarchy session setup).
 
-Keep `grim` installed for the companion's popup-free **Start Measuring**
-snapshot path. `vernier doctor` reports it and Vernier's other optional Linux
-tools.
+Keep `grim` installed for fresh measurement activation and refresh captures,
+including the companion's popup-free **Start Measuring** snapshot path. AUR
+packages install it automatically. `vernier doctor` reports missing Linux tools.
 
 ## Install
 
